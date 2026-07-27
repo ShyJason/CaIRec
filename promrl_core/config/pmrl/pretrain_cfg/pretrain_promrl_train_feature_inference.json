@@ -1,0 +1,30 @@
+{
+    "run_cfg": {
+        "default": "./config/pmrl/default_run_cfg.json",
+        "learning_rate": 2e-05
+    },
+    "model_cfg": {
+        "default": "./config/pmrl/default_model_cfg.json",
+        "vision_encoder_type": "evaclip01_giant"
+    },
+    "data_cfg": {
+        "train": [],
+        "val": [
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "finetune_area",
+                "txt": "./datasets/annotations/vast150k/VASTannotations150k.json",
+                "vision": "./SVD_MM/datasets/vast/videos",
+                "audio": "./SVD_MM/datasets/vast/audios",
+                "vision_transforms": "crop_flip",
+                "vision_format": "video_rawvideo",
+                "vision_sample_num": 2,
+                "audio_sample_num": 1,
+                "task": "ret%tvas",
+                "n_workers": 8,
+                "batch_size": 64
+            }
+        ]
+    }
+}

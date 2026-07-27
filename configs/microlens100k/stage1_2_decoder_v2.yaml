@@ -1,0 +1,52 @@
+dataset: microlens100k
+exp_mode: mm
+train_stage: imputer_backprop
+feature_bridge_mode: raw_decoder
+gcn_frontend_mode: original_linear
+selection_mode: val
+
+device_id: 0
+use_gpu: 1
+seed: 2023
+
+epoch: 50
+eva_interval: 1
+batch_size: 256
+lr: 0.0005
+lr_imp: 0.0005
+lr_decoder: 0.0002
+
+contra_dim: 64
+d_beta: 32
+tau1: 0.1
+tau2: 0.1
+lambda_itm: 0.1
+itm_temp: 0.07
+itm_num_heads: 4
+ema_eta: 0.01
+
+stage1_profile: v2
+stage1_v2_loss_preset: balanced
+stage1_2_mode: observed
+imputation_val_rate: 0.1
+imputation_selection_policy: stage1_default
+save_all_epochs: 1
+
+alpha_intra: 1.0
+alpha_inter: 1.0
+alpha_itm: 1.0
+alpha_rec: 1.0
+alpha_decode: 1.0
+alpha_decode_kl: 0.0
+decode_kl_temp: 0.2
+decode_loss_grad_mode: detached
+decode_loss_target_mode: observed
+generative_update_mode: fixed
+stage1_rec_loss_mode: observed
+missing_rate: 0.3
+tensorboard: 0
+hf_tensorboard_repo: ""
+hf_token: ""
+hf_commit_every: 5
+save: 1
+suffix: stage1_2_microlens100k_beststyle_nocl_decoder_v2

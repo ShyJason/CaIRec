@@ -1,0 +1,61 @@
+{
+    "run_cfg": {
+        "default": "./config/pmrl/default_run_cfg.json",
+        "learning_rate": 2e-05
+    },
+    "model_cfg": {
+        "default": "./config/pmrl/default_model_cfg.json",
+        "vision_encoder_type": "evaclip01_giant"
+    },
+    "data_cfg": {
+        "train": [
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "vggsound_train_ret",
+                "txt": "./datasets/annotations/vggsound/vggsound_train.json",
+                "vision": "./vggsound/scratch/shared/beegfs/hchen/train_data/VGGSound_final/video",
+                "vision_transforms": "crop_flip",
+                "vision_format": "video_rawvideo",
+                "audio": "./vggsound/scratch/shared/beegfs/hchen/train_data/VGGSound_final/audio",
+                "vision_sample_num": 2,
+                "audio_sample_num": 3,
+                "task": "ret%ta",
+                "epoch": 1,
+                "n_workers": 8,
+                "batch_size": 64
+            }
+        ],
+        "val": [
+            {
+                "type": "annoindexed",
+                "training": false,
+                "name": "msrvtt_ret",
+                "txt": "datasets/annotations/msrvtt/descs_ret_test.json",
+                "vision": "./SVD_MM/datasets/msrvtt/data/TestVideo",
+                "vision_transforms": "crop_flip",
+                "vision_format": "video_rawvideo",
+                "audio": "./SVD_MM/datasets/msrvtt/data/TestAudio",
+                "vision_sample_num": 8,
+                "audio_sample_num": 1,
+                "task": "ret%tvas",
+                "n_workers": 8,
+                "batch_size": 64
+            },
+            {
+                "type": "annoindexed",
+                "training": false,
+                "name": "audiocaps_ret",
+                "txt": "datasets/annotations/audiocaps/descs_ret_test.json",
+                "audio": "./SVD_MM/datasets/audiocaps/audios",
+                "vision": "./SVD_MM/datasets/audiocaps/videos",
+                "audio_sample_num": 1,
+                "vision_format": "video_rawvideo",
+                "vision_sample_num": 8,
+                "task": "ret%tva",
+                "n_workers": 8,
+                "batch_size": 64
+            }
+        ]
+    }
+}

@@ -1,0 +1,69 @@
+{
+    "run_cfg": {
+        "default": "./config/pmrl/default_run_cfg.json",
+        "learning_rate": 2e-05
+    },
+    "model_cfg": {
+        "default": "./config/pmrl/default_model_cfg.json",
+        "vision_encoder_type": "evaclip01_giant"
+    },
+    "data_cfg": {
+        "train": [],
+        "val": [
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "vggsound_test",
+                "txt": "./datasets/annotations/vggsound/vggsound_cmcl_test.json",
+                "vision": "./MM_datasets/datasets/vggsound/scratch/shared/beegfs/hchen/train_data/VGGSound_final/video",
+                "vision_transforms": "crop_flip",
+                "vision_format": "video_rawvideo",
+                "audio": "./MM_datasets/datasets/vggsound/scratch/shared/beegfs/hchen/train_data/VGGSound_final/audio",
+                "vision_sample_num": 2,
+                "audio_sample_num": 3,
+                "task": "ret%ta",
+                "epoch": 1,
+                "n_workers": 8,
+                "batch_size": 64
+            },
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "imagenet1k_test",
+                "txt": "./datasets/annotations/imagenet1k/imagenet1k_test.json",
+                "vision": "./MM_datasets/datasets/imagenet1k_test/processed/test/image",
+                "vision_transforms": "crop_flip",
+                "vision_format": "image_rawimage",
+                "task": "ret%tv",
+                "epoch": 1,
+                "n_workers": 8,
+                "batch_size": 64
+            },
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "caltech101_test",
+                "txt": "./datasets/annotations/caltech101/caltech101_test.json",
+                "vision": "./MM_datasets/datasets/caltech101/processed/test/image",
+                "vision_transforms": "crop_flip",
+                "vision_format": "image_rawimage",
+                "task": "ret%tv",
+                "epoch": 1,
+                "n_workers": 8,
+                "batch_size": 64
+            },
+            {
+                "type": "annoindexed",
+                "training": true,
+                "name": "esc50_test",
+                "txt": "./datasets/annotations/esc50/esc50_test.json",
+                "audio": "./MM_datasets/datasets/esc50/processed/test/audio",
+                "task": "ret%ta",
+                "audio_sample_num": 3,
+                "epoch": 1,
+                "n_workers": 8,
+                "batch_size": 64
+            }
+        ]
+    }
+}
