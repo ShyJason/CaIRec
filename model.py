@@ -5,13 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from promrl_core.general_module import Contra_head, Match_head
+from promrl_core.layers import Contra_head, Match_head, _build_mlp
 from promrl_core.utils.impute import update_posterior, compute_nll_loss
 from promrl_core.utils.eigen import (
     eigenvalue_computation_pmcl,
     shifted_relation_lifted_directions,
 )
-from promrl_core.promrl_variants import _build_mlp
 
 
 def _load_tensor_checkpoint(path):
