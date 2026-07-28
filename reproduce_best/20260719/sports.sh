@@ -25,7 +25,7 @@ verify_sha256() {
   }
 }
 
-verify_sha256 8e717a326c68a017621f7b2e61c8a0f7f748bcd0d3b1d893be8e4e46fa65ad54 "${CONFIG}"
+verify_sha256 b782119d3ccba7e96f6898b85742716cc49ca616214b24dcea4a6fe21c2a4197 "${CONFIG}"
 verify_sha256 95e388b214f75fd159de7b28c9902a60604eca2c804370324c8738d9d7db6086 "${IMPUTER_CKPT}"
 verify_sha256 421816fbeaa65cb6323f9f42e209a52f5688401525ba75bb6c902789580aaabe "${PAYLOAD}"
 test -f Data/sports/sports.inter

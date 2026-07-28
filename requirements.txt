@@ -1,0 +1,11 @@
+# Reproduction environment (Python 3.10)
+torch==1.13.0
+numpy==1.26.4
+scipy==1.15.3
+pandas==2.3.3
+tqdm==4.68.4
+numba==0.60.0
+faiss-cpu==1.13.2
+PyYAML==6.0.3
+tensorboard==2.20.0
+huggingface-hub==0.36.2

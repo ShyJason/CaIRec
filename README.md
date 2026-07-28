@@ -41,9 +41,19 @@ Large local assets are intentionally excluded: `Data/`, `exp_report/`,
 
 ## Environment
 
-The development environment used Python 3.10 with PyTorch, NumPy, SciPy,
-pandas, tqdm, numba, FAISS, EasyDict, and TensorBoard. A pinned public
-environment file is still to be added before the archival release.
+Python 3.10 is recommended. Create an isolated environment and install the
+recorded dependencies:
+
+```bash
+python3.10 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+For GPU training, install the PyTorch 1.13.0 wheel matching the local CUDA
+runtime before installing the remaining requirements if the default wheel is
+not suitable.
 
 ## Required assets
 
@@ -54,8 +64,10 @@ The fixed reproduction commands load:
 - the recorded Stage 1.2 epoch-49 checkpoint under the path declared by each
   reproduction script.
 
-Datasets and checkpoints are not committed to Git. Their public download
-manifest must be supplied separately.
+Datasets and Stage 1.2 checkpoints are not committed to Git. The reproduction
+scripts fail before training if an expected file or checksum is missing. The
+three small projection-only initializers are committed under
+`pretrained_projections/` and verified by its `SHA256SUMS`.
 
 ## Train the mainline
 
@@ -91,10 +103,11 @@ bash reproduce_best/20260719/sports.sh 2
 ```
 
 These commands reproduce Stage 2 from the retained Stage 1.2 checkpoints; they
-do not retrain Stage 1. The historical `SOURCE_SHA256SUMS` records the source
-fingerprints used when the reference results were produced. The current source
-has subsequently evolved, so a fresh result verification is required before a
-versioned archival release.
+do not retrain Stage 1. `SOURCE_SHA256SUMS` fingerprints the source and paper
+configuration files in this release. It verifies release integrity, but does
+not claim that the historical result-producing source—no longer available—was
+recovered. A fresh full run is therefore required before claiming bitwise
+reproduction of the recorded metrics.
 
 ## Tests
 
