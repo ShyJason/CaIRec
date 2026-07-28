@@ -1344,6 +1344,79 @@ class MILK_model(torch.nn.Module):
             )
         return adapted
 
+    def get_recommender_modal_features(self, raw_features=None, allow_imputer_grad=False):
+        item_ids = None
+        if raw_features is None:
+            item_ids = torch.arange(self.m_item, device=self.env.device)
+        raw_features = raw_features or self._current_raw_modal_features()
+
+        if self.use_latent_direct_bridge:
+            projected = self.project_features(raw_features=raw_features)
+            if self.disable_imputation:
+                return projected
+            masks = self._missing_masks(raw_features)
+            if all(mask.all() for mask in masks.values()):
+                return projected
+            return self._build_completed_features(
+                projected,
+                masks,
+                detach_imputed=not allow_imputer_grad,
+                item_ids=item_ids,
+            )
+
+        if self.use_decoupled_latent_bridge:
+            recommendation_projected = self.project_recommendation_features(
+                raw_features=raw_features
+            )
+            if self.disable_imputation:
+                return recommendation_projected
+            masks = self._missing_masks(raw_features)
+            if all(mask.all() for mask in masks.values()):
+                return recommendation_projected
+
+            completion_projected = self.project_features(raw_features=raw_features)
+            completed_shared = self._build_completed_features(
+                completion_projected,
+                masks,
+                detach_imputed=not allow_imputer_grad,
+                item_ids=item_ids,
+            )
+            adapted_completed = self.adapt_completed_to_recommendation(completed_shared)
+            return {
+                modality: torch.where(
+                    masks[modality].unsqueeze(1),
+                    recommendation_projected[modality],
+                    adapted_completed[modality],
+                )
+                for modality in self.modalities
+            }
+
+        modal_features = {
+            modality: feature.clone()
+            for modality, feature in raw_features.items()
+        }
+        if self.disable_imputation:
+            return modal_features
+        masks = self._missing_masks(raw_features)
+        if all(mask.all() for mask in masks.values()):
+            return modal_features
+        projected = self.project_features(raw_features=raw_features)
+        completed_shared = self._build_completed_features(
+            projected,
+            masks,
+            detach_imputed=not allow_imputer_grad,
+            item_ids=item_ids,
+        )
+        bridged_raw = self.bridge_completed_to_recommendation_raw(completed_shared)
+        return {
+            modality: torch.where(
+                masks[modality].unsqueeze(1),
+                raw_features[modality],
+                bridged_raw[modality],
+            )
+            for modality in self.modalities
+        }
+
     def _apply_fusion(self, item_source, deterministic=False):
         item_hidden = self.fusion_linear[0](item_source)
         if not deterministic:
