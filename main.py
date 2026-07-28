@@ -318,36 +318,6 @@ def _build_parser():
         choices=['all', 'missing'],
         help='Apply post-GCN, pre-fusion modality item-item residual to all items or only items missing that modality.',
     )
-    parser.add_argument(
-        '--fusion_mode',
-        type=str,
-        default='mean',
-        choices=['mean', 'posterior_reliability'],
-        help=(
-            'Item modality fusion. posterior_reliability uses the linear-Gaussian '
-            'completion posterior predictive variance in the components selected '
-            'by posterior_reliability_scope.'
-        ),
-    )
-    parser.add_argument(
-        '--posterior_reliability_scope',
-        type=str,
-        default='both',
-        choices=['both', 'graph', 'fusion'],
-        help='Apply posterior reliability to semantic graph top-k, modality fusion, or both.',
-    )
-    parser.add_argument(
-        '--posterior_reliability_scale',
-        type=float,
-        default=1.0,
-        help='Lambda in c=exp(-lambda * mean posterior predictive variance).',
-    )
-    parser.add_argument(
-        '--posterior_reliability_floor',
-        type=float,
-        default=0.0,
-        help='Optional lower bound for missing-modality posterior reliability.',
-    )
     parser.add_argument('--alpha_intra', type=float, default=1.0)
     parser.add_argument('--alpha_inter', type=float, default=1.0)
     parser.add_argument('--alpha_itm', type=float, default=1.0)

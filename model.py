@@ -172,26 +172,6 @@ class MILK_model(torch.nn.Module):
             self.item_graph_modal_alpha > 0.0
             and self.item_graph_modal_layers > 0
         )
-        self.fusion_mode = getattr(self.env.args, "fusion_mode", "mean")
-        if self.fusion_mode not in {"mean", "posterior_reliability"}:
-            raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
-        self.use_posterior_reliability = self.fusion_mode == "posterior_reliability"
-        self.posterior_reliability_scope = getattr(
-            self.env.args, "posterior_reliability_scope", "both"
-        )
-        if self.posterior_reliability_scope not in {"both", "graph", "fusion"}:
-            raise ValueError(
-                "Unsupported posterior reliability scope: "
-                f"{self.posterior_reliability_scope}"
-            )
-        self.posterior_reliability_scale = max(
-            float(getattr(self.env.args, "posterior_reliability_scale", 1.0)),
-            0.0,
-        )
-        self.posterior_reliability_floor = min(
-            max(float(getattr(self.env.args, "posterior_reliability_floor", 0.0)), 0.0),
-            1.0,
-        )
         if not self.use_latent_completion_bridge:
             self.contra_head_v = Contra_head(self.ori_image_feat.size(1), self.contra_dim)
             self.contra_head_t = Contra_head(self.ori_text_feat.size(1), self.contra_dim)
@@ -878,15 +858,6 @@ class MILK_model(torch.nn.Module):
         cf_scale = getattr(self.env.args, "item_graph_cf_scale", "raw")
         cf_power = float(getattr(self.env.args, "item_graph_cf_power", 0.5))
         cf_clip = float(getattr(self.env.args, "item_graph_cf_clip", 3.0))
-        if self._uses_posterior_reliability_for("graph"):
-            reliabilities = {
-                modality: scores.detach().cpu().numpy().astype(np.float32)
-                for modality, scores in self._posterior_completion_reliabilities(masks).items()
-            }
-        else:
-            reliabilities = None
-        reliability_blend = 1.0
-        reliability_topk = self._uses_posterior_reliability_for("graph")
         fuse_before_topk = bool(int(getattr(self.env.args, "item_graph_fuse_before_topk", 0)))
         if fuse_before_topk and kind != "modality_completed":
             raise ValueError(
@@ -908,35 +879,17 @@ class MILK_model(torch.nn.Module):
                 clip=cf_clip,
             )
         graphs = {"cf": cf_graph}
-        def build_semantic_graph(feature, reliability):
-            return self.dataset._build_feature_item_graph(
-                feature,
-                topk,
-                chunk_size,
-                reliability=reliability,
-                reliability_blend=reliability_blend,
-            )
+        def build_semantic_graph(feature):
+            return self.dataset._build_feature_item_graph(feature, topk, chunk_size)
 
         if weights["image"] > 0.0 and not fuse_before_topk:
-            graphs["image"] = build_semantic_graph(
-                graph_feature_np["v"],
-                reliabilities["v"] if reliability_topk else None,
-            )
+            graphs["image"] = build_semantic_graph(graph_feature_np["v"])
         if weights["text"] > 0.0 and not fuse_before_topk:
-            graphs["text"] = build_semantic_graph(
-                graph_feature_np["t"],
-                reliabilities["t"] if reliability_topk else None,
-            )
+            graphs["text"] = build_semantic_graph(graph_feature_np["t"])
         if "a" in self.modalities and weights["audio"] > 0.0 and not fuse_before_topk:
-            graphs["audio"] = build_semantic_graph(
-                graph_feature_np["a"],
-                reliabilities["a"] if reliability_topk else None,
-            )
+            graphs["audio"] = build_semantic_graph(graph_feature_np["a"])
         if "d" in self.modalities and weights["video"] > 0.0 and not fuse_before_topk:
-            graphs["video"] = build_semantic_graph(
-                graph_feature_np["d"],
-                reliabilities["d"] if reliability_topk else None,
-            )
+            graphs["video"] = build_semantic_graph(graph_feature_np["d"])
         if kind == "modality_masked":
             masked_graph_specs = (("image", "v"), ("text", "t"), ("audio", "a"), ("video", "d"))
             for graph_name, modality in masked_graph_specs:
@@ -977,11 +930,6 @@ class MILK_model(torch.nn.Module):
                 for key, (modality, feature_weight) in modality_specs.items():
                     if feature_weight <= 0.0:
                         continue
-                    reliability = (
-                        reliabilities[modality]
-                        if reliability_topk and reliabilities is not None
-                        else None
-                    )
                     graph = self.dataset._build_fused_cf_feature_item_graph(
                         graph_feature_np[modality],
                         full_cf_graph,
@@ -989,8 +937,6 @@ class MILK_model(torch.nn.Module):
                         chunk_size,
                         weights["cf"],
                         feature_weight,
-                        reliability=reliability,
-                        reliability_blend=reliability_blend,
                     )
                     graph = self.dataset._normalize_item_graph(graph, norm_type)
                     self.ItemItemGraphs[key] = (
@@ -1047,76 +993,11 @@ class MILK_model(torch.nn.Module):
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
                 f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}"
             )
-            if self._uses_posterior_reliability_for("graph"):
-                rel_desc = ",".join(
-                    f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}"
-                    for modality, scores in sorted(reliabilities.items())
-                )
-                print(
-                    "posterior reliability applied before semantic topk: "
-                    f"scale={self.posterior_reliability_scale},floor={self.posterior_reliability_floor},"
-                    f"{rel_desc}"
-                )
             return
 
     def _build_single_item_item_graph(self, graph, topk, norm_type):
         graph = self.dataset._topk_sparse_rows(graph.tocsr(), topk)
         return self.dataset._normalize_item_graph(graph, norm_type)
-
-    def _posterior_completion_reliabilities(self, masks):
-        """Return c_i^m from the linear-Gaussian completion predictive variance.
-
-        Observed modalities have reliability one. For a missing modality m,
-        c_i^m = exp(-lambda * tr(W_m V_i W_m^T + sigma_m^2 I) / d_c),
-        where V_i is the latent posterior covariance given the observed modalities.
-        With the current homoscedastic ProMRL model, items sharing an observation
-        pattern also share the same posterior reliability.
-        """
-        first_mask = next(iter(masks.values()))
-        reliabilities = {
-            modality: torch.ones(first_mask.size(0), dtype=torch.float32, device=first_mask.device)
-            for modality in self.modalities
-        }
-        pattern_keys = torch.stack([masks[modality] for modality in self.modalities], dim=1)
-        eye = torch.eye(self.d_beta, dtype=self.W[self.modalities[0]].dtype, device=first_mask.device)
-
-        with torch.no_grad():
-            for pattern in torch.unique(pattern_keys, dim=0):
-                selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
-                if not bool(selector.any()):
-                    continue
-                observed = [
-                    self.modalities[idx]
-                    for idx in range(len(self.modalities))
-                    if bool(pattern[idx])
-                ]
-                missing = [
-                    self.modalities[idx]
-                    for idx in range(len(self.modalities))
-                    if not bool(pattern[idx])
-                ]
-                if not missing:
-                    continue
-
-                posterior_precision = eye.clone()
-                for modality in observed:
-                    W = self.W[modality]
-                    sigma2 = torch.exp(2 * self.log_sigma[modality].squeeze())
-                    posterior_precision = posterior_precision + (W.T @ W) / sigma2
-                posterior_cov = torch.linalg.inv(posterior_precision + 1e-6 * eye)
-
-                for modality in missing:
-                    W = self.W[modality]
-                    sigma2 = torch.exp(2 * self.log_sigma[modality].squeeze())
-                    mean_predictive_variance = (
-                        torch.trace(posterior_cov @ (W.T @ W)) / float(self.promrl_dim)
-                        + sigma2
-                    )
-                    reliability = torch.exp(
-                        -self.posterior_reliability_scale * mean_predictive_variance
-                    ).clamp(min=self.posterior_reliability_floor, max=1.0)
-                    reliabilities[modality][selector] = reliability.to(dtype=torch.float32)
-        return reliabilities
 
     def _build_weighted_item_item_graph(
         self,
@@ -1485,30 +1366,7 @@ class MILK_model(torch.nn.Module):
             out = torch.where(missing_mask.unsqueeze(1), out, item_emb)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _uses_posterior_reliability_for(self, component):
-        if not self.use_posterior_reliability:
-            return False
-        return self.posterior_reliability_scope == "both" or self.posterior_reliability_scope == component
-
-    def _fuse_item_sources(self, item_outputs, modal_features=None, raw_features=None, observed_masks=None):
-        if self._uses_posterior_reliability_for("fusion"):
-            if observed_masks is None:
-                if raw_features is None:
-                    raise ValueError(
-                        "posterior_reliability fusion requires observed_masks or raw_features"
-                    )
-                observed_masks = self._missing_masks(raw_features=raw_features)
-            reliabilities = self._posterior_completion_reliabilities(observed_masks)
-            denominator = torch.stack(
-                [reliabilities[modality] for modality in self.modalities],
-                dim=0,
-            ).sum(dim=0).clamp_min(1e-8)
-            return sum(
-                item_outputs[modality]
-                * (reliabilities[modality] / denominator).unsqueeze(1)
-                for modality in self.modalities
-            )
-
+    def _fuse_item_sources(self, item_outputs):
         return sum(item_outputs[modality] for modality in self.modalities) / len(self.modalities)
 
     def compute_recommendation_embeddings(self, raw_features=None, allow_modal_grad=False, deterministic=False):
@@ -1534,11 +1392,7 @@ class MILK_model(torch.nn.Module):
             item_outputs[modality] = modal_item_emb
 
         user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
-        item_source = self._fuse_item_sources(
-            item_outputs,
-            modal_features=modal_features,
-            raw_features=raw_features,
-        )
+        item_source = self._fuse_item_sources(item_outputs)
 
         if not allow_modal_grad:
             item_source = item_source.detach()
@@ -1620,7 +1474,6 @@ class MILK_model(torch.nn.Module):
             modality: getattr(self, f"{modality}_gcn")
             for modality in self.modalities
         }
-        observed_masks = self._missing_masks(raw_features)
         for modality in self.modalities:
             features = modal_features[modality][item_ids]
             item_output = features if self._gcn_skip_mlp() else modal_gcns[modality].MLP(features)
@@ -1628,15 +1481,7 @@ class MILK_model(torch.nn.Module):
                 torch.nan_to_num(item_output, nan=0.0, posinf=0.0, neginf=0.0),
                 dim=-1,
             )
-        modal_subset = {m: modal_features[m][item_ids] for m in self.modalities}
-        raw_subset = {m: raw_features[m][item_ids] for m in self.modalities}
-        observed_subset = {m: observed_masks[m][item_ids] for m in self.modalities}
-        item_source = self._fuse_item_sources(
-            item_outputs,
-            modal_features=modal_subset,
-            raw_features=raw_subset,
-            observed_masks=observed_subset,
-        )
+        item_source = self._fuse_item_sources(item_outputs)
         return torch.nan_to_num(self._apply_fusion(item_source, deterministic=True), nan=0.0, posinf=0.0, neginf=0.0)
 
     def _recommendation_gcn_modality_item_embeddings(
@@ -2481,11 +2326,7 @@ class MILK_model(torch.nn.Module):
         modal_features = self.get_recommender_modal_features()
         observed_masks = self._missing_masks(raw_features=raw_features)
 
-        outputs = {
-            "user_id": user_id_emb,
-            "modal_inputs": modal_features,
-            "observed_masks": observed_masks,
-        }
+        outputs = {"user_id": user_id_emb}
         for modality in self.modalities:
             modal_user_emb, modal_item_emb = getattr(self, f"{modality}_gcn")(
                 modal_features[modality], user_id_emb, skip_mlp=self._gcn_skip_mlp()
@@ -2514,11 +2355,7 @@ class MILK_model(torch.nn.Module):
         }
 
         user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
-        item_source = self._fuse_item_sources(
-            item_outputs,
-            modal_features=outputs["modal_inputs"],
-            observed_masks=outputs["observed_masks"],
-        )
+        item_source = self._fuse_item_sources(item_outputs)
         item_emb = self.fusion_linear(item_source)
 
         user_emb = torch.nan_to_num(user_emb, nan=0.0, posinf=0.0, neginf=0.0)

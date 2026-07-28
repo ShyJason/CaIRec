@@ -500,33 +500,19 @@ class Loader4MM(torch.utils.data.Dataset):
         )
         return self._topk_sparse_rows(graph, topk)
 
-    def _build_feature_item_graph(self, feature, topk, chunk_size, reliability=None, reliability_blend=1.0):
+    def _build_feature_item_graph(self, feature, topk, chunk_size):
         feature = np.asarray(feature, dtype=np.float32)
         norms = np.linalg.norm(feature, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         feature = feature / norms
 
         n_item = feature.shape[0]
-        if reliability is not None:
-            reliability = np.asarray(reliability, dtype=np.float32).reshape(-1)
-            if reliability.shape[0] != n_item:
-                raise ValueError(
-                    f'reliability length must match item count: {reliability.shape[0]} != {n_item}'
-                )
-            reliability_blend = min(max(float(reliability_blend), 0.0), 1.0)
-            if reliability_blend <= 0.0:
-                reliability = None
         chunk_size = max(int(chunk_size), 1)
         k = min(max(int(topk), 1) + 1, n_item)
         rows, cols, data = [], [], []
         for start in tqdm(range(0, n_item, chunk_size), desc='building feature item graph'):
             end = min(start + chunk_size, n_item)
             sim = np.matmul(feature[start:end], feature.T)
-            if reliability is not None:
-                edge_reliability = reliability[start:end, None] * reliability[None, :]
-                if reliability_blend < 1.0:
-                    edge_reliability = 1.0 + reliability_blend * (edge_reliability - 1.0)
-                sim = sim * edge_reliability.astype(np.float32)
             local_rows = np.arange(start, end)
             sim[np.arange(end - start), local_rows] = -np.inf
             top_idx = np.argpartition(sim, -k, axis=1)[:, -k:]
@@ -553,8 +539,6 @@ class Loader4MM(torch.utils.data.Dataset):
         chunk_size,
         cf_weight,
         feature_weight,
-        reliability=None,
-        reliability_blend=1.0,
     ):
         """Fuse full CF and semantic scores, then select one final row-wise top-k."""
         feature = np.asarray(feature, dtype=np.float32)
@@ -575,16 +559,6 @@ class Loader4MM(torch.utils.data.Dataset):
         if total_weight <= 0.0:
             raise ValueError('Fused CF-feature graph requires a positive source weight')
 
-        if reliability is not None:
-            reliability = np.asarray(reliability, dtype=np.float32).reshape(-1)
-            if reliability.shape[0] != n_item:
-                raise ValueError(
-                    f'reliability length must match item count: {reliability.shape[0]} != {n_item}'
-                )
-            reliability_blend = min(max(float(reliability_blend), 0.0), 1.0)
-            if reliability_blend <= 0.0:
-                reliability = None
-
         chunk_size = max(int(chunk_size), 1)
         topk = min(max(int(topk), 1), max(n_item - 1, 1))
         candidate_k = min(topk + 1, n_item)
@@ -592,11 +566,6 @@ class Loader4MM(torch.utils.data.Dataset):
         for start in tqdm(range(0, n_item, chunk_size), desc='building fuse-before-topk item graph'):
             end = min(start + chunk_size, n_item)
             scores = np.matmul(feature[start:end], feature.T)
-            if reliability is not None:
-                edge_reliability = reliability[start:end, None] * reliability[None, :]
-                if reliability_blend < 1.0:
-                    edge_reliability = 1.0 + reliability_blend * (edge_reliability - 1.0)
-                scores = scores * edge_reliability.astype(np.float32)
             scores *= feature_weight
             if cf_weight > 0.0:
                 scores += cf_weight * cf_graph[start:end].toarray()
