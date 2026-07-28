@@ -83,43 +83,6 @@ class ResidualCompletionAdapter(nn.Module):
         return self.norm(self.skip(x) + self.mlp(x))
 
 
-class DirectionNormDecoder(nn.Module):
-    """Decode a completion latent into a native-scale raw feature.
-
-    Direction and magnitude are deliberately predicted by separate heads.  A
-    single normalized output cannot reproduce item-specific raw feature norms,
-    while an unconstrained raw regression head tends to spend most of its
-    capacity on the much larger visual-feature scale.
-    """
-
-    def __init__(self, input_dim, hidden_dim, output_dim, initial_log_norm):
-        super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.direction_head = nn.Linear(hidden_dim, output_dim)
-        self.log_norm_head = nn.Sequential(
-            nn.Linear(hidden_dim, max(32, hidden_dim // 4)),
-            nn.GELU(),
-            nn.Linear(max(32, hidden_dim // 4), 1),
-        )
-        nn.init.zeros_(self.log_norm_head[-1].weight)
-        nn.init.constant_(self.log_norm_head[-1].bias, float(initial_log_norm))
-
-    def forward(self, x):
-        hidden = self.trunk(x)
-        direction = F.normalize(self.direction_head(hidden), dim=-1)
-        # The clamp is only a numerical guard.  It spans norms from 6.7e-3 to
-        # 3.0e3, comfortably beyond all modalities used in this repository.
-        log_norm = self.log_norm_head(hidden).clamp(min=-5.0, max=8.0)
-        return direction * log_norm.exp()
-
-
 class MILK_model(torch.nn.Module):
     def __init__(self, env, dataset):
         super(MILK_model, self).__init__()
@@ -158,8 +121,6 @@ class MILK_model(torch.nn.Module):
 
         native_image_feat = torch.tensor(dataset.image_feat, dtype=torch.float32).to(self.env.device)
         native_text_feat = torch.tensor(dataset.text_feat, dtype=torch.float32).to(self.env.device)
-        self._register_native_raw_statistics("v", native_image_feat, dataset)
-        self._register_native_raw_statistics("t", native_text_feat, dataset)
         self.ori_image_feat = F.normalize(native_image_feat)
         self.ori_text_feat = F.normalize(native_text_feat)
 
@@ -168,12 +129,10 @@ class MILK_model(torch.nn.Module):
 
         if self.has_audio_modality:
             native_audio_feat = torch.tensor(dataset.audio_feat, dtype=torch.float32).to(self.env.device)
-            self._register_native_raw_statistics("a", native_audio_feat, dataset)
             self.ori_audio_feat = F.normalize(native_audio_feat)
             self.eval_ori_audio_feat = self.ori_audio_feat
         if self.has_video_modality:
             native_video_feat = torch.tensor(dataset.video_feat, dtype=torch.float32).to(self.env.device)
-            self._register_native_raw_statistics("d", native_video_feat, dataset)
             self.ori_video_feat = F.normalize(native_video_feat)
             self.eval_ori_video_feat = self.ori_video_feat
 
@@ -189,13 +148,7 @@ class MILK_model(torch.nn.Module):
         self.use_latent_direct_bridge = self.feature_bridge_mode == "latent_direct"
         self.use_decoupled_latent_bridge = self.feature_bridge_mode == "decoupled_latent"
         self.use_latent_completion_bridge = self.use_latent_direct_bridge or self.use_decoupled_latent_bridge
-        self.use_decode_head = (
-            not self.use_latent_completion_bridge
-            or bool(getattr(self.env.args, "enable_raw_completion_decoder", 0))
-        )
-        self.decoder_output_mode = getattr(self.env.args, "decoder_output_mode", "normalized")
-        if self.decoder_output_mode not in ("normalized", "native_direction_norm"):
-            raise ValueError(f"Unsupported decoder_output_mode: {self.decoder_output_mode}")
+        self.use_decode_head = not self.use_latent_completion_bridge
         self.gcn_frontend_mode = self.env.args.gcn_frontend_mode
         self.promrl_projection_mode = getattr(self.env.args, "promrl_projection_mode", "learned")
         self.promrl_dim = self.free_emb_dimension if self.use_latent_completion_bridge else self.contra_dim
@@ -394,63 +347,11 @@ class MILK_model(torch.nn.Module):
         canonical_stage = self._canonical_stage(train_stage)
         return canonical_stage == "imputer_backprop"
 
-    def _training_observed_mask(self, modality, dataset):
-        mask = torch.ones(self.m_item, dtype=torch.bool, device=self.env.device)
-        metadata = getattr(dataset, "train_missing_modality_items", None) or {}
-        items = np.asarray(metadata.get("items", []), dtype=np.int64)
-        indicators = np.asarray(metadata.get("indicator", []), dtype=np.int64)
-        modality_index = self.modalities.index(modality)
-        missing_items = items[indicators == modality_index]
-        if missing_items.size:
-            mask[torch.as_tensor(missing_items, device=self.env.device)] = False
-        return mask
-
-    def _register_native_raw_statistics(self, modality, native_feature, dataset):
-        observed = self._training_observed_mask(modality, dataset)
-        observed_feature = native_feature[observed]
-        observed_norm = observed_feature.norm(dim=-1).clamp_min(1e-8)
-        feature_std = observed_feature.std(dim=0, unbiased=False)
-        # Avoid exploding standardized errors on dimensions which are nearly
-        # constant.  The floor is derived only from train-observed features.
-        std_floor = feature_std.mean().clamp_min(1e-6) * 0.05
-        feature_std = feature_std.clamp_min(std_floor)
-        self.register_buffer(
-            f"native_raw_norm_{modality}",
-            native_feature.norm(dim=-1).clamp_min(1e-8),
-            persistent=False,
-        )
-        self.register_buffer(
-            f"native_raw_std_{modality}",
-            feature_std,
-            persistent=False,
-        )
-        self.register_buffer(
-            f"native_raw_initial_log_norm_{modality}",
-            observed_norm.log().mean(),
-            persistent=False,
-        )
-
-    def _native_raw_target(self, modality, normalized_feature, item_ids=None):
-        norms = getattr(self, f"native_raw_norm_{modality}")
-        if item_ids is not None:
-            norms = norms[item_ids]
-        return normalized_feature * norms.unsqueeze(-1)
-
     def _decoder_hidden_dim(self, raw_dim):
         return min(1024, max(256, raw_dim // 2))
 
     def _build_modal_decoder(self, modality, raw_dim):
         hidden_dim = self._decoder_hidden_dim(raw_dim)
-        if self.decoder_output_mode == "native_direction_norm":
-            initial_log_norm = getattr(
-                self, f"native_raw_initial_log_norm_{modality}"
-            ).item()
-            return DirectionNormDecoder(
-                self.promrl_dim,
-                hidden_dim,
-                raw_dim,
-                initial_log_norm,
-            )
         return nn.Sequential(
             nn.Linear(self.promrl_dim, hidden_dim),
             nn.GELU(),
@@ -1488,8 +1389,6 @@ class MILK_model(torch.nn.Module):
             modality: getattr(self, f"decoder_{modality}")(completed_shared[modality])
             for modality in self.modalities
         }
-        if self.decoder_output_mode == "native_direction_norm":
-            return decoded
         return {
             modality: F.normalize(feature, dim=-1)
             for modality, feature in decoded.items()
@@ -1499,59 +1398,12 @@ class MILK_model(torch.nn.Module):
         return self.decode_completed_to_raw(completed_shared)
 
     def _decoder_target(self, modality, normalized_target, item_ids=None):
-        if self.decoder_output_mode == "native_direction_norm":
-            return self._native_raw_target(modality, normalized_target, item_ids=item_ids)
+        del modality, item_ids
         return normalized_target
 
     def _decoder_reconstruction_loss(self, modality, prediction, target):
-        cosine_loss = 1.0 - F.cosine_similarity(prediction, target, dim=-1).mean()
-        if self.decoder_output_mode != "native_direction_norm":
-            return cosine_loss
-
-        feature_std = getattr(self, f"native_raw_std_{modality}").unsqueeze(0)
-        # Coordinate regression is useful for learning the native feature
-        # direction, but its conditional-mean optimum shrinks magnitude when
-        # the direction is uncertain.  Evaluate it at the target magnitude so
-        # that this term cannot teach the norm head to mark completed items via
-        # systematically smaller norms.  Magnitude is learned exclusively by
-        # the log-norm objective below.
-        target_norm = target.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-        direction_scaled_prediction = F.normalize(prediction, dim=-1) * target_norm
-        standardized_error = (direction_scaled_prediction - target) / feature_std
-        raw_loss = F.smooth_l1_loss(
-            standardized_error,
-            torch.zeros_like(standardized_error),
-            reduction="mean",
-        )
-        prediction_log_norm = prediction.norm(dim=-1).clamp_min(1e-8).log()
-        target_log_norm = target.norm(dim=-1).clamp_min(1e-8).log()
-        norm_loss = F.smooth_l1_loss(prediction_log_norm, target_log_norm)
-
-        relation_loss = prediction.new_zeros(())
-        relation_max_items = max(
-            int(getattr(self.env.args, "decoder_relation_max_items", 64)),
-            0,
-        )
-        if relation_max_items > 1 and prediction.size(0) > 1:
-            relation_count = min(relation_max_items, prediction.size(0))
-            pred_direction = F.normalize(prediction[:relation_count], dim=-1)
-            target_direction = F.normalize(target[:relation_count], dim=-1)
-            pred_relation = pred_direction @ pred_direction.transpose(0, 1)
-            target_relation = target_direction @ target_direction.transpose(0, 1)
-            relation_loss = F.smooth_l1_loss(pred_relation, target_relation)
-
-        self.latest_decoder_loss_components = {
-            "raw": float(raw_loss.detach().cpu()),
-            "cosine": float(cosine_loss.detach().cpu()),
-            "norm": float(norm_loss.detach().cpu()),
-            "relation": float(relation_loss.detach().cpu()),
-        }
-        return (
-            float(getattr(self.env.args, "decoder_raw_loss_weight", 1.0)) * raw_loss
-            + float(getattr(self.env.args, "decoder_cosine_loss_weight", 1.0)) * cosine_loss
-            + float(getattr(self.env.args, "decoder_norm_loss_weight", 0.25)) * norm_loss
-            + float(getattr(self.env.args, "decoder_relation_loss_weight", 0.1)) * relation_loss
-        )
+        del modality
+        return 1.0 - F.cosine_similarity(prediction, target, dim=-1).mean()
 
     def adapt_completed_to_recommendation(self, completed_shared):
         adapters = self._completion_adapters()
@@ -2856,25 +2708,6 @@ class MILK_model(torch.nn.Module):
                 decode_completed = completed
                 decode_selected = masks
                 decode_targets = raw_batch
-
-                if getattr(self.env.args, "decoder_loss_mode", "observed_projection") == "pseudo_missing":
-                    pseudo_masks, pseudo_selected = self._sample_pseudo_missing_masks(
-                        masks,
-                        ratio=float(getattr(self.env.args, "decoder_pseudo_missing_ratio", 1.0)),
-                    )
-                    if pseudo_masks is None or pseudo_selected is None:
-                        decode_completed = None
-                    else:
-                        # The completion module is normally frozen in this mode.  Detaching
-                        # here also makes the decoder-only contract explicit and avoids
-                        # retaining a graph through posterior inference.
-                        decode_completed = self._build_completed_features(
-                            projected,
-                            pseudo_masks,
-                            detach_imputed=True,
-                            item_ids=item_ids,
-                        )
-                        decode_selected = pseudo_selected
 
                 decode_losses = []
                 if decode_completed is not None:

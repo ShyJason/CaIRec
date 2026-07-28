@@ -185,49 +185,6 @@ def _build_parser():
         choices=['raw_decoder', 'latent_direct', 'decoupled_latent'],
     )
     parser.add_argument(
-        '--enable_raw_completion_decoder',
-        type=int,
-        default=0,
-        help=(
-            'Attach a decoder from the completion space back to each raw modality '
-            'space without changing feature_bridge_mode. This is intended for '
-            'decoder-only training on a frozen decoupled-latent checkpoint.'
-        ),
-    )
-    parser.add_argument(
-        '--decoder_loss_mode',
-        type=str,
-        default='observed_projection',
-        choices=['observed_projection', 'pseudo_missing'],
-        help=(
-            'observed_projection reconstructs raw features from their own projected '
-            'representations; pseudo_missing reconstructs a held-out observed modality '
-            'from the actual completion produced using the remaining modalities.'
-        ),
-    )
-    parser.add_argument(
-        '--decoder_pseudo_missing_ratio',
-        type=float,
-        default=1.0,
-        help='Fraction of eligible batch items used for pseudo-missing decoder supervision.',
-    )
-    parser.add_argument(
-        '--decoder_output_mode',
-        type=str,
-        default='normalized',
-        choices=['normalized', 'native_direction_norm'],
-        help=(
-            'normalized preserves the historical unit-vector decoder; '
-            'native_direction_norm predicts raw direction and item-specific magnitude '
-            'with separate heads.'
-        ),
-    )
-    parser.add_argument('--decoder_raw_loss_weight', type=float, default=1.0)
-    parser.add_argument('--decoder_cosine_loss_weight', type=float, default=1.0)
-    parser.add_argument('--decoder_norm_loss_weight', type=float, default=0.25)
-    parser.add_argument('--decoder_relation_loss_weight', type=float, default=0.1)
-    parser.add_argument('--decoder_relation_max_items', type=int, default=64)
-    parser.add_argument(
         '--gcn_frontend_mode',
         type=str,
         default='original_linear',
