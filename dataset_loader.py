@@ -19,11 +19,6 @@ class Loader4MM(torch.utils.data.Dataset):
         self.folds = 20
         self.n_user = 0
         self.m_item = 0
-        self.train_external_modal_observed_masks = None
-        self.eval_external_modal_observed_masks = None
-        self.uses_split_modal_feature_override = False
-
-
         split_path = self.env.DATA_PATH
 
         train_file = os.path.join(split_path, 'train.txt')
@@ -848,209 +843,24 @@ class Loader4MM(torch.utils.data.Dataset):
         return self.train_missing_modality_items
 
 
-    def _resolve_modal_feature_dir(self, explicit_dir, base_dir, phase_name):
-        if explicit_dir:
-            return os.path.expanduser(explicit_dir)
-        phase_dir = os.path.join(base_dir, phase_name)
-        if os.path.isdir(phase_dir):
-            return phase_dir
-        return base_dir
-
-    def _modal_feature_specs(self):
-        return [
-            ('v', 'image', getattr(self.env.args, 'modal_feature_image_file', 'agg_image_items.npy'), True),
-            ('t', 'text', getattr(self.env.args, 'modal_feature_text_file', 'agg_text_items.npy'), True),
-            ('a', 'audio', getattr(self.env.args, 'modal_feature_audio_file', 'agg_audio_items.npy'), False),
-            ('d', 'video', getattr(self.env.args, 'modal_feature_video_file', 'agg_video_items.npy'), False),
-        ]
-
-    def _modal_observed_mask_specs(self):
-        return {
-            'v': ('image', getattr(self.env.args, 'modal_feature_image_mask_file', 'image_observed_mask.npy')),
-            't': ('text', getattr(self.env.args, 'modal_feature_text_mask_file', 'text_observed_mask.npy')),
-            'a': ('audio', getattr(self.env.args, 'modal_feature_audio_mask_file', 'audio_observed_mask.npy')),
-            'd': ('video', getattr(self.env.args, 'modal_feature_video_mask_file', 'video_observed_mask.npy')),
-        }
-
-    def _load_modal_feature_bundle(self, feature_dir, label):
-        features = {}
-        for modality, name, file_name, required in self._modal_feature_specs():
-            feature_file = os.path.join(feature_dir, file_name)
-            if not os.path.exists(feature_file):
-                if required:
-                    raise FileNotFoundError(f'{label} {name} feature file not found: {feature_file}')
-                continue
-            feature = np.load(feature_file).astype(np.float32, copy=False)
-            if feature.shape[0] != self.m_item:
-                raise ValueError(
-                    f'{label} {name} feature item count mismatch: '
-                    f'feature has {feature.shape[0]} rows, dataset has {self.m_item} items'
-                )
-            features[modality] = feature
-        return features
-
-    def _load_modal_observed_mask_bundle(self, feature_dir, label, feature_modalities):
-        mask_source = getattr(self.env.args, 'modal_feature_mask_source', 'nonzero')
-        if mask_source != 'external_observed':
-            return None
-
-        masks = {}
-        for modality in feature_modalities:
-            name, file_name = self._modal_observed_mask_specs()[modality]
-            mask_file = os.path.join(feature_dir, file_name)
-            if not os.path.exists(mask_file):
-                raise FileNotFoundError(
-                    f'{label} {name} observed-mask file not found: {mask_file}; '
-                    'required by modal_feature_mask_source=external_observed'
-                )
-            mask = np.load(mask_file).astype(bool)
-            if mask.shape[0] != self.m_item:
-                raise ValueError(
-                    f'{label} {name} observed mask item count mismatch: '
-                    f'mask has {mask.shape[0]} rows, dataset has {self.m_item} items'
-                )
-            masks[modality] = mask
-        return masks
-
-    def _metadata_from_observed_masks(self, masks):
-        if not masks:
-            return self._empty_missing_metadata()
-        items = []
-        indicators = []
-        modality_order = {'v': 0, 't': 1, 'a': 2, 'd': 3}
-        for modality in ('v', 't', 'a', 'd'):
-            mask = masks.get(modality)
-            if mask is None:
-                continue
-            missing = np.flatnonzero(~mask).astype(np.int64)
-            if missing.size == 0:
-                continue
-            items.append(missing)
-            indicators.append(np.full(missing.shape, modality_order[modality], dtype=np.int64))
-        if not items:
-            return self._empty_missing_metadata()
-        return {
-            'items': np.concatenate(items).astype(np.int64),
-            'indicator': np.concatenate(indicators).astype(np.int64),
-        }
-
-    def _apply_external_observed_missing_metadata(self):
-        if getattr(self.env.args, 'modal_feature_mask_source', 'nonzero') != 'external_observed':
-            return
-        if self.train_external_modal_observed_masks is None or self.eval_external_modal_observed_masks is None:
-            raise ValueError(
-                'modal_feature_mask_source=external_observed requires observed masks in train/eval feature dirs'
-            )
-        self.train_missing_modality_items = self._metadata_from_observed_masks(
-            self.train_external_modal_observed_masks
-        )
-        self.test_missing_modality_items = self._metadata_from_observed_masks(
-            self.eval_external_modal_observed_masks
-        )
-        self.eval_val_missing_modality_items = self._metadata_from_observed_masks(
-            self.eval_external_modal_observed_masks
-        )
-        self.val_missing_modality_items = self._empty_missing_metadata()
-        self.stage1_train_items = np.array(list(set(self.trainItem)), dtype=np.int64)
-        print(
-            'loaded external observed modality masks, '
-            f'train missing entries={len(self.train_missing_modality_items["items"])}, '
-            f'eval missing entries={len(self.test_missing_modality_items["items"])}'
-        )
-
-    def _load_modal_feature_override(self):
-        override_dir = getattr(self.env.args, 'modal_feature_override_dir', '') or ''
-        if not override_dir:
-            return None
-
-        base_dir = os.path.expanduser(override_dir)
-        if not os.path.isdir(base_dir):
-            raise FileNotFoundError(f'modal_feature_override_dir not found: {base_dir}')
-
-        train_dir = self._resolve_modal_feature_dir(
-            getattr(self.env.args, 'modal_feature_train_dir', '') or '',
-            base_dir,
-            'phase_train',
-        )
-        eval_dir = self._resolve_modal_feature_dir(
-            getattr(self.env.args, 'modal_feature_eval_dir', '') or '',
-            base_dir,
-            'phase_eval',
-        )
-        train_features = self._load_modal_feature_bundle(train_dir, 'train')
-        eval_features = self._load_modal_feature_bundle(eval_dir, 'eval')
-        if set(train_features.keys()) != set(eval_features.keys()):
-            raise ValueError(
-                f'external train/eval modalities differ: train={sorted(train_features)}, '
-                f'eval={sorted(eval_features)}'
-            )
-        self.train_external_modal_observed_masks = self._load_modal_observed_mask_bundle(
-            train_dir,
-            'train',
-            train_features.keys(),
-        )
-        self.eval_external_modal_observed_masks = self._load_modal_observed_mask_bundle(
-            eval_dir,
-            'eval',
-            eval_features.keys(),
-        )
-
-        image_feat = train_features['v']
-        text_feat = train_features['t']
-        audio_feat = train_features.get('a')
-        video_feat = train_features.get('d')
-        self.eval_image_feat = eval_features['v']
-        self.eval_text_feat = eval_features['t']
-        self.eval_audio_feat = eval_features.get('a')
-        self.eval_video_feat = eval_features.get('d')
-        self.uses_split_modal_feature_override = os.path.abspath(train_dir) != os.path.abspath(eval_dir)
-        print(
-            'loaded external modal features: '
-            f'train_dir={train_dir}, eval_dir={eval_dir}, '
-            f"modalities={sorted(train_features.keys())}, "
-            f'image_shape={image_feat.shape}, text_shape={text_feat.shape}'
-        )
-        if self.train_external_modal_observed_masks is not None:
-            counts = ', '.join(
-                f'{modality}:train_obs={int(self.train_external_modal_observed_masks[modality].sum())},'
-                f'eval_obs={int(self.eval_external_modal_observed_masks[modality].sum())}'
-                for modality in sorted(self.train_external_modal_observed_masks)
-            )
-            print(f'loaded external modal observed masks: {counts}')
-        return image_feat, text_feat, audio_feat, video_feat
-
     def load_mutimedia_feature(self):
-        override_features = self._load_modal_feature_override()
-        using_override = override_features is not None
-        if override_features is not None:
-            image_feat, text_feat, audio_feat, video_feat = override_features
-            fea = [image_feat, text_feat]
-            if audio_feat is not None:
-                fea += [audio_feat]
-            if video_feat is not None:
-                fea += [video_feat]
-        else:
-            image_file = os.path.join(self.env.DATA_PATH, 'image_feat.npy')
-            text_file = os.path.join(self.env.DATA_PATH, 'text_feat.npy')
-            audio_file = os.path.join(self.env.DATA_PATH, 'audio_feat.npy')
-            video_file = os.path.join(self.env.DATA_PATH, 'video_feat.npy')
-            image_feat = np.load(image_file)
-            text_feat = np.load(text_file)
-            fea = [image_feat, text_feat]
+        image_file = os.path.join(self.env.DATA_PATH, 'image_feat.npy')
+        text_file = os.path.join(self.env.DATA_PATH, 'text_feat.npy')
+        audio_file = os.path.join(self.env.DATA_PATH, 'audio_feat.npy')
+        video_file = os.path.join(self.env.DATA_PATH, 'video_feat.npy')
+        image_feat = np.load(image_file)
+        text_feat = np.load(text_file)
+        fea = [image_feat, text_feat]
 
-            audio_feat = None
-            if os.path.exists(audio_file):
-                audio_feat = np.load(audio_file)
-                fea += [audio_feat]
+        audio_feat = None
+        if os.path.exists(audio_file):
+            audio_feat = np.load(audio_file)
+            fea.append(audio_feat)
 
-            video_feat = None
-            if os.path.exists(video_file):
-                video_feat = np.load(video_file)
-                fea += [video_feat]
-
-            self.eval_image_feat = image_feat
-            self.eval_text_feat = text_feat
-            self.uses_split_modal_feature_override = False
+        video_feat = None
+        if os.path.exists(video_file):
+            video_feat = np.load(video_file)
+            fea.append(video_feat)
 
         self.set_miss_mutimedia_feature_items(
             fea,
@@ -1058,20 +868,7 @@ class Loader4MM(torch.utils.data.Dataset):
             rate=self.env.args.missing_rate,
             exp_mode=self.env.args.exp_mode,
         )
-        self._apply_external_observed_missing_metadata()
-
-        if not using_override:
-            if audio_feat is None:
-                self.eval_audio_feat = None
-            else:
-                self.eval_audio_feat = audio_feat
-            if video_feat is None:
-                self.eval_video_feat = None
-            else:
-                self.eval_video_feat = video_feat
-
         return image_feat, text_feat, audio_feat, video_feat
-
 
     def getUserAllItems(self):
         posItems = defaultdict(list)

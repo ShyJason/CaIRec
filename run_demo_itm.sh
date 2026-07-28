@@ -55,19 +55,6 @@ FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE:-raw_decoder}"
 GCN_FRONTEND_MODE="${GCN_FRONTEND_MODE:-original_linear}"
 PROMRL_PROJECTION_MODE="${PROMRL_PROJECTION_MODE:-learned}"
 GENERATIVE_UPDATE_MODE="${GENERATIVE_UPDATE_MODE:-em}"
-MODAL_FEATURE_OVERRIDE_DIR="${MODAL_FEATURE_OVERRIDE_DIR:-${FEATURE_DIR:-}}"
-MODAL_FEATURE_TRAIN_DIR="${MODAL_FEATURE_TRAIN_DIR:-}"
-MODAL_FEATURE_EVAL_DIR="${MODAL_FEATURE_EVAL_DIR:-}"
-MODAL_FEATURE_IMAGE_FILE="${MODAL_FEATURE_IMAGE_FILE:-agg_image_items.npy}"
-MODAL_FEATURE_TEXT_FILE="${MODAL_FEATURE_TEXT_FILE:-agg_text_items.npy}"
-MODAL_FEATURE_AUDIO_FILE="${MODAL_FEATURE_AUDIO_FILE:-agg_audio_items.npy}"
-MODAL_FEATURE_VIDEO_FILE="${MODAL_FEATURE_VIDEO_FILE:-agg_video_items.npy}"
-MODAL_FEATURE_MASK_SOURCE="${MODAL_FEATURE_MASK_SOURCE:-nonzero}"
-MODAL_FEATURE_IMAGE_MASK_FILE="${MODAL_FEATURE_IMAGE_MASK_FILE:-image_observed_mask.npy}"
-MODAL_FEATURE_TEXT_MASK_FILE="${MODAL_FEATURE_TEXT_MASK_FILE:-text_observed_mask.npy}"
-MODAL_FEATURE_AUDIO_MASK_FILE="${MODAL_FEATURE_AUDIO_MASK_FILE:-audio_observed_mask.npy}"
-MODAL_FEATURE_VIDEO_MASK_FILE="${MODAL_FEATURE_VIDEO_MASK_FILE:-video_observed_mask.npy}"
-MODAL_FEATURE_OVERRIDE_IS_COMPLETED="${MODAL_FEATURE_OVERRIDE_IS_COMPLETED:-0}"
 ALPHA_INTRA="${ALPHA_INTRA:-1.0}"
 ALPHA_INTER="${ALPHA_INTER:-1.0}"
 ALPHA_ITM="${ALPHA_ITM:-1.0}"
@@ -228,30 +215,6 @@ fi
 
 if [[ -n "${EVAL_MISSING_RATE}" ]]; then
   cmd+=(--eval_missing_rate "${EVAL_MISSING_RATE}")
-fi
-
-if [[ -n "${MODAL_FEATURE_OVERRIDE_DIR}" ]]; then
-  cmd+=(
-    --modal_feature_override_dir "${MODAL_FEATURE_OVERRIDE_DIR}"
-    --modal_feature_image_file "${MODAL_FEATURE_IMAGE_FILE}"
-    --modal_feature_text_file "${MODAL_FEATURE_TEXT_FILE}"
-    --modal_feature_audio_file "${MODAL_FEATURE_AUDIO_FILE}"
-    --modal_feature_video_file "${MODAL_FEATURE_VIDEO_FILE}"
-    --modal_feature_mask_source "${MODAL_FEATURE_MASK_SOURCE}"
-    --modal_feature_image_mask_file "${MODAL_FEATURE_IMAGE_MASK_FILE}"
-    --modal_feature_text_mask_file "${MODAL_FEATURE_TEXT_MASK_FILE}"
-    --modal_feature_audio_mask_file "${MODAL_FEATURE_AUDIO_MASK_FILE}"
-    --modal_feature_video_mask_file "${MODAL_FEATURE_VIDEO_MASK_FILE}"
-    --modal_feature_override_is_completed "${MODAL_FEATURE_OVERRIDE_IS_COMPLETED}"
-  )
-fi
-
-if [[ -n "${MODAL_FEATURE_TRAIN_DIR}" ]]; then
-  cmd+=(--modal_feature_train_dir "${MODAL_FEATURE_TRAIN_DIR}")
-fi
-
-if [[ -n "${MODAL_FEATURE_EVAL_DIR}" ]]; then
-  cmd+=(--modal_feature_eval_dir "${MODAL_FEATURE_EVAL_DIR}")
 fi
 
 if [[ -n "${HF_TENSORBOARD_REPO}" ]]; then

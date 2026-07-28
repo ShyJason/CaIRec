@@ -150,16 +150,6 @@ class MILK_model(torch.nn.Module):
             {"items": [], "indicator": []},
         )
         self.test_missing_modality_items = dataset.test_missing_modality_items
-        self.modal_feature_mask_source = getattr(self.env.args, "modal_feature_mask_source", "nonzero")
-        self.modal_feature_override_is_completed = bool(
-            getattr(self.env.args, "modal_feature_override_is_completed", 0)
-        )
-        self.train_external_modal_observed_masks = self._tensorize_external_modal_masks(
-            getattr(dataset, "train_external_modal_observed_masks", None)
-        )
-        self.eval_external_modal_observed_masks = self._tensorize_external_modal_masks(
-            getattr(dataset, "eval_external_modal_observed_masks", None)
-        )
 
         self.audio_feat = None
         self.ori_audio_feat = None
@@ -173,40 +163,19 @@ class MILK_model(torch.nn.Module):
         self.ori_image_feat = F.normalize(native_image_feat)
         self.ori_text_feat = F.normalize(native_text_feat)
 
-        self.eval_ori_image_feat = torch.tensor(
-            getattr(dataset, "eval_image_feat", dataset.image_feat),
-            dtype=torch.float32,
-        ).to(self.env.device)
-        self.eval_ori_image_feat = F.normalize(self.eval_ori_image_feat)
-
-        self.eval_ori_text_feat = torch.tensor(
-            getattr(dataset, "eval_text_feat", dataset.text_feat),
-            dtype=torch.float32,
-        ).to(self.env.device)
-        self.eval_ori_text_feat = F.normalize(self.eval_ori_text_feat)
+        self.eval_ori_image_feat = self.ori_image_feat
+        self.eval_ori_text_feat = self.ori_text_feat
 
         if self.has_audio_modality:
             native_audio_feat = torch.tensor(dataset.audio_feat, dtype=torch.float32).to(self.env.device)
             self._register_native_raw_statistics("a", native_audio_feat, dataset)
             self.ori_audio_feat = F.normalize(native_audio_feat)
-            self.eval_ori_audio_feat = torch.tensor(
-                getattr(dataset, "eval_audio_feat", dataset.audio_feat),
-                dtype=torch.float32,
-            ).to(self.env.device)
-            self.eval_ori_audio_feat = F.normalize(self.eval_ori_audio_feat)
+            self.eval_ori_audio_feat = self.ori_audio_feat
         if self.has_video_modality:
             native_video_feat = torch.tensor(dataset.video_feat, dtype=torch.float32).to(self.env.device)
             self._register_native_raw_statistics("d", native_video_feat, dataset)
             self.ori_video_feat = F.normalize(native_video_feat)
-            self.eval_ori_video_feat = torch.tensor(
-                getattr(dataset, "eval_video_feat", dataset.video_feat),
-                dtype=torch.float32,
-            ).to(self.env.device)
-            self.eval_ori_video_feat = F.normalize(self.eval_ori_video_feat)
-
-        self.uses_split_modal_feature_override = bool(
-            getattr(dataset, "uses_split_modal_feature_override", False)
-        )
+            self.eval_ori_video_feat = self.ori_video_feat
 
         self.contra_dim = self.env.args.contra_dim
         self.d_beta = self.env.args.d_beta
@@ -785,9 +754,6 @@ class MILK_model(torch.nn.Module):
         miss_audio_feature = copy.deepcopy(audio_base) if "a" in self.modalities else None
         miss_video_feature = copy.deepcopy(video_base) if "d" in self.modalities else None
 
-        if self.modal_feature_override_is_completed and self.modal_feature_mask_source == "external_observed":
-            return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
-
         selected_missing_items = np.array(missing_metadata["items"], dtype=np.int64)
         selected_missing_modality_indicator = np.array(missing_metadata["indicator"], dtype=np.int64)
         if selected_missing_items.size == 0:
@@ -866,41 +832,31 @@ class MILK_model(torch.nn.Module):
 
     def _current_raw_modal_features(self, full=False):
         if full:
-            if not self.training and self.uses_split_modal_feature_override:
-                features = {"v": self.eval_ori_image_feat, "t": self.eval_ori_text_feat}
-            else:
-                features = {"v": self.ori_image_feat, "t": self.ori_text_feat}
+            features = {"v": self.ori_image_feat, "t": self.ori_text_feat}
         else:
             features = {"v": self.image_feat, "t": self.text_feat}
         if "a" in self.modalities:
             if full:
-                if not self.training and self.uses_split_modal_feature_override:
-                    features["a"] = self.eval_ori_audio_feat
-                else:
-                    features["a"] = self.ori_audio_feat
+                features["a"] = self.ori_audio_feat
             else:
                 features["a"] = self.audio_feat
         if "d" in self.modalities:
             if full:
-                if not self.training and self.uses_split_modal_feature_override:
-                    features["d"] = self.eval_ori_video_feat
-                else:
-                    features["d"] = self.ori_video_feat
+                features["d"] = self.ori_video_feat
             else:
                 features["d"] = self.video_feat
         return features
 
     def get_split_raw_modal_features(self, split="test", full=False):
         if full:
-            use_eval_features = split in {"val", "test"} and self.uses_split_modal_feature_override
             features = {
-                "v": self.eval_ori_image_feat if use_eval_features else self.ori_image_feat,
-                "t": self.eval_ori_text_feat if use_eval_features else self.ori_text_feat,
+                "v": self.ori_image_feat,
+                "t": self.ori_text_feat,
             }
             if "a" in self.modalities:
-                features["a"] = self.eval_ori_audio_feat if use_eval_features else self.ori_audio_feat
+                features["a"] = self.ori_audio_feat
             if "d" in self.modalities:
-                features["d"] = self.eval_ori_video_feat if use_eval_features else self.ori_video_feat
+                features["d"] = self.ori_video_feat
             return features
 
         if split == "train":
@@ -1358,37 +1314,9 @@ class MILK_model(torch.nn.Module):
     def _gcn_skip_mlp(self):
         return self.use_latent_completion_bridge
 
-    def _tensorize_external_modal_masks(self, masks):
-        if masks is None:
-            return None
-        tensor_masks = {}
-        for modality, mask in masks.items():
-            tensor_masks[modality] = torch.as_tensor(mask, dtype=torch.bool, device=self.env.device)
-        return tensor_masks
-
-    def _current_external_modal_observed_masks(self):
-        if self.modal_feature_mask_source != "external_observed":
-            return None
-        masks = self.train_external_modal_observed_masks if self.training else self.eval_external_modal_observed_masks
-        if masks is None:
-            raise ValueError(
-                "modal_feature_mask_source=external_observed requires observed mask files "
-                "in the external modal feature train/eval directories"
-            )
-        return masks
-
     def _missing_masks(self, raw_features=None):
         if raw_features is None:
             raw_features = self._current_raw_modal_features()
-        external_masks = self._current_external_modal_observed_masks()
-        if external_masks is not None:
-            first = next(iter(raw_features.values()))
-            if first.size(0) == self.m_item:
-                return {
-                    modality: external_masks[modality]
-                    for modality in raw_features
-                    if modality in external_masks
-                }
         masks = {}
         for modality, feature in raw_features.items():
             masks[modality] = feature.abs().sum(dim=1) > 0
