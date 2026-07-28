@@ -624,6 +624,13 @@ class Loader4MM(torch.utils.data.Dataset):
                     self.env.DATA_PATH,
                     f'unified_missing_items_mr{rate_token}_seed{payload_seed}.npy',
                 )
+                if not os.path.isfile(payload_file):
+                    payload_file = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        'configs',
+                        getattr(self.env.args, 'dataset', ''),
+                        f'unified_missing_items_mr{rate_token}_seed{payload_seed}.npy',
+                    )
             if not os.path.isfile(payload_file):
                 raise FileNotFoundError(f'unified missing payload not found: {payload_file}')
             payload = np.load(payload_file, allow_pickle=True).item()

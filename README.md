@@ -5,8 +5,8 @@ code. It combines latent modality completion with modality-specific
 recommendation projections, modality GCNs, completed-feature item graphs, and
 BPR optimization.
 
-Large local assets are intentionally excluded: `Data/`, `exp_report/`,
-`.release_downloads/`, and `.venv/`.
+Large local assets are intentionally excluded: `Data/`, `exp_report/`, and
+`.venv/`.
 
 ## Environment
 
@@ -46,11 +46,7 @@ python scripts/prepare_amazon_beauty.py \
   --device cuda:0
 ```
 
-Finally, install the fixed missing-item payloads:
-
-```bash
-python scripts/download_assets.py --payloads all
-```
+The fixed missing-item payloads are included in the repository.
 
 ## Reproduce the complete pipeline
 

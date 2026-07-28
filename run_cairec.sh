@@ -121,15 +121,23 @@ fi
 for asset in \
   "Data/${DATASET}/${DATASET}.inter" \
   "Data/${DATASET}/image_feat.npy" \
-  "Data/${DATASET}/text_feat.npy" \
-  "Data/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"; do
+  "Data/${DATASET}/text_feat.npy"; do
   if [[ ! -f "${asset}" ]]; then
     echo "[mainline] missing required asset: ${asset}" >&2
     exit 1
   fi
 done
+PAYLOAD="Data/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"
+if [[ ! -f "${PAYLOAD}" ]]; then
+  PAYLOAD="configs/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"
+fi
+if [[ ! -f "${PAYLOAD}" ]]; then
+  echo "[mainline] missing fixed missing-item payload for ${DATASET}" >&2
+  exit 1
+fi
 
 echo "[mainline] pretrained projection=${PROJECTION_CKPT}"
+echo "[mainline] missing payload=${PAYLOAD}"
 echo "[mainline] configs=${STAGE11_CONFIG},${STAGE12_CONFIG},${STAGE2_CONFIG}"
 if [[ "${CHECK_ONLY}" == "1" ]]; then
   echo "[mainline] preflight passed; no training started"

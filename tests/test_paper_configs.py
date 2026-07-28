@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -29,6 +30,23 @@ class PaperConfigTest(unittest.TestCase):
                     self.assertEqual(config["eval_missing_rate"], 0.5)
                     self.assertEqual(config["unified_payload_seed"], 2023)
                     self.assertEqual(config["feature_bridge_mode"], "decoupled_latent")
+
+    def test_bundled_missing_payloads_match_the_paper_protocol(self):
+        expected = {
+            "clothing": "34e09412a337e19906b16bb7bdb9e097d824e1e85a1b1908e501e5a29bc1873c",
+            "beauty": "408e3c8bfffd8322412e63b77cc87b07ae4ce1f02329f0500d61c2aee95e0cf4",
+            "sports": "421816fbeaa65cb6323f9f42e209a52f5688401525ba75bb6c902789580aaabe",
+        }
+        for dataset, expected_hash in expected.items():
+            with self.subTest(dataset=dataset):
+                path = (
+                    ROOT
+                    / "configs"
+                    / dataset
+                    / "unified_missing_items_mr0.5_seed2023.npy"
+                )
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected_hash)
 
     def test_stage2_matches_canonical_dataset_specific_settings(self):
         expected = {
