@@ -132,10 +132,8 @@ class MILK_model(torch.nn.Module):
         self.Graph = dataset.getSparseGraph()
         self.ItemItemGraph = None
         self.ItemItemGraphs = {}
-        self.ItemItemGraphComponents = {}
         self.InductiveItemItemGraphs = {}
         self._inductive_item_graph_split = None
-        self.item_graph_dynamic_norm_type = "rw"
         self.ItemItemRawGraph = None
         self.free_emb_dimension = self.env.args.free_emb_dimension
         self.has_audio_modality = dataset.audio_feat is not None
@@ -252,98 +250,9 @@ class MILK_model(torch.nn.Module):
                 raise ValueError("item_graph_kind=modality_masked is only valid for train_stage=recommender")
         self.use_completed_item_graph = self.item_graph_kind in (
             "modality_masked",
-            "fused_completed",
             "modality_completed",
             "modality_completed_inductive",
-            "modality_completed_confidence",
-            "modality_completed_dynamic_confidence",
-            "fused_completed_confidence",
-            "fused_completed_dynamic_confidence",
-            "fused_completed_reliability",
-            "fused_completed_reliability_topk",
         )
-        self.use_item_graph_edge_confidence = self.item_graph_kind in (
-            "fused_completed_confidence",
-            "fused_completed_dynamic_confidence",
-            "modality_completed_confidence",
-            "modality_completed_dynamic_confidence",
-        )
-        self.use_dynamic_item_graph_edge_confidence = self.item_graph_kind in (
-            "fused_completed_dynamic_confidence",
-            "modality_completed_dynamic_confidence",
-        )
-        self.item_graph_confidence_transform = getattr(
-            self.env.args,
-            "item_graph_confidence_transform",
-            "blend",
-        )
-        if self.item_graph_confidence_transform not in ("blend", "sigmoid"):
-            raise ValueError(f"Unsupported item graph confidence transform: {self.item_graph_confidence_transform}")
-        self.item_graph_confidence_blend = min(
-            max(float(getattr(self.env.args, "item_graph_confidence_blend", 1.0)), 0.0),
-            1.0,
-        )
-        self.item_graph_dynamic_score_blend = min(
-            max(float(getattr(self.env.args, "item_graph_dynamic_score_blend", 1.0)), 0.0),
-            1.0,
-        )
-        self.item_graph_dynamic_score_blend_start = float(
-            getattr(self.env.args, "item_graph_dynamic_score_blend_start", -1.0)
-        )
-        self.item_graph_dynamic_score_blend_warmup_epochs = max(
-            int(getattr(self.env.args, "item_graph_dynamic_score_blend_warmup_epochs", 0) or 0),
-            0,
-        )
-        self.item_graph_dynamic_neighbor_blend = min(
-            max(float(getattr(self.env.args, "item_graph_dynamic_neighbor_blend", 1.0)), 0.0),
-            1.0,
-        )
-        self.item_graph_dynamic_neighbor_blend_start = float(
-            getattr(self.env.args, "item_graph_dynamic_neighbor_blend_start", -1.0)
-        )
-        self.item_graph_dynamic_neighbor_blend_warmup_epochs = max(
-            int(getattr(self.env.args, "item_graph_dynamic_neighbor_blend_warmup_epochs", 0) or 0),
-            0,
-        )
-        self.item_graph_confidence_min = max(
-            float(getattr(self.env.args, "item_graph_confidence_min", 0.25)),
-            0.0,
-        )
-        self.item_graph_confidence_max = max(
-            float(getattr(self.env.args, "item_graph_confidence_max", 4.0)),
-            self.item_graph_confidence_min,
-        )
-        edge_conf_init = torch.tensor(
-            [
-                max(float(getattr(self.env.args, "item_graph_rr_confidence_init", 1.0)), 1e-6),
-                max(float(getattr(self.env.args, "item_graph_ri_confidence_init", 1.0)), 1e-6),
-                max(float(getattr(self.env.args, "item_graph_ii_confidence_init", 1.0)), 1e-6),
-            ],
-            dtype=torch.float32,
-        )
-        edge_conf_init = edge_conf_init.clamp(
-            min=self.item_graph_confidence_min,
-            max=self.item_graph_confidence_max,
-        )
-        if self.item_graph_confidence_transform == "sigmoid":
-            span = max(self.item_graph_confidence_max - self.item_graph_confidence_min, 1e-6)
-            normalized_conf = ((edge_conf_init - self.item_graph_confidence_min) / span).clamp(1e-4, 1.0 - 1e-4)
-            edge_conf_param_init = torch.logit(normalized_conf)
-        else:
-            edge_conf_param_init = torch.log(edge_conf_init)
-        self.use_item_graph_modality_specific_confidence = (
-            bool(int(getattr(self.env.args, "item_graph_modality_specific_confidence", 0)))
-            and self.item_graph_kind in ("modality_completed_confidence", "modality_completed_dynamic_confidence")
-        )
-        if self.use_item_graph_modality_specific_confidence:
-            self.item_graph_edge_confidence_params = nn.ParameterDict(
-                {
-                    modality: nn.Parameter(edge_conf_param_init.clone())
-                    for modality in self.modalities
-                }
-            )
-        else:
-            self.item_graph_edge_confidence_params = nn.ParameterList([nn.Parameter(edge_conf_param_init)])
         self.use_item_graph_modal_residual = (
             self.item_graph_modal_alpha > 0.0
             and self.item_graph_modal_layers > 0
@@ -651,8 +560,6 @@ class MILK_model(torch.nn.Module):
         modules.extend(getattr(self, f"{modality}_gcn") for modality in self.modalities)
         if self.use_decoupled_latent_bridge:
             modules.extend(getattr(self, f"comp_to_rec_{modality}") for modality in self.modalities)
-        if self.use_item_graph_edge_confidence:
-            modules.append(self.item_graph_edge_confidence_params)
         return modules
 
     def _set_modules_trainable(self, modules, trainable):
@@ -1129,15 +1036,8 @@ class MILK_model(torch.nn.Module):
         kind = getattr(self.env.args, "item_graph_kind", "cf")
         if kind not in (
             "modality_masked",
-            "fused_completed",
             "modality_completed",
             "modality_completed_inductive",
-            "modality_completed_confidence",
-            "modality_completed_dynamic_confidence",
-            "fused_completed_confidence",
-            "fused_completed_dynamic_confidence",
-            "fused_completed_reliability",
-            "fused_completed_reliability_topk",
         ):
             raise ValueError(f"Unsupported completed item graph kind: {kind}")
 
@@ -1196,21 +1096,15 @@ class MILK_model(torch.nn.Module):
         cf_scale = getattr(self.env.args, "item_graph_cf_scale", "raw")
         cf_power = float(getattr(self.env.args, "item_graph_cf_power", 0.5))
         cf_clip = float(getattr(self.env.args, "item_graph_cf_clip", 3.0))
-        uses_reliability = kind in ("fused_completed_reliability", "fused_completed_reliability_topk")
-        if uses_reliability:
-            reliabilities = self._compute_item_graph_reliability_scores(graph_features, masks)
-        elif self._uses_posterior_reliability_for("graph"):
+        if self._uses_posterior_reliability_for("graph"):
             reliabilities = {
                 modality: scores.detach().cpu().numpy().astype(np.float32)
                 for modality, scores in self._posterior_completion_reliabilities(masks).items()
             }
         else:
             reliabilities = None
-        reliability_blend = min(max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0), 1.0)
-        reliability_topk = (
-            kind == "fused_completed_reliability_topk"
-            or self._uses_posterior_reliability_for("graph")
-        )
+        reliability_blend = 1.0
+        reliability_topk = self._uses_posterior_reliability_for("graph")
         fuse_before_topk = bool(int(getattr(self.env.args, "item_graph_fuse_before_topk", 0)))
         if fuse_before_topk and kind != "modality_completed":
             raise ValueError(
@@ -1288,115 +1182,8 @@ class MILK_model(torch.nn.Module):
                     f"strict masked graph modality={modality} missing_items={int(missing.sum())} "
                     f"semantic_edges={graphs[graph_name].nnz} missing_semantic_edges=0"
                 )
-        if uses_reliability:
-            reliability_specs = (("image", "v"), ("text", "t"), ("audio", "a"), ("video", "d"))
-            if not reliability_topk:
-                for graph_name, modality in reliability_specs:
-                    if graph_name not in graphs or modality not in reliabilities:
-                        continue
-                    graphs[graph_name] = self._apply_item_graph_reliability(
-                        graphs[graph_name],
-                        reliabilities[modality],
-                    )
-            graph = self._build_weighted_item_item_graph(
-                graphs,
-                weights,
-                topk,
-                norm_type,
-                required_names=None,
-                context="reliability completed item graph",
-            )
-            self.ItemItemGraph = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-            self.ItemItemGraphs = {}
-            self.ItemItemGraphComponents = {}
-            rel_desc = ",".join(
-                f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}/missing_mean="
-                f"{scores[(~masks[modality]).detach().cpu().numpy()].mean():.4f}"
-                if np.any((~masks[modality]).detach().cpu().numpy())
-                else f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}/missing_mean=NA"
-                for modality, scores in sorted(reliabilities.items())
-            )
-            print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"feature_space={graph_feature_space}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
-                f"reliability_floor={float(getattr(self.env.args, 'item_graph_reliability_floor', 0.4))}, "
-                f"reliability_blend={float(getattr(self.env.args, 'item_graph_reliability_blend', 1.0))}, "
-                f"reliability_missing_penalty={float(getattr(self.env.args, 'item_graph_reliability_missing_penalty', 1.0))}, "
-                f"reliability_missing_boost={float(getattr(self.env.args, 'item_graph_reliability_missing_boost', 0.0))}, "
-                f"reliability_topk={int(reliability_topk)}, "
-                f"reliability={rel_desc}"
-            )
-            return
-        if kind == "fused_completed_dynamic_confidence":
-            dynamic_candidates = self._build_dynamic_confidence_item_graph_candidates(
-                graphs,
-                weights,
-                masks,
-                topk,
-            )
-            self.ItemItemGraphDynamicCandidates = {
-                name: value.to(self.env.device)
-                for name, value in dynamic_candidates.items()
-            }
-            self.ItemItemGraphComponents = {}
-            self.ItemItemGraph = None
-            self.ItemItemGraphs = {}
-            self.item_graph_dynamic_norm_type = norm_type
-            self.item_graph_dynamic_topk = topk
-            conf = self._item_graph_edge_confidences().detach().cpu().numpy()
-            coeff = self._item_graph_edge_confidence_coeffs().detach().cpu().numpy()
-            print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"dynamic_topk=1, candidate_width={dynamic_candidates['cols'].shape[1]}, "
-                f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
-                f"edge_conf_init=rr:{conf[0]:.4f},ri:{conf[1]:.4f},ii:{conf[2]:.4f}, "
-                f"edge_conf_coeff=rr:{coeff[0]:.4f},ri:{coeff[1]:.4f},ii:{coeff[2]:.4f}, "
-                f"transform={self.item_graph_confidence_transform}, "
-                f"blend={self.item_graph_confidence_blend:.4f}, "
-                f"score_blend={self.item_graph_dynamic_score_blend:.4f}, "
-                f"neighbor_blend={self.item_graph_dynamic_neighbor_blend:.4f}, "
-                f"range=[{self.item_graph_confidence_min:.4f},{self.item_graph_confidence_max:.4f}]"
-            )
-            return
-
-        if kind == "fused_completed_confidence":
-            component_graphs = self._build_confidence_item_item_components(
-                graphs,
-                weights,
-                masks,
-                topk,
-                norm_type,
-            )
-            self.ItemItemGraphComponents = {
-                name: self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-                for name, graph in component_graphs.items()
-            }
-            self.ItemItemGraph = None
-            self.ItemItemGraphs = {}
-            self.item_graph_dynamic_norm_type = norm_type
-            conf = self._item_graph_edge_confidences().detach().cpu().numpy()
-            coeff = self._item_graph_edge_confidence_coeffs().detach().cpu().numpy()
-            print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"components={','.join(sorted(self.ItemItemGraphComponents.keys()))}, "
-                f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
-                f"edge_conf_init=rr:{conf[0]:.4f},ri:{conf[1]:.4f},ii:{conf[2]:.4f}, "
-                f"edge_conf_coeff=rr:{coeff[0]:.4f},ri:{coeff[1]:.4f},ii:{coeff[2]:.4f}, "
-                f"transform={self.item_graph_confidence_transform}, "
-                f"blend={self.item_graph_confidence_blend:.4f}, "
-                f"range=[{self.item_graph_confidence_min:.4f},{self.item_graph_confidence_max:.4f}]"
-            )
-            return
-
         if kind in ("modality_masked", "modality_completed", "modality_completed_inductive"):
             self.ItemItemGraphs = {}
-            self.ItemItemGraphComponents = {}
             if fuse_before_topk:
                 modality_specs = {
                     "v": ("v", weights["image"]),
@@ -1512,156 +1299,6 @@ class MILK_model(torch.nn.Module):
                 )
             return
 
-        if kind == "modality_completed_confidence":
-            self.ItemItemGraphs = {}
-            self.ItemItemGraphComponents = {}
-            self.item_graph_dynamic_norm_type = norm_type
-            modality_graph_specs = {
-                "cf": ("image", "v"),
-                "v": ("image", "v"),
-                "t": ("text", "t"),
-            }
-            if "a" in self.modalities and "audio" in graphs:
-                modality_graph_specs["a"] = ("audio", "a")
-            if "d" in self.modalities and "video" in graphs:
-                modality_graph_specs["d"] = ("video", "d")
-
-            effective_weights = {}
-            for key, (feature_graph_name, modality_name) in modality_graph_specs.items():
-                if feature_graph_name not in graphs:
-                    continue
-                cf_weight = weights["cf"]
-                feature_weight = weights[feature_graph_name]
-                if cf_weight <= 0.0:
-                    feature_weight = 1.0
-                components = self._build_confidence_item_item_graph_for_modality(
-                    graphs["cf"],
-                    graphs[feature_graph_name],
-                    masks[modality_name],
-                    topk,
-                    norm_type,
-                    cf_weight,
-                    feature_weight,
-                    key,
-                )
-                effective_weights[key] = (cf_weight, feature_weight)
-                self.ItemItemGraphs[key] = None
-                self.ItemItemGraphComponents[key] = {
-                    name: self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-                    for name, graph in components.items()
-                }
-
-            if not self.ItemItemGraphComponents:
-                raise ValueError("modality_completed_confidence has no supported modality graphs")
-            print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"graphs={','.join(sorted(self.ItemItemGraphComponents.keys()))}, "
-                f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
-                f"effective_modal_weights="
-                f"{','.join(f'{name}:cf={vals[0]},semantic={vals[1]}' for name, vals in sorted(effective_weights.items()))}"
-            )
-            return
-
-        if kind == "modality_completed_dynamic_confidence":
-            self.ItemItemGraphs = {}
-            self.ItemItemGraphComponents = {}
-            self.ItemItemGraphDynamicCandidates = {}
-            self.item_graph_dynamic_norm_type = norm_type
-            self.item_graph_dynamic_topk = topk
-            modality_graph_specs = {
-                "v": ("image", "v"),
-                "t": ("text", "t"),
-            }
-            if "a" in self.modalities and "audio" in graphs:
-                modality_graph_specs["a"] = ("audio", "a")
-            if "d" in self.modalities and "video" in graphs:
-                modality_graph_specs["d"] = ("video", "d")
-
-            effective_weights = {}
-            candidate_widths = {}
-            for key, (feature_graph_name, modality_name) in modality_graph_specs.items():
-                if feature_graph_name not in graphs:
-                    continue
-                cf_weight = weights["cf"]
-                feature_weight = weights[feature_graph_name]
-                if cf_weight <= 0.0:
-                    feature_weight = 1.0
-                candidates = self._build_dynamic_confidence_item_graph_candidates_for_modality(
-                    graphs["cf"],
-                    graphs[feature_graph_name],
-                    masks[modality_name],
-                    cf_weight,
-                    feature_weight,
-                )
-                effective_weights[key] = (cf_weight, feature_weight)
-                candidate_widths[key] = candidates["cols"].shape[1]
-                self.ItemItemGraphDynamicCandidates[key] = {
-                    name: value.to(self.env.device)
-                    for name, value in candidates.items()
-                }
-
-            if not self.ItemItemGraphDynamicCandidates:
-                raise ValueError("modality_completed_dynamic_confidence has no supported modality graphs")
-            conf = self._item_graph_edge_confidences()
-            coeff = self._item_graph_edge_confidence_coeffs()
-            if isinstance(conf, dict):
-                edge_conf_desc = ",".join(
-                    f"{name}:rr={conf[name][0].detach().cpu().item():.4f}/"
-                    f"ri={conf[name][1].detach().cpu().item():.4f}/"
-                    f"ii={conf[name][2].detach().cpu().item():.4f}"
-                    for name in sorted(self.ItemItemGraphDynamicCandidates.keys())
-                )
-                edge_coeff_desc = ",".join(
-                    f"{name}:rr={coeff[name][0].detach().cpu().item():.4f}/"
-                    f"ri={coeff[name][1].detach().cpu().item():.4f}/"
-                    f"ii={coeff[name][2].detach().cpu().item():.4f}"
-                    for name in sorted(self.ItemItemGraphDynamicCandidates.keys())
-                )
-            else:
-                conf_np = conf.detach().cpu().numpy()
-                coeff_np = coeff.detach().cpu().numpy()
-                edge_conf_desc = f"rr:{conf_np[0]:.4f},ri:{conf_np[1]:.4f},ii:{conf_np[2]:.4f}"
-                edge_coeff_desc = f"rr:{coeff_np[0]:.4f},ri:{coeff_np[1]:.4f},ii:{coeff_np[2]:.4f}"
-            print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"dynamic_topk=1, graphs={','.join(sorted(self.ItemItemGraphDynamicCandidates.keys()))}, "
-                f"candidate_widths="
-                f"{','.join(f'{name}:{width}' for name, width in sorted(candidate_widths.items()))}, "
-                f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
-                f"effective_modal_weights="
-                f"{','.join(f'{name}:cf={vals[0]},semantic={vals[1]}' for name, vals in sorted(effective_weights.items()))}, "
-                f"edge_conf_init={edge_conf_desc}, "
-                f"edge_conf_coeff={edge_coeff_desc}, "
-                f"transform={self.item_graph_confidence_transform}, "
-                f"blend={self.item_graph_confidence_blend:.4f}, "
-                f"score_blend={self.item_graph_dynamic_score_blend:.4f}, "
-                f"neighbor_blend={self.item_graph_dynamic_neighbor_blend:.4f}, "
-                f"range=[{self.item_graph_confidence_min:.4f},{self.item_graph_confidence_max:.4f}]"
-            )
-            return
-
-        graph = self._build_weighted_item_item_graph(
-            graphs,
-            weights,
-            topk,
-            norm_type,
-            required_names=None,
-            context="completed item graph",
-        )
-        self.ItemItemGraph = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-        self.ItemItemGraphs = {}
-        self.ItemItemGraphComponents = {}
-        print(
-            f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-            f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-            f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}"
-        )
-
     def set_inductive_item_graph_split(self, split):
         """Switch between the warm training graph and cold-query inference graph."""
         if self.item_graph_kind != "modality_completed_inductive":
@@ -1735,10 +1372,7 @@ class MILK_model(torch.nn.Module):
         )
         modality_specs = (("v", "image"), ("t", "text"), ("a", "audio"), ("d", "video"))
         item_graphs = {}
-        reliability_blend = min(
-            max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0),
-            1.0,
-        )
+        reliability_blend = 1.0
         for modality, graph_name in modality_specs:
             if modality not in self.modalities or weights[graph_name] <= 0.0:
                 continue
@@ -1780,151 +1414,6 @@ class MILK_model(torch.nn.Module):
     def _build_single_item_item_graph(self, graph, topk, norm_type):
         graph = self.dataset._topk_sparse_rows(graph.tocsr(), topk)
         return self.dataset._normalize_item_graph(graph, norm_type)
-
-    def _item_graph_edge_confidences_from_params(self, params):
-        if self.item_graph_confidence_transform == "sigmoid":
-            conf = self.item_graph_confidence_min + (
-                self.item_graph_confidence_max - self.item_graph_confidence_min
-            ) * torch.sigmoid(params)
-            return conf
-        conf = torch.exp(params)
-        return conf.clamp(
-            min=self.item_graph_confidence_min,
-            max=self.item_graph_confidence_max,
-        )
-
-    def _item_graph_edge_confidences(self, modality=None):
-        if self.use_item_graph_modality_specific_confidence:
-            if modality is not None:
-                return self._item_graph_edge_confidences_from_params(
-                    self.item_graph_edge_confidence_params[modality]
-                )
-            return {
-                name: self._item_graph_edge_confidences_from_params(params)
-                for name, params in self.item_graph_edge_confidence_params.items()
-            }
-        return self._item_graph_edge_confidences_from_params(self.item_graph_edge_confidence_params[0])
-
-    def _item_graph_edge_confidence_coeffs_from_conf(self, conf):
-        if self.item_graph_confidence_transform == "sigmoid":
-            return conf
-        blend = self.item_graph_confidence_blend
-        return 1.0 + blend * (conf - 1.0)
-
-    def _item_graph_edge_confidence_coeffs(self, modality=None):
-        conf = self._item_graph_edge_confidences(modality=modality)
-        if isinstance(conf, dict):
-            return {
-                name: self._item_graph_edge_confidence_coeffs_from_conf(value)
-                for name, value in conf.items()
-            }
-        return self._item_graph_edge_confidence_coeffs_from_conf(conf)
-
-    def item_graph_confidence_regularization_loss(self):
-        if not self.use_item_graph_edge_confidence:
-            return self.item_emb.weight.new_zeros(())
-
-        base_target = float(getattr(self.env.args, "item_graph_confidence_reg_target", 1.0))
-        target = self.item_emb.weight.new_tensor([
-            float(getattr(self.env.args, "item_graph_rr_confidence_reg_target", None) or base_target),
-            float(getattr(self.env.args, "item_graph_ri_confidence_reg_target", None) or base_target),
-            float(getattr(self.env.args, "item_graph_ii_confidence_reg_target", None) or base_target),
-        ])
-        conf = self._item_graph_edge_confidences()
-        if isinstance(conf, dict):
-            active_modalities = set()
-            dynamic_candidates = getattr(self, "ItemItemGraphDynamicCandidates", None)
-            if isinstance(dynamic_candidates, dict):
-                active_modalities.update(dynamic_candidates.keys())
-            components = getattr(self, "ItemItemGraphComponents", None)
-            if isinstance(components, dict):
-                active_modalities.update(components.keys())
-            if not active_modalities:
-                active_modalities.update(conf.keys())
-            losses = [
-                (value - target.to(dtype=value.dtype, device=value.device)).pow(2).mean()
-                for name, value in conf.items()
-                if name in active_modalities
-            ]
-        else:
-            losses = [(conf - target.to(dtype=conf.dtype, device=conf.device)).pow(2).mean()]
-        if not losses:
-            return self.item_emb.weight.new_zeros(())
-        return torch.stack(losses).mean()
-
-    def _effective_item_graph_dynamic_score_blend(self):
-        return self._effective_warmup_value(
-            target=float(getattr(self, "item_graph_dynamic_score_blend", 1.0)),
-            start=float(getattr(self, "item_graph_dynamic_score_blend_start", -1.0)),
-            warmup_epochs=int(getattr(self, "item_graph_dynamic_score_blend_warmup_epochs", 0)),
-        )
-
-    def _effective_item_graph_dynamic_neighbor_blend(self):
-        return self._effective_warmup_value(
-            target=float(getattr(self, "item_graph_dynamic_neighbor_blend", 1.0)),
-            start=float(getattr(self, "item_graph_dynamic_neighbor_blend_start", -1.0)),
-            warmup_epochs=int(getattr(self, "item_graph_dynamic_neighbor_blend_warmup_epochs", 0)),
-        )
-
-    def _effective_warmup_value(self, target, start, warmup_epochs):
-        target = min(max(float(target), 0.0), 1.0)
-        warmup_epochs = max(int(warmup_epochs or 0), 0)
-        if warmup_epochs <= 0 or start < 0.0:
-            return target
-        start = min(max(start, 0.0), 1.0)
-        epoch = max(int(getattr(self, "current_epoch", warmup_epochs)), 0)
-        progress = min(float(epoch) / float(max(warmup_epochs, 1)), 1.0)
-        return start + progress * (target - start)
-
-    def _split_item_graph_by_observation(self, graph, observed_mask):
-        graph = graph.tocoo().astype(np.float32)
-        observed = observed_mask.detach().cpu().numpy().astype(bool)
-        src_observed = observed[graph.row]
-        dst_observed = observed[graph.col]
-        rr_mask = src_observed & dst_observed
-        ii_mask = ~src_observed & ~dst_observed
-        ri_mask = ~(rr_mask | ii_mask)
-
-        pieces = {}
-        for name, mask in (("rr", rr_mask), ("ri", ri_mask), ("ii", ii_mask)):
-            pieces[name] = sp.csr_matrix(
-                (graph.data[mask], (graph.row[mask], graph.col[mask])),
-                shape=graph.shape,
-                dtype=np.float32,
-            )
-        return pieces
-
-    def _compute_item_graph_reliability_scores(self, graph_features, masks):
-        floor = min(max(float(getattr(self.env.args, "item_graph_reliability_floor", 0.4)), 0.0), 1.0)
-        missing_penalty = max(float(getattr(self.env.args, "item_graph_reliability_missing_penalty", 1.0)), 0.0)
-        missing_boost = max(float(getattr(self.env.args, "item_graph_reliability_missing_boost", 0.0)), 0.0)
-        reliabilities = {}
-        for modality in self.modalities:
-            feature = F.normalize(graph_features[modality], dim=-1)
-            observed = masks[modality]
-            ref_sum = torch.zeros_like(feature)
-            ref_weight = torch.zeros(feature.size(0), 1, dtype=feature.dtype, device=feature.device)
-            for other in self.modalities:
-                if other == modality:
-                    continue
-                other_observed = masks[other].to(dtype=feature.dtype).unsqueeze(1)
-                ref_sum = ref_sum + F.normalize(graph_features[other], dim=-1) * other_observed
-                ref_weight = ref_weight + other_observed
-
-            has_ref = ref_weight.squeeze(1) > 0
-            ref = torch.zeros_like(feature)
-            ref[has_ref] = ref_sum[has_ref] / ref_weight[has_ref].clamp_min(1.0)
-            ref = F.normalize(ref, dim=-1)
-            consistency = F.cosine_similarity(feature, ref, dim=-1, eps=1e-8)
-            consistency = torch.where(has_ref, consistency, torch.zeros_like(consistency))
-            consistency = ((consistency + 1.0) * 0.5).clamp(0.0, 1.0)
-            missing_score = floor + (1.0 - floor) * consistency
-            if missing_boost > 0.0:
-                missing_score = missing_score + missing_boost * consistency
-            missing_score = (missing_score * missing_penalty).clamp(floor, 1.0 + missing_boost)
-            reliability = torch.where(observed, torch.ones_like(missing_score), missing_score)
-            reliabilities[modality] = reliability.detach().cpu().numpy().astype(np.float32)
-        return reliabilities
 
     def _posterior_completion_reliabilities(self, masks):
         """Return c_i^m from the linear-Gaussian completion predictive variance.
@@ -1980,264 +1469,6 @@ class MILK_model(torch.nn.Module):
                     ).clamp(min=self.posterior_reliability_floor, max=1.0)
                     reliabilities[modality][selector] = reliability.to(dtype=torch.float32)
         return reliabilities
-
-    def _apply_item_graph_reliability(self, graph, reliability):
-        blend = min(max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0), 1.0)
-        if blend <= 0.0:
-            return graph
-        graph = graph.tocoo().astype(np.float32)
-        edge_reliability = reliability[graph.row] * reliability[graph.col]
-        if blend < 1.0:
-            edge_reliability = 1.0 + blend * (edge_reliability - 1.0)
-        data = graph.data * edge_reliability.astype(np.float32)
-        reweighted = sp.csr_matrix((data, (graph.row, graph.col)), shape=graph.shape, dtype=np.float32)
-        reweighted.setdiag(0.0)
-        reweighted.eliminate_zeros()
-        return reweighted
-
-    def _build_confidence_item_item_components(self, graphs, weights, masks, topk, norm_type):
-        del norm_type
-        components = {
-            "cf": graphs["cf"].multiply(max(float(weights.get("cf", 0.0)), 0.0)).tocsr()
-        }
-        modality_specs = (("image", "v"), ("text", "t"), ("audio", "a"))
-        for graph_name, modality in modality_specs:
-            if graph_name not in graphs or modality not in masks:
-                continue
-            weight = max(float(weights.get(graph_name, 0.0)), 0.0)
-            if weight == 0.0:
-                continue
-            pieces = self._split_item_graph_by_observation(graphs[graph_name], masks[modality])
-            for piece_name, piece in pieces.items():
-                if piece.nnz == 0:
-                    continue
-                components[piece_name] = components.get(
-                    piece_name,
-                    sp.csr_matrix(graphs["cf"].shape, dtype=np.float32),
-                ) + piece.multiply(weight)
-
-        init_conf = self._item_graph_edge_confidence_coeffs().detach().cpu().numpy().astype(np.float32)
-        base = components["cf"].copy()
-        for idx, name in enumerate(("rr", "ri", "ii")):
-            if name in components:
-                base = base + components[name].multiply(float(init_conf[idx]))
-        base = self.dataset._topk_sparse_rows(base.tocsr(), topk)
-        topology = base.copy()
-        topology.data = np.ones_like(topology.data, dtype=np.float32)
-        topology = topology.tocsr()
-
-        pruned = {}
-        for name, component in components.items():
-            component = component.multiply(topology).tocsr().astype(np.float32)
-            component.setdiag(0.0)
-            component.eliminate_zeros()
-            if component.nnz > 0:
-                pruned[name] = component
-        if not pruned:
-            raise ValueError("confidence completed item graph has no positive edges")
-        return pruned
-
-    def _build_dynamic_confidence_item_graph_candidates(self, graphs, weights, masks, topk):
-        del topk
-        components = {
-            "cf": graphs["cf"].multiply(max(float(weights.get("cf", 0.0)), 0.0)).tocsr()
-        }
-        modality_specs = (("image", "v"), ("text", "t"), ("audio", "a"))
-        for graph_name, modality in modality_specs:
-            if graph_name not in graphs or modality not in masks:
-                continue
-            weight = max(float(weights.get(graph_name, 0.0)), 0.0)
-            if weight == 0.0:
-                continue
-            pieces = self._split_item_graph_by_observation(graphs[graph_name], masks[modality])
-            for piece_name, piece in pieces.items():
-                if piece.nnz == 0:
-                    continue
-                components[piece_name] = components.get(
-                    piece_name,
-                    sp.csr_matrix(graphs["cf"].shape, dtype=np.float32),
-                ) + piece.multiply(weight)
-
-        union = None
-        for component in components.values():
-            component = component.tocsr()
-            marker = component.copy()
-            marker.data = np.ones_like(marker.data, dtype=np.float32)
-            union = marker if union is None else union + marker
-        if union is None or union.nnz == 0:
-            raise ValueError("dynamic confidence item graph has no candidate edges")
-        union = union.tocsr()
-        union.setdiag(0.0)
-        union.eliminate_zeros()
-        if union.nnz == 0:
-            raise ValueError("dynamic confidence item graph has no non-self candidate edges")
-
-        n_rows = union.shape[0]
-        row_widths = np.diff(union.indptr)
-        max_width = int(row_widths.max(initial=0))
-        if max_width <= 0:
-            raise ValueError("dynamic confidence item graph has empty candidate rows")
-
-        padded_cols = np.zeros((n_rows, max_width), dtype=np.int64)
-        padded_mask = np.zeros((n_rows, max_width), dtype=np.bool_)
-        padded_values = np.zeros((n_rows, max_width, 4), dtype=np.float32)
-        component_order = ("cf", "rr", "ri", "ii")
-        component_csrs = {
-            name: components.get(name, sp.csr_matrix(union.shape, dtype=np.float32)).tocsr()
-            for name in component_order
-        }
-
-        for row in range(n_rows):
-            start, end = union.indptr[row], union.indptr[row + 1]
-            if end <= start:
-                continue
-            cols = union.indices[start:end]
-            width = cols.shape[0]
-            padded_cols[row, :width] = cols
-            padded_mask[row, :width] = True
-            col_pos = {int(col): idx for idx, col in enumerate(cols)}
-            for comp_idx, name in enumerate(component_order):
-                comp = component_csrs[name]
-                c_start, c_end = comp.indptr[row], comp.indptr[row + 1]
-                if c_end <= c_start:
-                    continue
-                comp_cols = comp.indices[c_start:c_end]
-                comp_data = comp.data[c_start:c_end]
-                for col, val in zip(comp_cols, comp_data):
-                    pos = col_pos.get(int(col))
-                    if pos is not None:
-                        padded_values[row, pos, comp_idx] = float(val)
-
-        return {
-            "cols": torch.from_numpy(padded_cols),
-            "mask": torch.from_numpy(padded_mask),
-            "values": torch.from_numpy(padded_values),
-        }
-
-    def _build_dynamic_confidence_item_graph_candidates_for_modality(
-        self,
-        cf_graph,
-        feature_graph,
-        observed_mask,
-        cf_weight,
-        feature_weight,
-    ):
-        components = {
-            "cf": cf_graph.multiply(max(float(cf_weight), 0.0)).tocsr()
-        }
-        weight = max(float(feature_weight), 0.0)
-        if weight != 0.0 and feature_graph is not None:
-            pieces = self._split_item_graph_by_observation(feature_graph, observed_mask)
-            for piece_name, piece in pieces.items():
-                if piece.nnz == 0:
-                    continue
-                components[piece_name] = components.get(
-                    piece_name,
-                    sp.csr_matrix(cf_graph.shape, dtype=np.float32),
-                ) + piece.multiply(weight)
-
-        union = None
-        for component in components.values():
-            component = component.tocsr()
-            marker = component.copy()
-            marker.data = np.ones_like(marker.data, dtype=np.float32)
-            union = marker if union is None else union + marker
-        if union is None or union.nnz == 0:
-            raise ValueError("dynamic modality confidence item graph has no candidate edges")
-        union = union.tocsr()
-        union.setdiag(0.0)
-        union.eliminate_zeros()
-        if union.nnz == 0:
-            raise ValueError("dynamic modality confidence item graph has no non-self candidate edges")
-
-        n_rows = union.shape[0]
-        row_widths = np.diff(union.indptr)
-        max_width = int(row_widths.max(initial=0))
-        if max_width <= 0:
-            raise ValueError("dynamic modality confidence item graph has empty candidate rows")
-
-        padded_cols = np.zeros((n_rows, max_width), dtype=np.int64)
-        padded_mask = np.zeros((n_rows, max_width), dtype=np.bool_)
-        padded_values = np.zeros((n_rows, max_width, 4), dtype=np.float32)
-        component_order = ("cf", "rr", "ri", "ii")
-        component_csrs = {
-            name: components.get(name, sp.csr_matrix(union.shape, dtype=np.float32)).tocsr()
-            for name in component_order
-        }
-
-        for row in range(n_rows):
-            start, end = union.indptr[row], union.indptr[row + 1]
-            if end <= start:
-                continue
-            cols = union.indices[start:end]
-            width = cols.shape[0]
-            padded_cols[row, :width] = cols
-            padded_mask[row, :width] = True
-            col_pos = {int(col): idx for idx, col in enumerate(cols)}
-            for comp_idx, name in enumerate(component_order):
-                comp = component_csrs[name]
-                c_start, c_end = comp.indptr[row], comp.indptr[row + 1]
-                if c_end <= c_start:
-                    continue
-                comp_cols = comp.indices[c_start:c_end]
-                comp_data = comp.data[c_start:c_end]
-                for col, val in zip(comp_cols, comp_data):
-                    pos = col_pos.get(int(col))
-                    if pos is not None:
-                        padded_values[row, pos, comp_idx] = float(val)
-
-        return {
-            "cols": torch.from_numpy(padded_cols),
-            "mask": torch.from_numpy(padded_mask),
-            "values": torch.from_numpy(padded_values),
-        }
-
-    def _build_confidence_item_item_graph_for_modality(
-        self,
-        cf_graph,
-        feature_graph,
-        observed_mask,
-        topk,
-        norm_type,
-        cf_weight,
-        feature_weight,
-        modality=None,
-    ):
-        del norm_type
-        components = {
-            "cf": cf_graph.multiply(max(float(cf_weight), 0.0)).tocsr()
-        }
-        weight = max(float(feature_weight), 0.0)
-        if weight != 0.0 and feature_graph is not None:
-            pieces = self._split_item_graph_by_observation(feature_graph, observed_mask)
-            for piece_name, piece in pieces.items():
-                if piece.nnz == 0:
-                    continue
-                components[piece_name] = components.get(
-                    piece_name,
-                    sp.csr_matrix(cf_graph.shape, dtype=np.float32),
-                ) + piece.multiply(weight)
-
-        init_conf = self._item_graph_edge_confidence_coeffs(modality=modality).detach().cpu().numpy().astype(np.float32)
-        base = components["cf"].copy()
-        for idx, name in enumerate(("rr", "ri", "ii")):
-            if name in components:
-                base = base + components[name].multiply(float(init_conf[idx]))
-        base = self.dataset._topk_sparse_rows(base.tocsr(), topk)
-        topology = base.copy()
-        topology.data = np.ones_like(topology.data, dtype=np.float32)
-        topology = topology.tocsr()
-
-        pruned = {}
-        for name, component in components.items():
-            component = component.multiply(topology).tocsr().astype(np.float32)
-            component.setdiag(0.0)
-            component.eliminate_zeros()
-            if component.nnz > 0:
-                pruned[name] = component
-        if not pruned:
-            raise ValueError("confidence completed item graph has no positive edges")
-        return pruned
 
     def _build_weighted_item_item_graph(
         self,
@@ -2599,7 +1830,6 @@ class MILK_model(torch.nn.Module):
             "modality_masked",
             "modality_completed",
             "modality_completed_inductive",
-            "modality_completed_confidence",
         ):
             if not self.ItemItemGraphs:
                 raise RuntimeError(
@@ -2618,175 +1848,15 @@ class MILK_model(torch.nn.Module):
         alpha = self.item_graph_modal_alpha
         out = item_emb
         for _ in range(self.item_graph_modal_layers):
-            if self.item_graph_kind in ("fused_completed_dynamic_confidence", "modality_completed_dynamic_confidence"):
-                neigh = self._dynamic_confidence_item_graph_mm(out, modality=modality)
-            elif self.item_graph_kind in ("fused_completed_confidence", "modality_completed_confidence"):
-                neigh = self._confidence_item_graph_mm(out, modality=modality)
-            else:
-                graph = self._item_graph_for_modality(modality)
-                if graph is None:
-                    raise RuntimeError("item_graph_modal_alpha > 0 requires an item-item graph")
-                neigh = torch.sparse.mm(graph, out)
+            graph = self._item_graph_for_modality(modality)
+            if graph is None:
+                raise RuntimeError("item_graph_modal_alpha > 0 requires an item-item graph")
+            neigh = torch.sparse.mm(graph, out)
             out = (1.0 - alpha) * out + alpha * neigh
         if self.item_graph_modal_target == "missing" and observed_mask is not None:
             missing_mask = ~observed_mask
             out = torch.where(missing_mask.unsqueeze(1), out, item_emb)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _component_row_sum(self, component):
-        component = component.coalesce()
-        values = component.values()
-        rows = component.indices()[0]
-        row_sum = torch.zeros(component.shape[0], dtype=values.dtype, device=values.device)
-        row_sum.scatter_add_(0, rows, values)
-        return row_sum
-
-    def _confidence_component_coeffs(self, modality=None):
-        conf = self._item_graph_edge_confidence_coeffs(modality=modality)
-        return {
-            "cf": torch.ones((), dtype=conf.dtype, device=conf.device),
-            "rr": conf[0],
-            "ri": conf[1],
-            "ii": conf[2],
-        }
-
-    def _dynamic_confidence_item_graph_mm(self, item_emb, modality=None):
-        candidates = getattr(self, "ItemItemGraphDynamicCandidates", None)
-        if not candidates:
-            raise RuntimeError(
-                "item_graph_kind=fused_completed_dynamic_confidence|modality_completed_dynamic_confidence "
-                "requires dynamic graph candidates"
-            )
-        if self.item_graph_kind == "modality_completed_dynamic_confidence":
-            if modality is None:
-                raise RuntimeError("item_graph_kind=modality_completed_dynamic_confidence requires a modality key")
-            if modality not in candidates:
-                raise RuntimeError(f"missing dynamic confidence graph candidates for modality={modality}")
-            candidates = candidates[modality]
-
-        cols = candidates["cols"]
-        mask = candidates["mask"]
-        values = candidates["values"].to(dtype=item_emb.dtype)
-        edge_coeffs = self._item_graph_edge_confidence_coeffs(modality=modality).to(dtype=item_emb.dtype)
-        coeff = torch.stack(
-            [
-                torch.ones((), dtype=item_emb.dtype, device=item_emb.device),
-                edge_coeffs[0],
-                edge_coeffs[1],
-                edge_coeffs[2],
-            ]
-        )
-        learned_scores = torch.sum(values * coeff.view(1, 1, 4), dim=-1)
-        score_blend = self._effective_item_graph_dynamic_score_blend()
-        base_scores = torch.sum(values, dim=-1)
-        if score_blend < 1.0:
-            scores = base_scores + score_blend * (learned_scores - base_scores)
-        else:
-            scores = learned_scores
-        neg_inf = torch.finfo(scores.dtype).min
-        scores = torch.where(mask, scores, torch.full_like(scores, neg_inf))
-
-        topk = min(int(getattr(self, "item_graph_dynamic_topk", scores.shape[1])), scores.shape[1])
-        norm_type = getattr(self, "item_graph_dynamic_norm_type", "rw")
-
-        def aggregate_neighbors(candidate_scores):
-            top_scores, top_pos = torch.topk(candidate_scores, k=topk, dim=1)
-            top_cols = torch.gather(cols, 1, top_pos)
-            valid = torch.isfinite(top_scores) & (top_scores > 0)
-            top_scores = torch.where(valid, top_scores, torch.zeros_like(top_scores))
-            top_cols = torch.where(valid, top_cols, torch.zeros_like(top_cols))
-
-            if norm_type == "sym":
-                col_degree = torch.zeros(item_emb.size(0), dtype=item_emb.dtype, device=item_emb.device)
-                col_degree.scatter_add_(0, top_cols.reshape(-1), top_scores.reshape(-1))
-                col_inv_sqrt = torch.zeros_like(col_degree)
-                col_nonzero = col_degree > 0
-                col_inv_sqrt[col_nonzero] = torch.pow(col_degree[col_nonzero], -0.5)
-                neighbor_emb = item_emb[top_cols] * col_inv_sqrt[top_cols].unsqueeze(-1)
-                neigh = torch.sum(top_scores.unsqueeze(-1) * neighbor_emb, dim=1)
-                row_degree = torch.sum(top_scores, dim=1)
-                row_inv_sqrt = torch.zeros_like(row_degree)
-                row_nonzero = row_degree > 0
-                row_inv_sqrt[row_nonzero] = torch.pow(row_degree[row_nonzero], -0.5)
-                return neigh * row_inv_sqrt.unsqueeze(1)
-
-            neighbor_emb = item_emb[top_cols]
-            neigh = torch.sum(top_scores.unsqueeze(-1) * neighbor_emb, dim=1)
-            if norm_type == "none":
-                return neigh
-            if norm_type == "rw":
-                degree = torch.sum(top_scores, dim=1)
-                inv = torch.zeros_like(degree)
-                nonzero = degree > 0
-                inv[nonzero] = 1.0 / degree[nonzero]
-                return neigh * inv.unsqueeze(1)
-            raise ValueError(f"Unsupported item graph normalization: {norm_type}")
-
-        dynamic_neigh = aggregate_neighbors(scores)
-        neighbor_blend = self._effective_item_graph_dynamic_neighbor_blend()
-        if neighbor_blend >= 1.0:
-            return dynamic_neigh
-
-        base_scores = torch.where(mask, base_scores, torch.full_like(base_scores, neg_inf))
-        base_neigh = aggregate_neighbors(base_scores)
-        if neighbor_blend <= 0.0:
-            return base_neigh
-        return base_neigh + neighbor_blend * (dynamic_neigh - base_neigh)
-
-    def _confidence_item_graph_mm(self, item_emb, modality=None):
-        if not self.ItemItemGraphComponents:
-            raise RuntimeError(
-                "item_graph_kind=fused_completed_confidence|modality_completed_confidence requires confidence graph components"
-            )
-
-        components = self.ItemItemGraphComponents
-        if self.item_graph_kind == "modality_completed_confidence":
-            if modality is None:
-                raise RuntimeError("item_graph_kind=modality_completed_confidence requires a modality key")
-            if modality not in components:
-                raise RuntimeError(f"missing confidence graph components for modality={modality}")
-            components = components[modality]
-
-        coeffs = self._confidence_component_coeffs(modality=modality)
-        norm_type = getattr(self, "item_graph_dynamic_norm_type", "rw")
-        components = [
-            (name, component, coeffs[name])
-            for name, component in components.items()
-            if name in coeffs
-        ]
-        if not components:
-            raise RuntimeError("confidence graph components are empty")
-
-        if norm_type == "none":
-            neigh = torch.zeros_like(item_emb)
-            for _, component, coeff in components:
-                neigh = neigh + coeff * torch.sparse.mm(component, item_emb)
-            return neigh
-
-        degree = torch.zeros(item_emb.size(0), dtype=item_emb.dtype, device=item_emb.device)
-        for _, component, coeff in components:
-            degree = degree + coeff * self._component_row_sum(component).to(dtype=item_emb.dtype)
-
-        if norm_type == "rw":
-            neigh = torch.zeros_like(item_emb)
-            for _, component, coeff in components:
-                neigh = neigh + coeff * torch.sparse.mm(component, item_emb)
-            inv = torch.zeros_like(degree)
-            nonzero = degree > 0
-            inv[nonzero] = 1.0 / degree[nonzero]
-            return neigh * inv.unsqueeze(1)
-
-        if norm_type == "sym":
-            inv_sqrt = torch.zeros_like(degree)
-            nonzero = degree > 0
-            inv_sqrt[nonzero] = torch.pow(degree[nonzero], -0.5)
-            scaled_item_emb = item_emb * inv_sqrt.unsqueeze(1)
-            neigh = torch.zeros_like(item_emb)
-            for _, component, coeff in components:
-                neigh = neigh + coeff * torch.sparse.mm(component, scaled_item_emb)
-            return neigh * inv_sqrt.unsqueeze(1)
-
-        raise ValueError(f"Unsupported item graph normalization: {norm_type}")
 
     def _uses_posterior_reliability_for(self, component):
         if not self.use_posterior_reliability:

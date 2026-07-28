@@ -210,37 +210,6 @@ class MILK_session(object):
         }
         self.model.load_state_dict(restored, strict=True)
 
-    def _format_item_graph_confidences(self):
-        if not getattr(self.model, 'use_item_graph_edge_confidence', False):
-            return None
-        with torch.no_grad():
-            edge_conf = self.model._item_graph_edge_confidences()
-            edge_coeff = self.model._item_graph_edge_confidence_coeffs()
-
-        def fmt_triplet(values):
-            values = values.detach().cpu().tolist()
-            return f"rr={values[0]:.6f}, ri={values[1]:.6f}, ii={values[2]:.6f}"
-
-        messages = []
-        if isinstance(edge_conf, dict):
-            for modality in sorted(edge_conf):
-                messages.append(
-                    f"ITEM_GRAPH_CONF[{modality}]: confidence {fmt_triplet(edge_conf[modality])}; "
-                    f"coeff {fmt_triplet(edge_coeff[modality])}"
-                )
-        else:
-            messages.append(
-                f"ITEM_GRAPH_CONF: confidence {fmt_triplet(edge_conf)}; "
-                f"coeff {fmt_triplet(edge_coeff)}"
-            )
-        if hasattr(self.model, '_effective_item_graph_dynamic_score_blend'):
-            messages.append(
-                "ITEM_GRAPH_DYNAMIC_BLEND: "
-                f"score={self.model._effective_item_graph_dynamic_score_blend():.6f}, "
-                f"neighbor={self.model._effective_item_graph_dynamic_neighbor_blend():.6f}"
-            )
-        return messages
-
     def _finalize_strict_test_metrics(self):
         if self.best_model_state is None:
             return
@@ -737,20 +706,6 @@ class MILK_session(object):
                         self.env.args.modality_bpr_coeff
                         * self.model.modality_bpr_loss(user, pos_item, neg_item)
                     )
-                item_graph_confidence_reg_coeff = float(
-                    getattr(self.env.args, "item_graph_confidence_reg_coeff", 0.0) or 0.0
-                )
-                item_graph_confidence_reg_start_epoch = int(
-                    getattr(self.env.args, "item_graph_confidence_reg_start_epoch", 0) or 0
-                )
-                if (
-                    item_graph_confidence_reg_coeff > 0.0
-                    and current_epoch >= item_graph_confidence_reg_start_epoch
-                ):
-                    penalty_loss = penalty_loss + (
-                        item_graph_confidence_reg_coeff
-                        * self.model.item_graph_confidence_regularization_loss()
-                    )
                 if use_rec_neighbor_cl:
                     rec_neighbor_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                     rec_neighbor_cl_loss = self.model.compute_true_missing_gcn_infonce_loss(
@@ -1129,13 +1084,6 @@ class MILK_session(object):
                 key = 20 if 20 in hr else list(hr.keys())[0]
                 print(
                     f'epoch = {epoch} hr@{key} = {hr[key]:.5f}, recall@{key} = {recall[key]:.5f}, ndcg@{key} = {ndcg[key]:.5f}, {selection_mode}_time = {val_time:.2f}')
-                confidence_log_interval = int(getattr(self.env.args, 'item_graph_confidence_log_interval', 0) or 0)
-                if confidence_log_interval > 0 and epoch % confidence_log_interval == 0:
-                    for confidence_message in self._format_item_graph_confidences() or []:
-                        print(f'epoch = {epoch} {confidence_message}')
-                        if self.env.args.log:
-                            self.env.val_logger.info(f'epoch = {epoch} {confidence_message}')
-
                 metric_name, metric_topk, metric_value = self._resolve_recommendation_selection(hr, recall, ndcg)
                 if metric_value > self.best_recommendation_metric:
                     self.early_stop = 0

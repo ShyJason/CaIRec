@@ -376,31 +376,16 @@ def _build_parser():
         choices=[
             'none',
             'modality_masked',
-            'fused_completed',
             'modality_completed',
             'modality_completed_inductive',
-            'modality_completed_confidence',
-            'modality_completed_dynamic_confidence',
-            'fused_completed_confidence',
-            'fused_completed_dynamic_confidence',
-            'fused_completed_reliability',
-            'fused_completed_reliability_topk',
         ],
         help=(
             'Item-item graph adapter kind. modality_masked builds per-modality CF plus semantic '
             'graphs directly from masked raw features for strict Stage2-only no-completion ablations; '
-            'fused_completed fuses CF plus completed-feature '
-            'modality graphs before propagation; modality_completed propagates each modality '
+            'modality_completed propagates each modality '
             'embedding with its own CF plus completed-feature modality graph; '
             'modality_completed_inductive restricts semantic references to warm items and '
-            'attaches cold query rows only during evaluation; '
-            'modality_completed_confidence adds learnable edge confidence (rr/ri/ii) for each modality completed graph; '
-            'modality_completed_dynamic_confidence recomputes per-modality topk from the learned confidences during propagation; '
-            'fused_completed_confidence learns edge confidence for real-real, real-imputed, '
-            'and imputed-imputed completed-feature edges after a fixed initial topk; '
-            'fused_completed_dynamic_confidence recomputes topk from the learned confidences during propagation; '
-            'fused_completed_reliability downweights completed-feature graph edges using per-item completion reliability; '
-            'fused_completed_reliability_topk applies the same reliability before top-k neighbor selection.'
+            'attaches cold query rows only during evaluation.'
         ),
     )
     parser.add_argument(
@@ -435,93 +420,6 @@ def _build_parser():
     )
     parser.add_argument('--item_graph_image_weight', type=float, default=0.25)
     parser.add_argument('--item_graph_text_weight', type=float, default=0.25)
-    parser.add_argument('--item_graph_rr_confidence_init', type=float, default=1.0)
-    parser.add_argument('--item_graph_ri_confidence_init', type=float, default=1.0)
-    parser.add_argument('--item_graph_ii_confidence_init', type=float, default=1.0)
-    parser.add_argument(
-        '--item_graph_modality_specific_confidence',
-        type=int,
-        default=0,
-        help='Use separate rr/ri/ii confidence parameters for each modality graph when item_graph_kind is modality_completed*_confidence.',
-    )
-    parser.add_argument(
-        '--item_graph_confidence_blend',
-        type=float,
-        default=1.0,
-        help='Blend strength for learned edge confidences. 0 keeps the unweighted fused graph; 1 fully applies learned confidences.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_score_blend',
-        type=float,
-        default=1.0,
-        help='For dynamic confidence item graphs, blend raw candidate scores with learned-confidence scores before top-k. 1 fully uses learned scores.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_score_blend_start',
-        type=float,
-        default=-1.0,
-        help='Optional starting score blend for dynamic confidence graphs. Negative keeps item_graph_dynamic_score_blend from epoch 0.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_score_blend_warmup_epochs',
-        type=int,
-        default=0,
-        help='Linearly warm score blend from item_graph_dynamic_score_blend_start to item_graph_dynamic_score_blend over this many epochs.',
-    )
-    parser.add_argument(
-        '--item_graph_confidence_log_interval',
-        type=int,
-        default=0,
-        help='Print learned item graph edge confidences every N epochs when confidence item graphs are enabled. 0 disables periodic logging.',
-    )
-    parser.add_argument(
-        '--item_graph_confidence_reg_coeff',
-        type=float,
-        default=0.0,
-        help='L2 penalty coefficient that keeps active learned item graph edge confidences near item_graph_confidence_reg_target.',
-    )
-    parser.add_argument(
-        '--item_graph_confidence_reg_target',
-        type=float,
-        default=1.0,
-        help='Target edge confidence used by item_graph_confidence_reg_coeff.',
-    )
-    parser.add_argument('--item_graph_rr_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_ri_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_ii_confidence_reg_target', type=float, default=None)
-    parser.add_argument(
-        '--item_graph_confidence_reg_start_epoch',
-        type=int,
-        default=0,
-        help='Epoch at which item graph edge confidence regularization starts.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_neighbor_blend',
-        type=float,
-        default=1.0,
-        help='For dynamic confidence graphs, blend fixed-base neighbor propagation with dynamic learned neighbor propagation. 1 fully uses dynamic neighbors.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_neighbor_blend_start',
-        type=float,
-        default=-1.0,
-        help='Optional starting neighbor blend for dynamic confidence graphs. Negative keeps item_graph_dynamic_neighbor_blend from epoch 0.',
-    )
-    parser.add_argument(
-        '--item_graph_dynamic_neighbor_blend_warmup_epochs',
-        type=int,
-        default=0,
-        help='Linearly warm neighbor blend from item_graph_dynamic_neighbor_blend_start to item_graph_dynamic_neighbor_blend over this many epochs.',
-    )
-    parser.add_argument(
-        '--item_graph_confidence_transform',
-        type=str,
-        default='blend',
-        choices=['blend', 'sigmoid'],
-        help='blend uses 1 + blend * (confidence - 1); sigmoid directly uses a sigmoid-bounded learned edge weight.',
-    )
-    parser.add_argument('--item_graph_confidence_min', type=float, default=0.25)
-    parser.add_argument('--item_graph_confidence_max', type=float, default=4.0)
     parser.add_argument(
         '--item_graph_feature_space',
         type=str,
@@ -546,30 +444,6 @@ def _build_parser():
         help='Video graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
     )
     parser.add_argument('--item_graph_feature_chunk_size', type=int, default=1024)
-    parser.add_argument(
-        '--item_graph_reliability_floor',
-        type=float,
-        default=0.4,
-        help='Minimum per-item reliability for missing completed modality features in fused_completed_reliability.',
-    )
-    parser.add_argument(
-        '--item_graph_reliability_blend',
-        type=float,
-        default=1.0,
-        help='Blend strength for reliability edge reweighting. 0 keeps original completed graphs; 1 fully applies q_i*q_j.',
-    )
-    parser.add_argument(
-        '--item_graph_reliability_missing_penalty',
-        type=float,
-        default=1.0,
-        help='Extra multiplier for missing-item reliability before clamping to [floor, 1].',
-    )
-    parser.add_argument(
-        '--item_graph_reliability_missing_boost',
-        type=float,
-        default=0.0,
-        help='Optional boost for high-consistency missing completed modality features; 0 keeps reliability in [floor, 1].',
-    )
     parser.add_argument(
         '--item_graph_modal_alpha',
         type=float,
@@ -924,15 +798,8 @@ if args.imputer_ckpt is not None:
     tool.cprint(f'Loaded imputer checkpoint from {args.imputer_ckpt} ({len(matched_keys)} tensors)')
 if getattr(args, 'item_graph_kind', None) in (
     'modality_masked',
-    'fused_completed',
     'modality_completed',
     'modality_completed_inductive',
-    'modality_completed_confidence',
-    'modality_completed_dynamic_confidence',
-    'fused_completed_confidence',
-    'fused_completed_dynamic_confidence',
-    'fused_completed_reliability',
-    'fused_completed_reliability_topk',
 ):
     my_model.build_completed_item_graph()
 tool.cprint('Init Model')
@@ -968,43 +835,6 @@ my_session.train(my_env.args.epoch)
 # my_session.save_memory()
 my_env.close_env()
 tool.cprint(f'training stage cost time: {time.time() - t}')
-if getattr(my_model, 'use_item_graph_edge_confidence', False):
-    with torch.no_grad():
-        edge_conf = my_model._item_graph_edge_confidences()
-        edge_coeff = my_model._item_graph_edge_confidence_coeffs()
-    if isinstance(edge_conf, dict):
-        for modality in sorted(edge_conf):
-            conf = edge_conf[modality].detach().cpu().tolist()
-            coeff = edge_coeff[modality].detach().cpu().tolist()
-            edge_conf_msg = (
-                f"learned edge confidence[{modality}]: rr={conf[0]:.6f}, "
-                f"ri={conf[1]:.6f}, ii={conf[2]:.6f}"
-            )
-            edge_coeff_msg = (
-                f"learned edge coeff[{modality}]: rr={coeff[0]:.6f}, "
-                f"ri={coeff[1]:.6f}, ii={coeff[2]:.6f}"
-            )
-            tool.cprint(edge_conf_msg)
-            tool.cprint(edge_coeff_msg)
-            if my_env.args.log:
-                my_env.test_logger.info(edge_conf_msg)
-                my_env.test_logger.info(edge_coeff_msg)
-    else:
-        edge_conf = edge_conf.detach().cpu().tolist()
-        edge_coeff = edge_coeff.detach().cpu().tolist()
-        edge_conf_msg = (
-            f"learned edge confidence: rr={edge_conf[0]:.6f}, "
-            f"ri={edge_conf[1]:.6f}, ii={edge_conf[2]:.6f}"
-        )
-        edge_coeff_msg = (
-            f"learned edge coeff: rr={edge_coeff[0]:.6f}, "
-            f"ri={edge_coeff[1]:.6f}, ii={edge_coeff[2]:.6f}"
-        )
-        tool.cprint(edge_conf_msg)
-        tool.cprint(edge_coeff_msg)
-        if my_env.args.log:
-            my_env.test_logger.info(edge_conf_msg)
-            my_env.test_logger.info(edge_coeff_msg)
 if my_env.args.log:
     my_env.test_logger.info(f'--------- {my_env.args.suffix} best epoch {my_session.best_epoch}------------')
 
