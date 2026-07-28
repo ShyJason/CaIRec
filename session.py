@@ -838,7 +838,6 @@ class MILK_session(object):
             start_epoch = self.env.args.ckpt_start_epoch
         for epoch in range(start_epoch, epochs):
             self.model.train()
-            self.model.set_inductive_item_graph_split('train')
             (
                 loss,
                 main_bpr_loss,
@@ -1172,7 +1171,6 @@ class MILK_session(object):
     def test(self, mode='val', top_list=[50]):
         self.model.eval()
         self.model.set_missing_modality_via_env(eval_split=mode)
-        self.model.set_inductive_item_graph_split(mode)
         t = time.time()
         # user_emb = self.model.user_emb.weight
         # image_feat = self.model.image_feat
@@ -1183,25 +1181,18 @@ class MILK_session(object):
 
         user_emb = user_emb.cpu().detach().numpy()
         item_emb = item_emb.cpu().detach().numpy()
-        candidate_only = getattr(self.dataset, 'cold_start_protocol', 'none') == 'milk'
         if mode == 'val':
-            candidate_items = self.dataset.get_eval_candidate_items('val') if candidate_only else self.dataset.cold_item_index
             hr, recall, ndcg = evaluation.num_faiss_evaluate(self.dataset.val_data,
                                                         list(
                                                             self.dataset.val_data.keys()),
-                                                        list(candidate_items),
                                                         self.dataset.train_data,
-                                                        top_list, user_emb, item_emb,
-                                                        candidate_only=candidate_only)
+                                                        top_list, user_emb, item_emb)
         else:
-            candidate_items = self.dataset.get_eval_candidate_items('test') if candidate_only else self.dataset.cold_item_index
             hr, recall, ndcg = evaluation.num_faiss_evaluate(self.dataset.test_data,
                                                              list(
                                                                      self.dataset.test_data.keys()),
-                                                            list(candidate_items),
                                                              self.dataset.train_data,
-                                                             top_list, user_emb, item_emb,
-                                                             candidate_only=candidate_only)
+                                                             top_list, user_emb, item_emb)
             if bool(getattr(self.env.args, 'report_test_modality_subsets', 0)):
                 missing_items = self.dataset.test_missing_modality_items['items']
                 missing_ratings, full_ratings = evaluation.split_ratings_by_item_membership(
@@ -1220,12 +1211,10 @@ class MILK_session(object):
                     subset_hr, subset_recall, subset_ndcg = evaluation.num_faiss_evaluate(
                         subset_ratings,
                         list(subset_ratings.keys()),
-                        list(candidate_items),
                         self.dataset.train_data,
                         top_list,
                         user_emb,
                         item_emb,
-                        candidate_only=candidate_only,
                     )
                     self.last_test_modality_subsets[subset_name] = {
                         'counts': counts,

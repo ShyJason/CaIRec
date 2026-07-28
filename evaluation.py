@@ -67,12 +67,10 @@ def compute_ranking_metrics(testusers, testdata, traindata, topk_list, user_rank
 def num_faiss_evaluate(
     _test_ratings,
     _test_user_list,
-    _test_item_list,
     _train_ratings,
     _topk_list,
     _user_matrix,
     _item_matrix,
-    candidate_only=False,
 ):
     '''
     Evaluation for ranking results
@@ -91,23 +89,9 @@ def num_faiss_evaluate(
     dim = _user_matrix.shape[-1]
     index = faiss.IndexFlatIP(dim)
 
-    if candidate_only:
-        candidate_items = np.asarray(_test_item_list, dtype=np.int64)
-        if candidate_items.ndim != 1 or candidate_items.size == 0:
-            raise ValueError('candidate_only evaluation requires a non-empty 1-D item list')
-        if np.unique(candidate_items).size != candidate_items.size:
-            raise ValueError('candidate item list contains duplicates')
-        if candidate_items.min() < 0 or candidate_items.max() >= _item_matrix.shape[0]:
-            raise ValueError('candidate item id is outside the item embedding matrix')
-        if candidate_items.size < _topk_list[-1]:
-            raise ValueError('candidate item count must be at least max(topk)')
-        index.add(np.ascontiguousarray(_item_matrix[candidate_items]))
-        _, local_ranked_items = index.search(query_vectors, _topk_list[-1])
-        _user_rank_pred_items = candidate_items[local_ranked_items]
-    else:
-        index.add(_item_matrix)
-        max_mask_items_length = max(len(_train_ratings[user]) for user in _train_ratings.keys())
-        _, _user_rank_pred_items = index.search(query_vectors, _topk_list[-1]+max_mask_items_length)
+    index.add(_item_matrix)
+    max_mask_items_length = max(len(_train_ratings[user]) for user in _train_ratings.keys())
+    _, _user_rank_pred_items = index.search(query_vectors, _topk_list[-1]+max_mask_items_length)
     testdata = [list(_test_ratings[user]) for user in test_users]
     traindata = [list(_train_ratings[user]) if (user in _train_ratings.keys()) and len(_train_ratings[user]) > 0 else [-1] for user in test_users]
     all_metrics = compute_ranking_metrics(nb.typed.List(test_users), nb.typed.List(testdata),

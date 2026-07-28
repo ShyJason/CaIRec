@@ -43,10 +43,10 @@ class ModalitySubsetEvaluationTest(unittest.TestCase):
         missing, full = evaluation.split_ratings_by_item_membership(ratings, [2])
 
         _, missing_recall, _ = evaluation.num_faiss_evaluate(
-            missing, [0], [], {0: []}, [1, 2], users, items
+            missing, [0], {0: []}, [1, 2], users, items
         )
         _, full_recall, _ = evaluation.num_faiss_evaluate(
-            full, [0], [], {0: []}, [1, 2], users, items
+            full, [0], {0: []}, [1, 2], users, items
         )
 
         self.assertEqual(missing_recall[1], 0.0)

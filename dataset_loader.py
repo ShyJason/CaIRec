@@ -24,45 +24,7 @@ class Loader4MM(torch.utils.data.Dataset):
         self.uses_split_modal_feature_override = False
 
 
-        self.cold_start_protocol = getattr(self.env.args, 'cold_start_protocol', 'none')
-        self.cold_start_manifest = None
         split_path = self.env.DATA_PATH
-        if getattr(self, 'cold_start_protocol', 'none') == 'milk':
-            configured_dir = str(getattr(self.env.args, 'cold_start_data_dir', '') or '').strip()
-            if configured_dir:
-                split_path = configured_dir
-                if not os.path.isabs(split_path):
-                    split_path = os.path.join(self.env.DATA_PATH, split_path)
-            else:
-                split_path = os.path.join(
-                    self.env.DATA_PATH,
-                    'milk_cold_start',
-                    f"seed_{int(getattr(self.env.args, 'cold_start_seed', 2023))}",
-                )
-            manifest_file = os.path.join(split_path, 'manifest.json')
-            if not os.path.isfile(manifest_file):
-                raise FileNotFoundError(
-                    f'MILK cold-start split not found: {manifest_file}. '
-                    'Run scripts/prepare_milk_cold_start.py first.'
-                )
-            with open(manifest_file, encoding='utf-8') as f:
-                self.cold_start_manifest = json.load(f)
-            if self.cold_start_manifest.get('protocol') != 'milk_item_cold_start_v1':
-                raise ValueError(f'Unsupported cold-start manifest: {manifest_file}')
-            if self.cold_start_manifest.get('dataset') != self.env.args.dataset:
-                raise ValueError(f'Cold-start manifest dataset mismatch: {manifest_file}')
-            expected_seed = int(getattr(self.env.args, 'cold_start_seed', 2023))
-            if int(self.cold_start_manifest.get('seed')) != expected_seed:
-                raise ValueError(f'Cold-start manifest seed mismatch: {manifest_file}')
-            missing_masks = self.cold_start_manifest.get('missing_masks', {})
-            expected_missing_seed = int(getattr(self.env.args, 'cold_start_missing_seed', 2023))
-            if missing_masks.get('protocol') != 'milk_mtmt_fixed_v1':
-                raise ValueError(
-                    f'Cold-start manifest has no fixed MILK MM missing masks: {manifest_file}. '
-                    'Regenerate it with scripts/prepare_milk_cold_start.py --force.'
-                )
-            if int(missing_masks.get('seed')) != expected_missing_seed:
-                raise ValueError(f'Cold-start missing-mask seed mismatch: {manifest_file}')
 
         train_file = os.path.join(split_path, 'train.txt')
         val_file = os.path.join(split_path, 'val.txt')
@@ -131,8 +93,6 @@ class Loader4MM(torch.utils.data.Dataset):
       
 
         self.trainItem = trainItem
-        setTrainItem = set(trainItem)
-        self.cold_item_index = set()
         self.eval_val_missing_modality_items = self._empty_missing_metadata()
         self.val_data = defaultdict(list)
         with open(val_file) as f:
@@ -148,9 +108,6 @@ class Loader4MM(torch.utils.data.Dataset):
                     else:
                         items = [int(i) for i in l[1:]]
 
-                    for item in items:
-                        if item not in setTrainItem:
-                            self.cold_item_index.add(item)
                     self.val_data[uid].extend(items)
                     valUniqueUsers.append(uid)
                     valUser.extend([uid] * len(items))
@@ -173,16 +130,12 @@ class Loader4MM(torch.utils.data.Dataset):
                         continue
                     else:
                         items = [int(i) for i in l[1:]]
-                    for item in items:
-                        if item not in setTrainItem:
-                            self.cold_item_index.add(item)
                     self.test_data[uid].extend(items)
                     testUniqueUsers.append(uid)
                     testUser.extend([uid] * len(items))
                     testItem.extend(items)
                     self.m_item = max(self.m_item, max(items))
                     self.testDataSize += len(items)
-        self.cold_item_index = list(self.cold_item_index)
         self.m_item += 1
         self.n_user += 1
 
@@ -190,39 +143,7 @@ class Loader4MM(torch.utils.data.Dataset):
         self.testUser = np.array(testUser)
         self.testItem = np.array(testItem)
 
-        if self.cold_start_protocol == 'milk':
-            self.train_item_index = np.asarray(self.cold_start_manifest['train_items'], dtype=np.int64)
-            self.val_cold_item_index = np.asarray(self.cold_start_manifest['val_items'], dtype=np.int64)
-            self.test_cold_item_index = np.asarray(self.cold_start_manifest['test_items'], dtype=np.int64)
-            observed_train_items = set(trainItem)
-            observed_val_items = set(valItem)
-            observed_test_items = set(testItem)
-            train_candidates = set(self.train_item_index.tolist())
-            val_candidates = set(self.val_cold_item_index.tolist())
-            test_candidates = set(self.test_cold_item_index.tolist())
-            if train_candidates & val_candidates or train_candidates & test_candidates or val_candidates & test_candidates:
-                raise ValueError('MILK cold-start item partitions are not disjoint')
-            if not observed_train_items <= train_candidates:
-                raise ValueError('Training interactions contain held-out cold items')
-            if not observed_val_items <= val_candidates:
-                raise ValueError('Validation interactions contain non-validation items')
-            if not observed_test_items <= test_candidates:
-                raise ValueError('Test interactions contain non-test items')
-            self.cold_item_index = np.concatenate(
-                [self.val_cold_item_index, self.test_cold_item_index]
-            ).astype(np.int64)
-            self.negative_item_pool = self.train_item_index.copy()
-            print(
-                'loaded strict MILK cold-start split: '
-                f'train_items={len(self.train_item_index)}, '
-                f'val_items={len(self.val_cold_item_index)}, '
-                f'test_items={len(self.test_cold_item_index)}'
-            )
-        else:
-            self.train_item_index = np.asarray(sorted(set(trainItem)), dtype=np.int64)
-            self.val_cold_item_index = np.asarray(self.cold_item_index, dtype=np.int64)
-            self.test_cold_item_index = np.asarray(self.cold_item_index, dtype=np.int64)
-            self.negative_item_pool = np.arange(self.m_item, dtype=np.int64)
+        self.negative_item_pool = np.arange(self.m_item, dtype=np.int64)
 
         self.Graph = None
         # pre-calculate
@@ -704,90 +625,9 @@ class Loader4MM(torch.utils.data.Dataset):
                 data.extend(row_data.astype(np.float32).tolist())
         return sp.csr_matrix((data, (rows, cols)), shape=(n_item, n_item), dtype=np.float32)
 
-    def _build_inductive_feature_item_graph(
-        self,
-        feature,
-        reference_items,
-        query_items,
-        topk,
-        chunk_size,
-        reliability=None,
-        reliability_blend=1.0,
-    ):
-        """Build directed query-to-warm semantic edges for cold-start."""
-        feature = np.asarray(feature, dtype=np.float32)
-        n_item = feature.shape[0]
-        reference_items = np.unique(np.asarray(reference_items, dtype=np.int64))
-        query_items = np.unique(np.asarray(query_items, dtype=np.int64))
-        if reference_items.size == 0:
-            raise ValueError('Inductive item graph requires warm reference items')
-        if np.any(reference_items < 0) or np.any(reference_items >= n_item):
-            raise ValueError('Inductive reference item is out of range')
-        if np.any(query_items < 0) or np.any(query_items >= n_item):
-            raise ValueError('Inductive query item is out of range')
-
-        norms = np.linalg.norm(feature, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        feature = feature / norms
-        reference_feature = feature[reference_items]
-        if reliability is not None:
-            reliability = np.asarray(reliability, dtype=np.float32).reshape(-1)
-            if reliability.shape[0] != n_item:
-                raise ValueError(
-                    f'reliability length must match item count: {reliability.shape[0]} != {n_item}'
-                )
-            reliability_blend = min(max(float(reliability_blend), 0.0), 1.0)
-            if reliability_blend <= 0.0:
-                reliability = None
-
-        chunk_size = max(int(chunk_size), 1)
-        topk = min(max(int(topk), 1), reference_items.size)
-        candidate_k = min(topk + 1, reference_items.size)
-        reference_position = {int(item): idx for idx, item in enumerate(reference_items.tolist())}
-        rows, cols, data = [], [], []
-        for start in tqdm(range(0, query_items.size, chunk_size), desc='building inductive feature item graph'):
-            batch_queries = query_items[start:start + chunk_size]
-            sim = np.matmul(feature[batch_queries], reference_feature.T)
-            if reliability is not None:
-                edge_reliability = reliability[batch_queries, None] * reliability[reference_items][None, :]
-                if reliability_blend < 1.0:
-                    edge_reliability = 1.0 + reliability_blend * (edge_reliability - 1.0)
-                sim = sim * edge_reliability.astype(np.float32)
-            for offset, item in enumerate(batch_queries.tolist()):
-                self_position = reference_position.get(int(item))
-                if self_position is not None:
-                    sim[offset, self_position] = -np.inf
-
-            top_idx = np.argpartition(sim, -candidate_k, axis=1)[:, -candidate_k:]
-            top_val = np.take_along_axis(sim, top_idx, axis=1)
-            order = np.argsort(top_val, axis=1)[:, ::-1]
-            top_idx = np.take_along_axis(top_idx, order, axis=1)
-            top_val = np.take_along_axis(top_val, order, axis=1)
-            for offset, row in enumerate(batch_queries.tolist()):
-                valid = np.isfinite(top_val[offset]) & (top_val[offset] > 0)
-                row_cols = reference_items[top_idx[offset][valid]][:topk]
-                row_data = top_val[offset][valid][:topk]
-                if row_data.size == 0:
-                    continue
-                rows.extend([int(row)] * row_data.size)
-                cols.extend(row_cols.astype(np.int64).tolist())
-                data.extend(row_data.astype(np.float32).tolist())
-        return sp.csr_matrix((data, (rows, cols)), shape=(n_item, n_item), dtype=np.float32)
-
     @property
     def allPos(self):
         return self._allPos
-
-    def get_eval_candidate_items(self, mode):
-        if self.cold_start_protocol != 'milk':
-            return np.arange(self.m_item, dtype=np.int64)
-        if getattr(self.env.args, 'cold_start_eval_candidates', 'milk_union') == 'milk_union':
-            return self.cold_item_index
-        if mode == 'val':
-            return self.val_cold_item_index
-        if mode == 'test':
-            return self.test_cold_item_index
-        raise ValueError(f'Unsupported evaluation split: {mode}')
 
     def set_miss_mutimedia_feature_items(self, fea, seed=None, rate=0.3, exp_mode='fm', path=''):
 
@@ -797,84 +637,6 @@ class Loader4MM(torch.utils.data.Dataset):
 
         protocol = getattr(self.env.args, 'missing_mask_protocol', 'i3')
         seed = self._dataset_seed() if seed is None else seed
-        if getattr(self, 'cold_start_protocol', 'none') == 'milk':
-            fixed = self.cold_start_manifest['missing_masks']
-            eval_rate = float(getattr(self.env.args, 'eval_missing_rate', 0.5))
-            if not np.isclose(float(rate), float(fixed['train_rate'])):
-                raise ValueError(
-                    f'MILK MM train missing rate must be {fixed["train_rate"]}, got {rate}'
-                )
-            if not np.isclose(eval_rate, float(fixed['eval_rate'])):
-                raise ValueError(
-                    f'MILK MM eval missing rate must be {fixed["eval_rate"]}, got {eval_rate}'
-                )
-            if int(fixed['n_modalities']) != len(fea):
-                raise ValueError(
-                    f'Missing-mask modality count mismatch: {fixed["n_modalities"]} != {len(fea)}'
-                )
-
-            partition_sets = {
-                'train': set(self.train_item_index.tolist()),
-                'val': set(self.val_cold_item_index.tolist()),
-                'test': set(self.test_cold_item_index.tolist()),
-            }
-
-            def load_fixed_metadata(split):
-                payload = fixed[split]
-                items = np.asarray(payload['items'], dtype=np.int64)
-                indicators = np.asarray(payload['indicator'], dtype=np.int64)
-                if items.ndim != 1 or indicators.shape != items.shape:
-                    raise ValueError(f'Invalid fixed missing metadata for {split}')
-                if len(np.unique(items)) != len(items):
-                    raise ValueError(f'Duplicate fixed missing items for {split}')
-                if not set(items.tolist()) <= partition_sets[split]:
-                    raise ValueError(f'Fixed missing items escape the {split} item partition')
-                if np.any(indicators < 0) or np.any(indicators >= len(fea)):
-                    raise ValueError(f'Invalid fixed missing modality for {split}')
-                return {'items': items, 'indicator': indicators}
-
-            self.train_missing_modality_items = load_fixed_metadata('train')
-            self.eval_val_missing_modality_items = load_fixed_metadata('val')
-            self.test_missing_modality_items = load_fixed_metadata('test')
-            self.protected_indices = np.asarray(
-                fixed['modality_indicator_by_item'], dtype=np.int64
-            )
-            if self.protected_indices.shape != (fea[0].shape[0],):
-                raise ValueError('Fixed modality_indicator_by_item has invalid shape')
-            self.train_protected_indices = self.protected_indices.copy()
-
-            train_candidates = np.asarray(sorted(set(self.trainItem)), dtype=np.int64)
-            val_rate = max(0.0, float(getattr(self.env.args, 'imputation_val_rate', 0.0)))
-            if val_rate > 0 and train_candidates.size > 0:
-                holdout_rng = np.random.default_rng(int(fixed['seed']) + 1000009)
-                holdout_candidates = train_candidates.copy()
-                holdout_rng.shuffle(holdout_candidates)
-                holdout_size = min(
-                    train_candidates.size,
-                    max(1, int(train_candidates.size * val_rate)),
-                )
-                holdout_items = np.sort(holdout_candidates[:holdout_size])
-                self.val_missing_modality_items = {
-                    'items': holdout_items,
-                    'indicator': self.protected_indices[holdout_items],
-                }
-                self.stage1_train_items = np.setdiff1d(
-                    train_candidates, holdout_items, assume_unique=False
-                )
-                keep = ~np.isin(self.train_missing_modality_items['items'], holdout_items)
-                self.train_missing_modality_items = {
-                    'items': self.train_missing_modality_items['items'][keep],
-                    'indicator': self.train_missing_modality_items['indicator'][keep],
-                }
-            else:
-                self.val_missing_modality_items = self._empty_missing_metadata()
-                self.stage1_train_items = train_candidates
-            print(
-                f'loaded fixed MILK MM missing masks from cold-start manifest '
-                f'(seed={fixed["seed"]})'
-            )
-            self._log_missing_protocol(len(fea), rate, eval_rate)
-            return
         if protocol == 'unified_static':
             payload_seed = int(getattr(self.env.args, 'unified_payload_seed', -1))
             if payload_seed < 0:

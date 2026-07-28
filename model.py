@@ -132,8 +132,6 @@ class MILK_model(torch.nn.Module):
         self.Graph = dataset.getSparseGraph()
         self.ItemItemGraph = None
         self.ItemItemGraphs = {}
-        self.InductiveItemItemGraphs = {}
-        self._inductive_item_graph_split = None
         self.ItemItemRawGraph = None
         self.free_emb_dimension = self.env.args.free_emb_dimension
         self.has_audio_modality = dataset.audio_feat is not None
@@ -251,7 +249,6 @@ class MILK_model(torch.nn.Module):
         self.use_completed_item_graph = self.item_graph_kind in (
             "modality_masked",
             "modality_completed",
-            "modality_completed_inductive",
         )
         self.use_item_graph_modal_residual = (
             self.item_graph_modal_alpha > 0.0
@@ -764,31 +761,6 @@ class MILK_model(torch.nn.Module):
             audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
             video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
-        missing_all_metadata = {
-            "items": np.concatenate([
-                np.asarray(self.train_missing_modality_items.get("items", []), dtype=np.int64),
-                np.asarray(self.eval_val_missing_modality_items.get("items", []), dtype=np.int64),
-                np.asarray(self.test_missing_modality_items.get("items", []), dtype=np.int64),
-            ]),
-            "indicator": np.concatenate([
-                np.asarray(self.train_missing_modality_items.get("indicator", []), dtype=np.int64),
-                np.asarray(self.eval_val_missing_modality_items.get("indicator", []), dtype=np.int64),
-                np.asarray(self.test_missing_modality_items.get("indicator", []), dtype=np.int64),
-            ]),
-        }
-        (
-            self.miss_cold_union_image_feature,
-            self.miss_cold_union_text_feature,
-            self.miss_cold_union_audio_feature,
-            self.miss_cold_union_video_feature,
-        ) = self._build_missing_feature_view(
-            missing_all_metadata,
-            image_base=self.eval_ori_image_feat,
-            text_base=self.eval_ori_text_feat,
-            audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
-            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
-        )
-
     def refresh_dynamic_stage1_missing_views(self):
         self._dynamic_stage1_refresh_counter += 1
         dataset_seed = int(getattr(self.env.args, "dataset_seed", 0))
@@ -866,18 +838,6 @@ class MILK_model(torch.nn.Module):
                 print("set complete modality successfully for train step")
         else:
             if use_missing_test:
-                if (
-                    getattr(self.dataset, "cold_start_protocol", "none") == "milk"
-                    and getattr(self.env.args, "cold_start_eval_candidates", "milk_union") == "milk_union"
-                ):
-                    self.image_feat = self.miss_cold_union_image_feature
-                    self.text_feat = self.miss_cold_union_text_feature
-                    if "a" in self.modalities:
-                        self.audio_feat = self.miss_cold_union_audio_feature
-                    if "d" in self.modalities:
-                        self.video_feat = self.miss_cold_union_video_feature
-                    print("set MILK missing-all modality view for evaluation")
-                    return
                 if eval_split == "val":
                     self.image_feat = self.miss_eval_val_image_feature
                     self.text_feat = self.miss_eval_val_text_feature
@@ -1037,7 +997,6 @@ class MILK_model(torch.nn.Module):
         if kind not in (
             "modality_masked",
             "modality_completed",
-            "modality_completed_inductive",
         ):
             raise ValueError(f"Unsupported completed item graph kind: {kind}")
 
@@ -1126,20 +1085,7 @@ class MILK_model(torch.nn.Module):
                 clip=cf_clip,
             )
         graphs = {"cf": cf_graph}
-        inductive_kind = kind == "modality_completed_inductive"
-        warm_items = np.asarray(getattr(self.dataset, "train_item_index", []), dtype=np.int64)
-
         def build_semantic_graph(feature, reliability):
-            if inductive_kind:
-                return self.dataset._build_inductive_feature_item_graph(
-                    feature,
-                    reference_items=warm_items,
-                    query_items=warm_items,
-                    topk=topk,
-                    chunk_size=chunk_size,
-                    reliability=reliability,
-                    reliability_blend=reliability_blend,
-                )
             return self.dataset._build_feature_item_graph(
                 feature,
                 topk,
@@ -1182,7 +1128,7 @@ class MILK_model(torch.nn.Module):
                     f"strict masked graph modality={modality} missing_items={int(missing.sum())} "
                     f"semantic_edges={graphs[graph_name].nnz} missing_semantic_edges=0"
                 )
-        if kind in ("modality_masked", "modality_completed", "modality_completed_inductive"):
+        if kind in ("modality_masked", "modality_completed"):
             self.ItemItemGraphs = {}
             if fuse_before_topk:
                 modality_specs = {
@@ -1269,17 +1215,8 @@ class MILK_model(torch.nn.Module):
                     required_names=list(graph_parts.keys()),
                     context=f"{graph_label} {key} item graph",
                 )
-                if kind == "modality_completed_inductive":
-                    cold_items = np.asarray(self.dataset.cold_item_index, dtype=np.int64)
-                    if graph[cold_items].nnz or graph[:, cold_items].nnz:
-                        raise RuntimeError(
-                            f"inductive training item graph {key} contains an edge involving a cold item"
-                        )
                 self.ItemItemGraphs[key] = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
             self.ItemItemGraph = None
-            if kind == "modality_completed_inductive":
-                self.InductiveItemItemGraphs["train"] = self.ItemItemGraphs
-                self._inductive_item_graph_split = "train"
             print(
                 f"built {graph_label} item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
                 f"graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
@@ -1298,118 +1235,6 @@ class MILK_model(torch.nn.Module):
                     f"{rel_desc}"
                 )
             return
-
-    def set_inductive_item_graph_split(self, split):
-        """Switch between the warm training graph and cold-query inference graph."""
-        if self.item_graph_kind != "modality_completed_inductive":
-            return
-        if split == "train":
-            self.ItemItemGraphs = self.InductiveItemItemGraphs["train"]
-            self._inductive_item_graph_split = "train"
-            self.clear_gcn_cache()
-            return
-        if split not in ("val", "test"):
-            raise ValueError(f"Unsupported inductive item graph split: {split}")
-
-        candidate_protocol = getattr(self.env.args, "cold_start_eval_candidates", "milk_union")
-        cache_key = "milk_union" if candidate_protocol == "milk_union" else split
-        if cache_key in self.InductiveItemItemGraphs:
-            self.ItemItemGraphs = self.InductiveItemItemGraphs[cache_key]
-            self._inductive_item_graph_split = cache_key
-            self.clear_gcn_cache()
-            return
-
-        topk = int(getattr(self.env.args, "item_graph_topk", 20))
-        norm_type = getattr(self.env.args, "item_graph_norm", "rw")
-        chunk_size = int(getattr(self.env.args, "item_graph_feature_chunk_size", 1024))
-        warm_items = np.asarray(self.dataset.train_item_index, dtype=np.int64)
-        cold_queries = np.asarray(self.dataset.get_eval_candidate_items(split), dtype=np.int64)
-        active_queries = np.unique(np.concatenate([warm_items, cold_queries]))
-        raw_features = self._current_raw_modal_features()
-        with torch.no_grad():
-            masks = self._missing_masks(raw_features=raw_features)
-            projected = self.project_features(raw_features=raw_features)
-            graph_features = self._build_completed_features(
-                projected,
-                masks,
-                detach_imputed=True,
-            )
-            graph_feature_space = getattr(self.env.args, "item_graph_feature_space", "shared")
-            if graph_feature_space == "raw_decoder" and not self.use_latent_completion_bridge:
-                decoded_raw = self.bridge_completed_to_recommendation_raw(graph_features)
-                graph_features = {
-                    modality: torch.where(
-                        masks[modality].unsqueeze(1),
-                        raw_features[modality],
-                        decoded_raw[modality],
-                    )
-                    for modality in self.modalities
-                }
-            graph_feature_np = {
-                modality: graph_features[modality].detach().cpu().numpy().astype(np.float32)
-                for modality in self.modalities
-            }
-            if self.use_posterior_reliability:
-                reliabilities = {
-                    modality: scores.detach().cpu().numpy().astype(np.float32)
-                    for modality, scores in self._posterior_completion_reliabilities(masks).items()
-                }
-            else:
-                reliabilities = None
-
-        weights = {
-            "cf": float(getattr(self.env.args, "item_graph_cf_weight", 0.5)),
-            "image": float(getattr(self.env.args, "item_graph_image_weight", 0.25)),
-            "text": float(getattr(self.env.args, "item_graph_text_weight", 0.25)),
-            "audio": float(getattr(self.env.args, "item_graph_audio_weight", 0.0)),
-            "video": float(getattr(self.env.args, "item_graph_video_weight", 0.0)),
-        }
-        cf_graph = self.dataset._build_cf_item_graph(
-            topk,
-            scale=getattr(self.env.args, "item_graph_cf_scale", "raw"),
-            power=float(getattr(self.env.args, "item_graph_cf_power", 0.5)),
-            clip=float(getattr(self.env.args, "item_graph_cf_clip", 3.0)),
-        )
-        modality_specs = (("v", "image"), ("t", "text"), ("a", "audio"), ("d", "video"))
-        item_graphs = {}
-        reliability_blend = 1.0
-        for modality, graph_name in modality_specs:
-            if modality not in self.modalities or weights[graph_name] <= 0.0:
-                continue
-            semantic_graph = self.dataset._build_inductive_feature_item_graph(
-                graph_feature_np[modality],
-                reference_items=warm_items,
-                query_items=active_queries,
-                topk=topk,
-                chunk_size=chunk_size,
-                reliability=reliabilities[modality] if reliabilities is not None else None,
-                reliability_blend=reliability_blend,
-            )
-            graph = self._build_weighted_item_item_graph(
-                {"cf": cf_graph, graph_name: semantic_graph},
-                {"cf": weights["cf"], graph_name: weights[graph_name]},
-                topk,
-                norm_type,
-                required_names=["cf", graph_name],
-                context=f"inductive {split} {modality} item graph",
-            )
-            all_cold_items = np.asarray(self.dataset.cold_item_index, dtype=np.int64)
-            if graph[:, all_cold_items].nnz:
-                raise RuntimeError(
-                    f"inductive evaluation item graph {modality} contains warm-to-cold or cold-to-cold edges"
-                )
-            item_graphs[modality] = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-        item_graphs["cf"] = self.dataset._convert_sp_mat_to_sp_tensor(
-            self._build_single_item_item_graph(cf_graph, topk, norm_type)
-        ).coalesce().to(self.env.device)
-        self.InductiveItemItemGraphs[cache_key] = item_graphs
-        self.ItemItemGraphs = item_graphs
-        self._inductive_item_graph_split = cache_key
-        self.clear_gcn_cache()
-        print(
-            f"built inductive item graph split={split}, candidates={candidate_protocol}, "
-            f"warm_references={len(warm_items)}, cold_queries={len(cold_queries)}"
-        )
 
     def _build_single_item_item_graph(self, graph, topk, norm_type):
         graph = self.dataset._topk_sparse_rows(graph.tocsr(), topk)
@@ -1829,7 +1654,6 @@ class MILK_model(torch.nn.Module):
         if self.item_graph_kind in (
             "modality_masked",
             "modality_completed",
-            "modality_completed_inductive",
         ):
             if not self.ItemItemGraphs:
                 raise RuntimeError(

@@ -142,28 +142,6 @@ def _build_parser():
         help='Strict protocol only: log test metrics every N epochs without using them for selection. 0 disables.',
     )
     parser.add_argument('--dataset', type=str, default='clothing')
-    parser.add_argument(
-        '--cold_start_protocol',
-        type=str,
-        default='none',
-        choices=['none', 'milk'],
-        help='milk loads a pre-generated 80/10/10 item-disjoint split.',
-    )
-    parser.add_argument('--cold_start_seed', type=int, default=2023)
-    parser.add_argument('--cold_start_missing_seed', type=int, default=2023)
-    parser.add_argument(
-        '--cold_start_eval_candidates',
-        type=str,
-        default='milk_union',
-        choices=['milk_union', 'split'],
-        help='Use the official MILK cold union or split-specific cold candidates.',
-    )
-    parser.add_argument(
-        '--cold_start_data_dir',
-        type=str,
-        default='',
-        help='Optional split directory. Relative paths are resolved below Data/<dataset>.',
-    )
     parser.add_argument('--exp_mode', type=str, default='fm')
     parser.add_argument(
         '--train_stage',
@@ -377,15 +355,12 @@ def _build_parser():
             'none',
             'modality_masked',
             'modality_completed',
-            'modality_completed_inductive',
         ],
         help=(
             'Item-item graph adapter kind. modality_masked builds per-modality CF plus semantic '
             'graphs directly from masked raw features for strict Stage2-only no-completion ablations; '
             'modality_completed propagates each modality '
-            'embedding with its own CF plus completed-feature modality graph; '
-            'modality_completed_inductive restricts semantic references to warm items and '
-            'attaches cold query rows only during evaluation.'
+            'embedding with its own CF plus completed-feature modality graph.'
         ),
     )
     parser.add_argument(
@@ -727,26 +702,6 @@ def _validate_protocol_args(args):
             raise ValueError('Strict evaluation cannot use selection_mode=test; use validation selection.')
         if args.imputation_selection_split == 'test':
             raise ValueError('Strict evaluation cannot use imputation_selection_split=test; use train or val.')
-    if args.cold_start_protocol == 'milk':
-        if args.exp_mode != 'mm':
-            raise ValueError('This MILK cold-start implementation is restricted to exp_mode=mm.')
-        if args.evaluation_protocol != 'strict':
-            raise ValueError('MILK cold-start requires evaluation_protocol=strict.')
-        if getattr(args, 'item_graph_kind', 'none') not in ('none', 'modality_completed_inductive'):
-            raise ValueError(
-                'MILK cold-start requires item_graph_kind=none or modality_completed_inductive; '
-                'the other semantic item graphs expose cold features during training.'
-            )
-        if getattr(args, 'item_graph_kind', 'none') == 'modality_completed_inductive':
-            if args.train_stage != 'recommender':
-                raise ValueError('modality_completed_inductive is only supported in cold-start Stage2 recommender training.')
-            if int(getattr(args, 'freeze_imputer', -1)) == 0:
-                raise ValueError('modality_completed_inductive requires a frozen Stage1 imputer.')
-        if getattr(args, 'missing_mask_protocol', 'i3') == 'unified_static':
-            raise ValueError(
-                'MILK cold-start does not support unified_static masks because the shared payload can '
-                'place cold items in the training missing-modality set.'
-            )
     return args
 
 
@@ -799,7 +754,6 @@ if args.imputer_ckpt is not None:
 if getattr(args, 'item_graph_kind', None) in (
     'modality_masked',
     'modality_completed',
-    'modality_completed_inductive',
 ):
     my_model.build_completed_item_graph()
 tool.cprint('Init Model')
