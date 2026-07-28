@@ -461,15 +461,12 @@ class MILK_model(torch.nn.Module):
         decoder_trainable = (
             self.use_decode_head
             and not bool(freeze_decoder)
-            and canonical_stage in ("imputer_backprop", "recommender", "joint")
+            and canonical_stage in ("imputer_backprop", "recommender")
         )
         self._set_modules_trainable(self._decoder_modules(), decoder_trainable)
         self._imputer_updates_enabled = (
             getattr(self.env.args, "generative_update_mode", "em") == "em"
-            and canonical_stage in (
-                "imputer_param",
-                "joint",
-            )
+            and canonical_stage == "imputer_param"
         )
         self.clear_gcn_cache()
 
@@ -491,7 +488,7 @@ class MILK_model(torch.nn.Module):
 
     def get_imputer_parameters(self):
         exclude = set()
-        if self.use_latent_direct_bridge and self._canonical_stage() in ("recommender", "joint"):
+        if self.use_latent_direct_bridge and self._canonical_stage() == "recommender":
             exclude = self._module_param_ids(self._projection_modules())
         return self._trainable_parameters(self._imputer_modules(), exclude)
 
@@ -500,7 +497,7 @@ class MILK_model(torch.nn.Module):
 
     def get_recommender_parameters(self):
         exclude = set()
-        if self.use_latent_direct_bridge and self._canonical_stage() not in ("recommender", "joint"):
+        if self.use_latent_direct_bridge and self._canonical_stage() != "recommender":
             exclude = self._module_param_ids(self._projection_modules())
         return self._trainable_parameters(self._recommender_modules(), exclude)
 
@@ -1534,17 +1531,6 @@ class MILK_model(torch.nn.Module):
         item_emb = torch.nan_to_num(item_emb, nan=0.0, posinf=0.0, neginf=0.0)
         return user_emb, item_emb
 
-    def compute_task_aware_distillation_losses(
-        self,
-        batch_users,
-        batch_pos_items,
-        batch_neg_items,
-        student_user_emb=None,
-        student_item_emb=None,
-    ):
-        zero = torch.zeros((), device=self.env.device)
-        return zero, zero
-
     def compute_adapter_alignment_loss(self, item_ids, pseudo_ratio=1.0):
         """Align decoupled completed representations to the recommendation space.
 
@@ -2297,10 +2283,7 @@ class MILK_model(torch.nn.Module):
                 observed_modalities,
                 self.d_beta,
             )
-            if self._imputer_updates_enabled and stage in (
-                "imputer_param",
-                "joint",
-            ):
+            if self._imputer_updates_enabled and stage == "imputer_param":
                 self.queue_em_update(batch_data, posterior_mean, posterior_cov)
             pattern_rec_loss, _ = compute_nll_loss(
                 batch_data,
@@ -2417,8 +2400,7 @@ class MILK_model(torch.nn.Module):
         """Build completed features for ALL items (like ProMRL).
         Observed features keep grad_fn.
         Imputed features are detached by default to preserve the original
-        ProMRL-style optimization path, but recommendation-time joint training
-        can opt into gradient flow through the imputation branch.
+        ProMRL-style optimization path.
         """
         if self.disable_imputation:
             return {modality: feat.clone() for modality, feat in projected.items()}
@@ -2486,28 +2468,13 @@ class MILK_model(torch.nn.Module):
         projected = self.project_features(item_ids=item_ids, raw_features=raw_features)
         full_masks = self._missing_masks(raw_features=raw_features)
         masks = {modality: full_masks[modality][item_ids] for modality in self.modalities}
-        is_joint_stage = stage == "joint"
-
-        if is_joint_stage:
-            need_rec = float(getattr(self.env.args, "beta_rec", 0.0)) != 0.0
-            need_contrastive = (
-                float(getattr(self.env.args, "beta_intra", 0.0)) != 0.0
-                or float(getattr(self.env.args, "beta_inter", 0.0)) != 0.0
-            )
-            need_itm = float(getattr(self.env.args, "beta_itm", 0.0)) != 0.0
-            need_decode = (
-                float(getattr(self.env.args, "beta_decode", 0.0)) != 0.0
-            )
-        else:
-            need_rec = float(getattr(self.env.args, "alpha_rec", 0.0)) != 0.0
-            need_contrastive = (
-                float(getattr(self.env.args, "alpha_intra", 0.0)) != 0.0
-                or float(getattr(self.env.args, "alpha_inter", 0.0)) != 0.0
-            )
-            need_itm = float(getattr(self.env.args, "alpha_itm", 0.0)) != 0.0
-            need_decode = (
-                float(getattr(self.env.args, "alpha_decode", 0.0)) != 0.0
-            )
+        need_rec = float(getattr(self.env.args, "alpha_rec", 0.0)) != 0.0
+        need_contrastive = (
+            float(getattr(self.env.args, "alpha_intra", 0.0)) != 0.0
+            or float(getattr(self.env.args, "alpha_inter", 0.0)) != 0.0
+        )
+        need_itm = float(getattr(self.env.args, "alpha_itm", 0.0)) != 0.0
+        need_decode = float(getattr(self.env.args, "alpha_decode", 0.0)) != 0.0
 
         # Step 2-3: Posterior inference + rec_loss for each observed-modality pattern.
         rec_loss = torch.zeros((), device=self.env.device)

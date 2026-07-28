@@ -171,7 +171,6 @@ def _build_parser():
             'imputer_param',
             'imputer_backprop',
             'recommender',
-            'joint',
         ],
     )
     parser.add_argument('--freeze_imputer', type=int, default=-1)
@@ -390,42 +389,6 @@ def _build_parser():
         ),
     )
     parser.add_argument('--modality_bpr_coeff', type=float, default=0.2)
-    parser.add_argument('--beta_intra', type=float, default=0.05)
-    parser.add_argument('--beta_inter', type=float, default=0.05)
-    parser.add_argument('--beta_itm', type=float, default=0.05)
-    parser.add_argument('--beta_rec', type=float, default=0.01)
-    parser.add_argument('--beta_decode', type=float, default=0.01)
-    parser.add_argument(
-        '--joint_completion_batch_size',
-        type=int,
-        default=0,
-        help=(
-            'Joint stage only: use an independent uniformly shuffled item batch of this '
-            'size for completion losses. 0 preserves the legacy behavior that reuses '
-            'unique positive/negative items from the interaction batch.'
-        ),
-    )
-    parser.add_argument(
-        '--joint_grad_audit',
-        type=int,
-        default=0,
-        help='Joint stage only: print and validate first-batch imputer/recommender gradient norms.',
-    )
-    parser.add_argument(
-        '--joint_item_graph_refresh_interval',
-        type=int,
-        default=0,
-        help=(
-            'Joint stage only: rebuild completed-feature item graphs every N epochs '
-            'from the current completion module. 0 keeps the initialization-time graph.'
-        ),
-    )
-    parser.add_argument(
-        '--joint_log_sigma_min',
-        type=float,
-        default=-100.0,
-        help='Joint stage only: lower bound applied to generative log_sigma after each update.',
-    )
     parser.add_argument('--gamma_align', type=float, default=0.0)
     parser.add_argument(
         '--adapter_align_pseudo_ratio',
@@ -452,8 +415,6 @@ def _build_parser():
         default=0.0,
         help='Dropout for residual_mlp completion adapter.',
     )
-    parser.add_argument('--gamma_distill', type=float, default=0.0)
-    parser.add_argument('--joint_allow_modal_grad', type=int, default=0)
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
     parser.add_argument(
         '--rec_neighbor_cl_weight',

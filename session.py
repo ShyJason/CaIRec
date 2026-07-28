@@ -69,8 +69,6 @@ class MILK_session(object):
         lr_rec = self.env.args.lr_rec if self.env.args.lr_rec is not None else self.env.args.lr
         if self.env.args.lr_imp is not None:
             lr_imp = self.env.args.lr_imp
-        elif self.env.args.train_stage == 'joint':
-            lr_imp = 0.1 * lr_rec
         else:
             lr_imp = lr_rec
 
@@ -102,56 +100,6 @@ class MILK_session(object):
             return None
 
         return torch.optim.Adam(param_groups, lr=lr_rec)
-
-    @staticmethod
-    def _parameter_grad_norm(parameters):
-        squared_norm = 0.0
-        count = 0
-        for parameter in parameters:
-            if parameter.grad is None:
-                continue
-            squared_norm += float(parameter.grad.detach().float().norm().cpu()) ** 2
-            count += 1
-        return squared_norm ** 0.5, count
-
-    def _audit_joint_gradients(self):
-        imputer_norm, imputer_count = self._parameter_grad_norm(
-            self.model.get_imputer_parameters()
-        )
-        recommender_norm, recommender_count = self._parameter_grad_norm(
-            self.model.get_recommender_parameters()
-        )
-        print(
-            "joint gradient audit: "
-            f"imputer_norm={imputer_norm:.8e} imputer_tensors={imputer_count} "
-            f"recommender_norm={recommender_norm:.8e} recommender_tensors={recommender_count}"
-        )
-        if imputer_count == 0 or imputer_norm <= 0.0:
-            raise RuntimeError(
-                "joint gradient audit failed: recommendation/completion objectives "
-                "did not reach the trainable imputer parameters"
-            )
-        if recommender_count == 0 or recommender_norm <= 0.0:
-            raise RuntimeError(
-                "joint gradient audit failed: no trainable recommender gradient"
-            )
-
-    def _uses_joint_item_graph_refresh(self):
-        return (
-            self.env.args.train_stage == 'joint'
-            and int(getattr(self.env.args, 'joint_item_graph_refresh_interval', 0) or 0) > 0
-            and bool(getattr(self.model, 'use_completed_item_graph', False))
-        )
-
-    def _refresh_joint_item_graph(self, current_epoch, force=False):
-        if not self._uses_joint_item_graph_refresh():
-            return
-        interval = int(self.env.args.joint_item_graph_refresh_interval)
-        if not force and (current_epoch <= 0 or current_epoch % interval != 0):
-            return
-        print(f"refreshing joint completed-feature item graph at epoch={current_epoch}")
-        self.model.build_completed_item_graph()
-        self.model.clear_gcn_cache()
 
     def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=None):
         self.env.args.train_stage = train_stage
@@ -221,7 +169,6 @@ class MILK_session(object):
         was_training = self.model.training
         try:
             self._restore_model_state(self.best_model_state)
-            self._refresh_joint_item_graph(self.best_epoch, force=True)
             thr, trecall, tndcg, test_time = self.test(mode='test', top_list=self.env.args.topk)
             for key in thr.keys():
                 tool.cprint(
@@ -234,7 +181,6 @@ class MILK_session(object):
             self.log_test_modality_subsets(prefix='final strict test')
         finally:
             self._restore_model_state(current_state)
-            self._refresh_joint_item_graph(self.total_epoch - 1, force=True)
             if was_training:
                 self.model.train()
 
@@ -512,14 +458,6 @@ class MILK_session(object):
                 + self.env.args.alpha_rec * promrl_rec_loss
                 + self.env.args.alpha_decode * promrl_decode_loss
             )
-        elif stage == 'joint':
-            stage_promrl_loss = (
-                self.env.args.beta_intra * promrl_intra_loss
-                + self.env.args.beta_inter * promrl_inter_loss
-                + self.env.args.beta_itm * promrl_itm_loss
-                + self.env.args.beta_rec * promrl_rec_loss
-                + self.env.args.beta_decode * promrl_decode_loss
-            )
         else:
             stage_promrl_loss = zero
             promrl_intra_loss = zero
@@ -543,26 +481,16 @@ class MILK_session(object):
         if effective_stage not in (
             'imputer_param',
             'imputer_backprop',
-            'joint',
         ):
             return False
 
-        if effective_stage == 'joint':
-            weights = (
-                self.env.args.beta_intra,
-                self.env.args.beta_inter,
-                self.env.args.beta_itm,
-                self.env.args.beta_rec,
-                self.env.args.beta_decode,
-            )
-        else:
-            weights = (
-                self.env.args.alpha_intra,
-                self.env.args.alpha_inter,
-                self.env.args.alpha_itm,
-                self.env.args.alpha_rec,
-                self.env.args.alpha_decode,
-            )
+        weights = (
+            self.env.args.alpha_intra,
+            self.env.args.alpha_inter,
+            self.env.args.alpha_itm,
+            self.env.args.alpha_rec,
+            self.env.args.alpha_decode,
+        )
 
         return any(float(weight) != 0.0 for weight in weights)
         
@@ -572,7 +500,6 @@ class MILK_session(object):
         self.total_epoch += 1
         current_epoch = self.total_epoch - 1
         self.model.current_epoch = current_epoch
-        self._refresh_joint_item_graph(current_epoch)
         rec_neighbor_cl_weight_eff = self._effective_rec_neighbor_cl_weight(current_epoch)
         stage = self.env.args.train_stage
         imputer_only_stage = stage in STAGE1_IMPUTER_STAGES
@@ -595,26 +522,6 @@ class MILK_session(object):
             negItems = negItems.to(self.env.device)
             users, posItems, negItems = tool.shuffle(users, posItems, negItems)
             total_batch = len(users) // self.env.args.batch_size + 1
-        joint_completion_batches = None
-        joint_completion_batch_size = int(
-            getattr(self.env.args, 'joint_completion_batch_size', 0) or 0
-        )
-        if stage == 'joint' and joint_completion_batch_size > 0:
-            joint_item_ids = torch.as_tensor(
-                dataset_loader.ItemSample(self.dataset),
-                dtype=torch.long,
-                device=self.env.device,
-            )
-
-            def uniform_joint_completion_batches():
-                while True:
-                    shuffled_item_ids = tool.shuffle(joint_item_ids)
-                    yield from dataset_loader.minibatch(
-                        shuffled_item_ids,
-                        batch_size=joint_completion_batch_size,
-                    )
-
-            joint_completion_batches = uniform_joint_completion_batches()
         all_loss, all_main_bpr_loss, all_maximize_loss = 0., 0., 0.
         all_modality_bpr_loss, all_grad_loss, all_penalty_loss = 0., 0., 0.
         all_promrl_intra_loss, all_promrl_inter_loss = 0., 0.
@@ -622,7 +529,7 @@ class MILK_session(object):
         all_promrl_decode_loss = 0.
         all_promrl_decode_kl_loss = 0.
         all_rec_neighbor_cl_loss = 0.
-        all_align_loss, all_distill_loss = 0., 0.
+        all_align_loss = 0.
         self.model.set_missing_modality_via_env()
         if imputer_only_stage:
             batch_iterator = (
@@ -647,8 +554,6 @@ class MILK_session(object):
             if self._should_compute_promrl_losses(effective_stage):
                 if imputer_only_stage:
                     promrl_item_ids = pos_item
-                elif joint_completion_batches is not None:
-                    promrl_item_ids = next(joint_completion_batches)
                 else:
                     promrl_item_ids = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                 promrl_losses = self.model.compute_promrl_losses(promrl_item_ids, stage=effective_stage)
@@ -672,24 +577,14 @@ class MILK_session(object):
             penalty_loss = zero
             mutual_info = zero
             align_loss = zero
-            distill_loss = zero
             rec_neighbor_cl_loss = zero
 
-            if effective_stage in ('recommender', 'joint'):
-                use_task_aware_refinement = (
-                    effective_stage == 'joint'
-                    and bool(self.env.args.freeze_recommender)
-                    and (self.env.args.gamma_align > 0 or self.env.args.gamma_distill > 0)
-                )
-                allow_joint_modal_grad = (
-                    effective_stage == 'joint'
-                    and bool(getattr(self.env.args, 'joint_allow_modal_grad', 0))
-                )
+            if effective_stage == 'recommender':
                 allow_recommender_modal_grad = bool(getattr(self.env.args, 'recommender_allow_modal_grad', 0))
                 use_rec_neighbor_cl = rec_neighbor_cl_weight_eff > 0.0
                 all_user_emb = None
                 all_item_emb = None
-                if use_task_aware_refinement or allow_joint_modal_grad or allow_recommender_modal_grad:
+                if allow_recommender_modal_grad:
                     main_bpr_loss, base_reg_loss, all_user_emb, all_item_emb = self.model.basic_recommendation_loss(
                         user,
                         pos_item,
@@ -721,14 +616,6 @@ class MILK_session(object):
                     )
                 self.model.clear_gcn_cache()
                 reg_loss = self.env.args.reg_coeff * base_reg_loss
-                if use_task_aware_refinement:
-                    align_loss, distill_loss = self.model.compute_task_aware_distillation_losses(
-                        user,
-                        pos_item,
-                        neg_item,
-                        student_user_emb=all_user_emb,
-                        student_item_emb=all_item_emb,
-                    )
 
             loss = (
                 main_bpr_loss
@@ -739,7 +626,6 @@ class MILK_session(object):
                 + stage_promrl_loss
                 + rec_neighbor_cl_weight_eff * rec_neighbor_cl_loss
                 + self.env.args.gamma_align * align_loss
-                + self.env.args.gamma_distill * distill_loss
             )
 
             # print(self.model.id_embedding.weight.mean())
@@ -748,22 +634,7 @@ class MILK_session(object):
                 self.representation_optimizer.zero_grad()
                 if loss.requires_grad:
                     loss.backward()
-                if (
-                    effective_stage == 'joint'
-                    and bool(getattr(self.env.args, 'joint_grad_audit', 0))
-                    and current_epoch == 0
-                    and batch_index == 0
-                ):
-                    self._audit_joint_gradients()
                 self.representation_optimizer.step()
-                if effective_stage == 'joint':
-                    log_sigma_min = float(
-                        getattr(self.env.args, 'joint_log_sigma_min', -100.0)
-                    )
-                    if log_sigma_min > -100.0:
-                        with torch.no_grad():
-                            for parameter in self.model.log_sigma.values():
-                                parameter.clamp_(min=log_sigma_min)
             if self.model.has_pending_em_updates():
                 self.model.apply_pending_em_updates()
 
@@ -781,7 +652,6 @@ class MILK_session(object):
             all_promrl_decode_kl_loss += promrl_decode_kl_loss
             all_rec_neighbor_cl_loss += rec_neighbor_cl_loss
             all_align_loss += align_loss
-            all_distill_loss += distill_loss
         return (
             all_loss / total_batch,
             all_main_bpr_loss / total_batch,
@@ -798,7 +668,6 @@ class MILK_session(object):
             all_rec_neighbor_cl_loss / total_batch,
             rec_neighbor_cl_weight_eff,
             all_align_loss / total_batch,
-            all_distill_loss / total_batch,
             time.time() - t,
         )
 
@@ -835,13 +704,12 @@ class MILK_session(object):
                 rec_neighbor_cl_loss,
                 rec_neighbor_cl_weight_eff,
                 align_loss,
-                distill_loss,
                 train_time,
             ) = self.train_epoch()
             # self.model.show_scores()
             print('-' * 30)
             print(
-                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, rec_neighbor_cl = {rec_neighbor_cl_loss:.5f}, rec_neighbor_cl_weight = {rec_neighbor_cl_weight_eff:.5f}, align_loss = {align_loss:.5f}, distill_loss = {distill_loss:.5f}, train_time = {train_time:.2f}')
+                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, rec_neighbor_cl = {rec_neighbor_cl_loss:.5f}, rec_neighbor_cl_weight = {rec_neighbor_cl_weight_eff:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
             self.last_train_metrics = {
                 'epoch': epoch,
                 'loss_s1': float(loss),
@@ -859,7 +727,6 @@ class MILK_session(object):
                 'rec_neighbor_cl': float(rec_neighbor_cl_loss),
                 'rec_neighbor_cl_weight': float(rec_neighbor_cl_weight_eff),
                 'align_loss': float(align_loss),
-                'distill_loss': float(distill_loss),
                 'train_time': float(train_time),
             }
             if self.env.args.tensorboard:
@@ -877,7 +744,6 @@ class MILK_session(object):
                 self.env.w.add_scalar('Train/rec_neighbor_cl', float(rec_neighbor_cl_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/rec_neighbor_cl_weight', float(rec_neighbor_cl_weight_eff), self.total_epoch)
                 self.env.w.add_scalar('Train/align_loss', float(align_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/distill_loss', float(distill_loss), self.total_epoch)
                 for group_idx, group in enumerate(self.representation_optimizer.param_groups if self.representation_optimizer is not None else []):
                     self.env.w.add_scalar(f'Train/lr_group_{group_idx}', group['lr'], self.total_epoch)
 
