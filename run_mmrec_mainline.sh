@@ -14,15 +14,6 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
   fi
 fi
 
-latest_ckpt_for_suffix() {
-  local suffix="$1"
-  local ckpt_dir="${ROOT_DIR}/exp_report/${DATASET}/${suffix}/ckpt"
-  find "${ckpt_dir}" -maxdepth 1 -type f -name "*.pth" -printf "%T@ %p\n" 2>/dev/null \
-    | sort -nr \
-    | head -n 1 \
-    | cut -d' ' -f2-
-}
-
 ckpt_for_suffix_epoch() {
   local suffix="$1"
   local epoch="$2"
@@ -34,8 +25,16 @@ ckpt_for_suffix_epoch() {
 }
 
 DATASET="${DATASET:-clothing}"
+case "${DATASET}" in
+  clothing|beauty|sports) ;;
+  *)
+    echo "[mainline] DATASET must be one of: clothing, beauty, sports" >&2
+    exit 2
+    ;;
+esac
 EXP_MODE="${EXP_MODE:-mm}"
 DEVICE_ID="${DEVICE_ID:-4}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
 SEED="${SEED:-2023}"
 if [[ "${DATASET}" == "beauty" ]]; then
   DEFAULT_DATASET_SEED="2023"
@@ -81,38 +80,61 @@ STAGE2_LR_REC="${STAGE2_LR_REC:-${DEFAULT_STAGE2_LR_REC}}"
 STAGE2_LR_IMP="${STAGE2_LR_IMP:-0.0002}"
 STAGE2_GAMMA_ALIGN="${STAGE2_GAMMA_ALIGN:-${DEFAULT_STAGE2_GAMMA_ALIGN}}"
 STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
+TENSORBOARD="${TENSORBOARD:-0}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
 PROJECTION_CKPT="${PROJECTION_CKPT:-${ROOT_DIR}/pretrained_projections/${DATASET}.pth}"
 STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_1_param}"
 STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_2_completion}"
 STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage2_recommender}"
 
-if [[ -f "configs/${DATASET}/paper_stage1_1.yaml" ]]; then
-  DEFAULT_STAGE11_CONFIG="configs/${DATASET}/paper_stage1_1.yaml"
-else
-  DEFAULT_STAGE11_CONFIG="configs/clothing/paper_stage1_1.yaml"
-fi
-if [[ -f "configs/${DATASET}/paper_stage1_2.yaml" ]]; then
-  DEFAULT_STAGE12_CONFIG="configs/${DATASET}/paper_stage1_2.yaml"
-else
-  DEFAULT_STAGE12_CONFIG="configs/clothing/paper_stage1_2.yaml"
-fi
+DEFAULT_STAGE11_CONFIG="configs/${DATASET}/paper_stage1_1.yaml"
+DEFAULT_STAGE12_CONFIG="configs/${DATASET}/paper_stage1_2.yaml"
 STAGE11_CONFIG="${STAGE11_CONFIG:-${DEFAULT_STAGE11_CONFIG}}"
 STAGE12_CONFIG="${STAGE12_CONFIG:-${DEFAULT_STAGE12_CONFIG}}"
 DEFAULT_STAGE2_CONFIG="configs/${DATASET}/paper_stage2.yaml"
 STAGE2_CONFIG="${STAGE2_CONFIG:-${DEFAULT_STAGE2_CONFIG}}"
-if [[ ! -f "${STAGE2_CONFIG}" ]]; then
-  echo "[mainline] missing paper Stage 2 config: ${STAGE2_CONFIG}" >&2
-  exit 1
-fi
 
 echo "[mainline] dataset=${DATASET} exp_mode=${EXP_MODE} bridge=${FEATURE_BRIDGE_MODE} train_missing_modality=${TRAIN_MISSING_MODALITY} missing_rate=${MISSING_RATE} eval_missing_rate=${EVAL_MISSING_RATE}"
+
+for config in "${STAGE11_CONFIG}" "${STAGE12_CONFIG}" "${STAGE2_CONFIG}"; do
+  if [[ ! -f "${config}" ]]; then
+    echo "[mainline] missing canonical config: ${config}" >&2
+    exit 1
+  fi
+  "${PYTHON_BIN}" main.py --config "${config}" --check_config
+done
 
 if [[ ! -f "${PROJECTION_CKPT}" ]]; then
   echo "[mainline] projection checkpoint not found: ${PROJECTION_CKPT}" >&2
   exit 1
 fi
+if [[ "${PROJECTION_CKPT}" == "${ROOT_DIR}/pretrained_projections/${DATASET}.pth" ]]; then
+  (
+    cd "${ROOT_DIR}/pretrained_projections"
+    sha256sum --check --status SHA256SUMS
+  ) || {
+    echo "[mainline] bundled projection checksum verification failed" >&2
+    exit 1
+  }
+fi
+
+for asset in \
+  "Data/${DATASET}/${DATASET}.inter" \
+  "Data/${DATASET}/image_feat.npy" \
+  "Data/${DATASET}/text_feat.npy" \
+  "Data/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"; do
+  if [[ ! -f "${asset}" ]]; then
+    echo "[mainline] missing required asset: ${asset}" >&2
+    exit 1
+  fi
+done
+
 echo "[mainline] pretrained projection=${PROJECTION_CKPT}"
+echo "[mainline] configs=${STAGE11_CONFIG},${STAGE12_CONFIG},${STAGE2_CONFIG}"
+if [[ "${CHECK_ONLY}" == "1" ]]; then
+  echo "[mainline] preflight passed; no training started"
+  exit 0
+fi
 
 echo "[mainline] stage1.1: imputer_param epochs=${STAGE11_EPOCHS} suffix=${STAGE11_SUFFIX}"
 
@@ -137,6 +159,7 @@ env \
   IMPUTER_CKPT= \
   ALPHA_REC="${STAGE11_ALPHA_REC:-1.0}" \
   ALPHA_DECODE=0.0 \
+  TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
   SAVE_ALL_EPOCHS=1 \
   SUFFIX="${STAGE11_SUFFIX}" \
@@ -181,6 +204,7 @@ env \
   ALPHA_INTER="${STAGE12_ALPHA_INTER:-1.0}" \
   ALPHA_ITM="${STAGE12_ALPHA_ITM:-1.0}" \
   ALPHA_DECODE=0.0 \
+  TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
   SAVE_ALL_EPOCHS=1 \
   SUFFIX="${STAGE12_SUFFIX}" \
@@ -230,6 +254,7 @@ env \
   IMPUTER_CKPT="${STAGE12_CKPT}" \
   ALPHA_DECODE=0.0 \
   ALPHA_DECODE_KL=0.0 \
+  TENSORBOARD="${TENSORBOARD}" \
   SAVE="${SAVE:-1}" \
   SUFFIX="${STAGE2_SUFFIX}" \
   ./run_demo_itm.sh \

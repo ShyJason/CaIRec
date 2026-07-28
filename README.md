@@ -14,7 +14,7 @@ BPR optimization.
 ├── promrl_core/                        # completion runtime
 ├── configs/                            # retained paper configurations
 ├── pretrained_projections/             # fixed Stage 1 projection initializers
-├── reproduce_best/20260719/            # fixed Stage 2 reproduction commands
+├── run_mmrec_mainline.sh                # complete Stage 1.1 → 1.2 → 2 pipeline
 ├── scripts/                            # data preparation and significance test
 └── tests/                              # focused regression tests
 ```
@@ -40,57 +40,38 @@ not suitable.
 
 ## Required assets
 
-The fixed reproduction commands load:
+The complete pipeline loads:
 
 - dataset interactions and modality features under `Data/<dataset>/`;
-- `unified_missing_items_mr0.5_seed2023.npy` in each dataset directory;
-- the recorded Stage 1.2 epoch-49 checkpoint under the path declared by each
-  reproduction script.
+- `unified_missing_items_mr0.5_seed2023.npy` in each dataset directory.
 
-Datasets and Stage 1.2 checkpoints are not committed to Git. The reproduction
-scripts fail before training if an expected file or checksum is missing. The
-three small projection-only initializers are committed under
-`pretrained_projections/` and verified by its `SHA256SUMS`.
+Datasets are not committed to Git. The three small projection-only initializers
+are committed under `pretrained_projections/` and verified by its
+`SHA256SUMS`. No pre-existing Stage 1.1, Stage 1.2, or Stage 2 checkpoint is
+required.
 
-## Train the mainline
+## Reproduce the complete pipeline
 
 Stage 0 projection training is not part of this repository. Stage 1 starts by
 loading the matching pretrained modality projection from
-`pretrained_projections/<dataset>.pth`. The default launch is:
+`pretrained_projections/<dataset>.pth`, then the script runs Stage 1.1, Stage
+1.2, and Stage 2 in order.
 
 ```bash
-bash run_mmrec_mainline.sh
+CHECK_ONLY=1 DATASET=clothing bash run_mmrec_mainline.sh
+DATASET=clothing DEVICE_ID=0 bash run_mmrec_mainline.sh
 ```
-
-Set `DATASET=beauty` or `DATASET=sports` for the other retained datasets. An
-explicit `PROJECTION_CKPT=/path/to/projection.pth` can override the bundled
-initializer. The checkpoint is loaded through the projection-only loader, so
-unrelated imputer or recommender tensors are ignored.
-
-## Run the canonical Stage 2 configurations
-
-Run the read-only preflight checks first:
 
 ```bash
-CHECK_ONLY=1 bash reproduce_best/20260719/clothing.sh
-CHECK_ONLY=1 bash reproduce_best/20260719/beauty.sh
-CHECK_ONLY=1 bash reproduce_best/20260719/sports.sh
+DATASET=beauty DEVICE_ID=1 bash run_mmrec_mainline.sh
+DATASET=sports DEVICE_ID=2 bash run_mmrec_mainline.sh
 ```
 
-Then select a physical GPU:
-
-```bash
-bash reproduce_best/20260719/clothing.sh 0
-bash reproduce_best/20260719/beauty.sh 1
-bash reproduce_best/20260719/sports.sh 2
-```
-
-These commands run Stage 2 from the retained Stage 1.2 checkpoints; they do not
-retrain Stage 1. The directory name is retained for compatibility, but the
-Clothing and Sports commands now use mean fusion and therefore do not reproduce
-the older reliability-enabled values in the historical table.
-`SOURCE_SHA256SUMS` fingerprints the source and canonical configuration files
-in this release.
+Each stage saves its checkpoint under `exp_report/<dataset>/`; the next stage
+automatically loads the final checkpoint produced by the preceding stage.
+`RUN_TAG` can be set to give all three stages a shared experiment identifier.
+An explicit `PROJECTION_CKPT=/path/to/projection.pth` can override the bundled
+initializer.
 
 ## Tests
 

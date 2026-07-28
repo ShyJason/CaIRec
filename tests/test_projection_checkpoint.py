@@ -7,6 +7,9 @@ import torch
 from model import MILK_model
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class ProjectionCheckpointTest(unittest.TestCase):
     def _model(self):
         model = MILK_model.__new__(MILK_model)
@@ -66,6 +69,25 @@ class ProjectionCheckpointTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "missing tensors=.*comp_proj_t"):
                 model.load_projection_checkpoint(path)
+
+    def test_bundled_projections_are_safe_tensor_checkpoints(self):
+        expected_keys = {
+            "comp_proj_v.weight",
+            "comp_proj_v.bias",
+            "comp_proj_t.weight",
+            "comp_proj_t.bias",
+        }
+        for dataset in ("clothing", "beauty", "sports"):
+            with self.subTest(dataset=dataset):
+                checkpoint = torch.load(
+                    ROOT / "pretrained_projections" / f"{dataset}.pth",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                self.assertEqual(
+                    set(checkpoint["model_state_dict"]),
+                    expected_keys,
+                )
 
 
 if __name__ == "__main__":
