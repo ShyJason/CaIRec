@@ -1692,22 +1692,14 @@ class MILK_model(torch.nn.Module):
     def compute_true_missing_gcn_infonce_loss(
         self,
         item_ids,
-        user_ids=None,
         temperature=0.2,
         bank_size=256,
-        user_bank_size=256,
         allow_modal_grad=False,
     ):
-        """InfoNCE for real missing modalities after modality-specific GCNs.
-
-        Anchor: imputed representation of a truly missing modality.
-        Positive: same item's observed modality representations.
-        Negatives: other items whose same modality is observed.
-        """
+        """Align imputed missing-modality GCN embeddings with observed modalities."""
         zero = torch.zeros((), device=self.env.device)
         if self.disable_imputation or item_ids is None or item_ids.numel() == 0:
             return zero
-
         raw_features = self._current_raw_modal_features()
         masks = self._missing_masks(raw_features)
         item_ids = torch.unique(item_ids.detach()).long()
@@ -1715,239 +1707,65 @@ class MILK_model(torch.nn.Module):
         if item_ids.numel() < 2:
             return zero
 
-        objective = getattr(self.env.args, "rec_neighbor_cl_objective", "infonce")
-        max_bank_size = int(bank_size or 0)
         bank_ids = item_ids
-        if (
-            objective != "positive_cosine"
-            and max_bank_size > 0
-            and bank_ids.numel() > max_bank_size
-        ):
-            perm = torch.randperm(bank_ids.numel(), device=self.env.device)[:max_bank_size]
-            bank_ids = bank_ids[perm]
+        max_bank_size = int(bank_size or 0)
+        if max_bank_size > 0 and bank_ids.numel() > max_bank_size:
+            bank_ids = bank_ids[
+                torch.randperm(bank_ids.numel(), device=self.env.device)[:max_bank_size]
+            ]
         if bank_ids.numel() < 2:
             return zero
 
-        similarity_space = getattr(
-            self.env.args,
-            "rec_neighbor_cl_similarity_space",
-            "embedding",
+        item_outputs = self._recommendation_gcn_modality_item_embeddings(
+            raw_features=raw_features,
+            allow_modal_grad=allow_modal_grad,
+            apply_item_graph=False,
         )
-        user_basis = None
-        if similarity_space == "user_preference":
-            if user_ids is None or user_ids.numel() == 0:
-                return zero
-            profile_user_ids = torch.unique(user_ids.detach()).long()
-            profile_user_ids = profile_user_ids[
-                (profile_user_ids >= 0) & (profile_user_ids < self.n_user)
-            ]
-            max_user_bank_size = int(user_bank_size or 0)
-            if (
-                max_user_bank_size > 0
-                and profile_user_ids.numel() > max_user_bank_size
-            ):
-                perm = torch.randperm(
-                    profile_user_ids.numel(),
-                    device=self.env.device,
-                )[:max_user_bank_size]
-                profile_user_ids = profile_user_ids[perm]
-            if profile_user_ids.numel() < 2:
-                return zero
-            user_basis = F.normalize(
-                self.user_emb.weight[profile_user_ids].detach(),
-                dim=-1,
-            )
-        elif similarity_space != "embedding":
-            raise ValueError(
-                f"Unsupported rec_neighbor_cl_similarity_space: {similarity_space}"
-            )
-
-        def to_contrast_space(item_embeddings):
-            if user_basis is not None:
-                item_embeddings = torch.matmul(
-                    item_embeddings,
-                    user_basis.transpose(0, 1),
-                )
-            return F.normalize(
-                torch.nan_to_num(
-                    item_embeddings,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ),
-                dim=-1,
-            )
-
-        cl_stage = getattr(self.env.args, "rec_neighbor_cl_stage", "gcn")
-        if cl_stage == "frontend":
-            gcn_item_outputs = self._recommendation_frontend_modality_item_embeddings(
-                raw_features=raw_features,
-                allow_modal_grad=allow_modal_grad,
-            )
-        else:
-            gcn_item_outputs = self._recommendation_gcn_modality_item_embeddings(
-                raw_features=raw_features,
-                allow_modal_grad=allow_modal_grad,
-                apply_item_graph=(cl_stage == "post_item_graph"),
-            )
         temp = max(float(temperature), 1e-6)
         losses = []
-        loss_weights = []
-        modality_count = len(self.modalities)
-        anchor_weighting = getattr(
-            self.env.args,
-            "rec_neighbor_cl_anchor_weighting",
-            "uniform",
-        )
-        reliabilities = None
-        if anchor_weighting == "posterior_reliability":
-            reliabilities = self._posterior_completion_reliabilities(masks)
-        false_negative_threshold = float(
-            getattr(self.env.args, "rec_neighbor_cl_false_negative_threshold", 1.1)
-        )
-        positive_source = getattr(
-            self.env.args,
-            "rec_neighbor_cl_positive_source",
-            "cross_modal",
-        )
-        negative_source = getattr(
-            self.env.args,
-            "rec_neighbor_cl_negative_source",
-            "same_modal",
-        )
-        if positive_source != "cross_modal" and negative_source == "cross_modal":
-            raise ValueError(
-                "rec_neighbor_cl_negative_source=cross_modal requires "
-                "rec_neighbor_cl_positive_source=cross_modal"
-            )
         for modality in self.modalities:
             anchor_mask = ~masks[modality][item_ids]
-            if modality_count > 1:
-                has_observed_other = torch.zeros_like(anchor_mask)
-                for observed_modality in self.modalities:
-                    if observed_modality == modality:
-                        continue
-                    has_observed_other = has_observed_other | masks[observed_modality][item_ids]
-                anchor_mask = anchor_mask & has_observed_other
-            anchor_ids = item_ids[anchor_mask]
+            has_observed_other = torch.zeros_like(anchor_mask)
+            for observed_modality in self.modalities:
+                if observed_modality != modality:
+                    has_observed_other |= masks[observed_modality][item_ids]
+            anchor_ids = item_ids[anchor_mask & has_observed_other]
             if anchor_ids.numel() == 0:
                 continue
 
-            if positive_source == "cf_neighbor":
-                cf_graph = self.ItemItemGraphs.get("cf")
-                if cf_graph is None:
-                    raise RuntimeError(
-                        "rec_neighbor_cl_positive_source=cf_neighbor requires "
-                        "ItemItemGraphs['cf']"
-                    )
-                observed = masks[modality].to(gcn_item_outputs[modality].dtype).unsqueeze(1)
-                positive_sum_all = torch.sparse.mm(
-                    cf_graph,
-                    gcn_item_outputs[modality] * observed,
-                )
-                positive_weight_all = torch.sparse.mm(cf_graph, observed)
-                has_positive = positive_weight_all[anchor_ids, 0] > 0
-                anchor_ids = anchor_ids[has_positive]
-                if anchor_ids.numel() == 0:
+            positive_parts = []
+            positive_weights = []
+            for observed_modality in self.modalities:
+                if observed_modality == modality:
                     continue
-                positive_emb = F.normalize(
-                    positive_sum_all[anchor_ids]
-                    / positive_weight_all[anchor_ids].clamp_min(1e-8),
-                    dim=-1,
+                observed = masks[observed_modality][anchor_ids].float().unsqueeze(1)
+                positive_parts.append(
+                    F.normalize(item_outputs[observed_modality][anchor_ids], dim=-1)
+                    * observed
                 )
-                positive_emb = to_contrast_space(positive_emb)
-            else:
-                positive_parts = []
-                positive_weights = []
-                for observed_modality in self.modalities:
-                    if observed_modality == modality:
-                        continue
-                    observed_mask = masks[observed_modality][anchor_ids].float().unsqueeze(1)
-                    positive_parts.append(
-                        to_contrast_space(
-                            gcn_item_outputs[observed_modality][anchor_ids]
-                        )
-                        * observed_mask
-                    )
-                    positive_weights.append(observed_mask)
-                if not positive_parts:
-                    continue
-                positive_sum = torch.stack(positive_parts, dim=0).sum(dim=0)
-                positive_count = torch.stack(positive_weights, dim=0).sum(dim=0).clamp_min(1.0)
-                positive_emb = F.normalize(positive_sum / positive_count, dim=-1)
+                positive_weights.append(observed)
+            positive_sum = torch.stack(positive_parts).sum(dim=0)
+            positive_count = torch.stack(positive_weights).sum(dim=0).clamp_min(1.0)
+            positive_target = F.normalize(positive_sum / positive_count, dim=-1).detach()
+            anchor_emb = F.normalize(item_outputs[modality][anchor_ids], dim=-1)
 
-            anchor_emb = to_contrast_space(gcn_item_outputs[modality][anchor_ids])
-            positive_target = positive_emb.detach()
-
-            if objective == "positive_cosine":
-                per_anchor_loss = 1.0 - (anchor_emb * positive_target).sum(dim=1)
-            else:
-                if negative_source == "cross_modal":
-                    negative_parts = []
-                    negative_weights = []
-                    for observed_modality in self.modalities:
-                        if observed_modality == modality:
-                            continue
-                        observed_mask = masks[observed_modality][bank_ids].float().unsqueeze(1)
-                        negative_parts.append(
-                            to_contrast_space(
-                                gcn_item_outputs[observed_modality][bank_ids]
-                            )
-                            * observed_mask
-                        )
-                        negative_weights.append(observed_mask)
-                    if not negative_parts:
-                        continue
-                    negative_sum = torch.stack(negative_parts, dim=0).sum(dim=0)
-                    negative_count = torch.stack(negative_weights, dim=0).sum(dim=0)
-                    valid_negative = negative_count[:, 0] > 0
-                    negative_ids = bank_ids[valid_negative]
-                    if negative_ids.numel() == 0:
-                        continue
-                    negative_emb = F.normalize(
-                        negative_sum[valid_negative]
-                        / negative_count[valid_negative].clamp_min(1.0),
-                        dim=-1,
-                    )
-                else:
-                    negative_ids = bank_ids[masks[modality][bank_ids]]
-                    if negative_ids.numel() == 0:
-                        continue
-                    negative_emb = to_contrast_space(
-                        gcn_item_outputs[modality][negative_ids]
-                    )
-                negative_target = negative_emb.detach()
-                pos_logits = (anchor_emb * positive_target).sum(dim=1, keepdim=True) / temp
-                neg_logits = torch.matmul(anchor_emb, negative_target.transpose(0, 1)) / temp
-                same_item = anchor_ids.unsqueeze(1).eq(negative_ids.unsqueeze(0))
-                neg_logits = neg_logits.masked_fill(same_item, -1e9)
-                if false_negative_threshold <= 1.0:
-                    teacher_negative_similarity = torch.matmul(
-                        positive_target.detach(),
-                        negative_target.detach().transpose(0, 1),
-                    )
-                    false_negatives = teacher_negative_similarity >= false_negative_threshold
-                    neg_logits = neg_logits.masked_fill(false_negatives, -1e9)
-                logits = torch.cat([pos_logits, neg_logits], dim=1)
-                targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.env.device)
-                per_anchor_loss = F.cross_entropy(logits, targets, reduction="none")
-
-            if reliabilities is None:
-                anchor_weights = torch.ones_like(per_anchor_loss)
-            else:
-                anchor_weights = reliabilities[modality][anchor_ids].to(per_anchor_loss.dtype)
-            anchor_weight_sum = anchor_weights.sum().clamp_min(1e-8)
-            losses.append((per_anchor_loss * anchor_weights).sum() / anchor_weight_sum)
-            if reliabilities is None:
-                loss_weights.append(torch.ones((), device=self.env.device))
-            else:
-                loss_weights.append(anchor_weights.mean().clamp_min(1e-8))
+            negative_ids = bank_ids[masks[modality][bank_ids]]
+            if negative_ids.numel() == 0:
+                continue
+            negative_target = F.normalize(
+                item_outputs[modality][negative_ids], dim=-1
+            ).detach()
+            pos_logits = (anchor_emb * positive_target).sum(dim=1, keepdim=True) / temp
+            neg_logits = torch.matmul(anchor_emb, negative_target.transpose(0, 1)) / temp
+            same_item = anchor_ids.unsqueeze(1).eq(negative_ids.unsqueeze(0))
+            neg_logits = neg_logits.masked_fill(same_item, -1e9)
+            logits = torch.cat([pos_logits, neg_logits], dim=1)
+            targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.env.device)
+            losses.append(F.cross_entropy(logits, targets))
 
         if not losses:
             return zero
-        stacked_losses = torch.stack(losses)
-        stacked_weights = torch.stack(loss_weights)
-        return (stacked_losses * stacked_weights).sum() / stacked_weights.sum().clamp_min(1e-8)
+        return torch.stack(losses).mean()
 
     @torch.no_grad()
     def compute_imputation_representation_metrics(self, split="test", include_random_baseline=True):

@@ -710,10 +710,8 @@ class MILK_session(object):
                     rec_neighbor_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                     rec_neighbor_cl_loss = self.model.compute_true_missing_gcn_infonce_loss(
                         rec_neighbor_items,
-                        user_ids=user,
                         temperature=float(getattr(self.env.args, 'rec_neighbor_cl_temp', 0.2)),
                         bank_size=int(getattr(self.env.args, 'rec_neighbor_cl_bank_size', 256)),
-                        user_bank_size=int(getattr(self.env.args, 'rec_neighbor_cl_user_bank_size', 256)),
                     )
                 if float(getattr(self.env.args, 'gamma_align', 0.0)) > 0.0:
                     align_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
@@ -805,25 +803,8 @@ class MILK_session(object):
         )
 
     def _effective_rec_neighbor_cl_weight(self, epoch):
-        base_weight = float(getattr(self.env.args, 'rec_neighbor_cl_weight', 0.0))
-        if base_weight <= 0.0:
-            return 0.0
-
-        start_epoch = int(getattr(self.env.args, 'rec_neighbor_cl_start_epoch', 0) or 0)
-        if epoch < start_epoch:
-            return 0.0
-
-        decay_start_epoch = int(getattr(self.env.args, 'rec_neighbor_cl_decay_start_epoch', -1) or -1)
-        final_weight = float(getattr(self.env.args, 'rec_neighbor_cl_final_weight', -1.0))
-        if decay_start_epoch >= 0 and final_weight >= 0.0 and epoch >= decay_start_epoch:
-            total_epochs = max(int(getattr(self.env.args, 'epoch', epoch + 1) or (epoch + 1)), decay_start_epoch + 1)
-            if total_epochs <= decay_start_epoch + 1:
-                return final_weight
-            progress = (epoch - decay_start_epoch) / float(total_epochs - decay_start_epoch - 1)
-            progress = min(max(progress, 0.0), 1.0)
-            return base_weight + progress * (final_weight - base_weight)
-
-        return base_weight
+        del epoch
+        return max(float(getattr(self.env.args, 'rec_neighbor_cl_weight', 0.0)), 0.0)
 
     def train(self, epochs, finalize=True, start_epoch=None):
         strict_probe_test_interval = int(getattr(self.env.args, 'strict_probe_test_interval', 0) or 0)
