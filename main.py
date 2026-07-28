@@ -1,4 +1,5 @@
 import argparse
+import ast
 import sys
 import json
 from pathlib import Path
@@ -9,7 +10,24 @@ from enviroment import Env
 from dataset_loader import Loader4MM
 from model import MILK_model
 from session import MILK_session
-# from invRL_session import InvRL
+
+
+def _parse_topk(value):
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (SyntaxError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(f'invalid topk list: {value!r}') from exc
+    if not isinstance(value, (list, tuple)) or not value:
+        raise argparse.ArgumentTypeError('topk must be a non-empty list of positive integers')
+    parsed = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+            raise argparse.ArgumentTypeError('topk must contain only positive integers')
+        parsed.append(item)
+    if parsed != sorted(set(parsed)):
+        raise argparse.ArgumentTypeError('topk values must be unique and increasing')
+    return parsed
 
 
 def _load_config_file(config_path):
@@ -42,9 +60,6 @@ def _load_config_file(config_path):
     normalized = {}
     for key, value in data.items():
         normalized[key.replace('-', '_')] = value
-
-    if isinstance(normalized.get('topk'), list):
-        normalized['topk'] = str(normalized['topk'])
 
     return normalized, str(path)
 
@@ -114,7 +129,7 @@ def _build_parser():
     parser.add_argument('--eva_interval', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--early_stop', type=int, default=20)
-    parser.add_argument('--topk', type=str, default='[10, 20, 30, 40, 50]')
+    parser.add_argument('--topk', type=_parse_topk, default=[10, 20, 30, 40, 50])
     parser.add_argument('--selection_mode', type=str, default='val', choices=['val', 'test'])
     parser.add_argument(
         '--recommendation_selection_metric',
@@ -466,7 +481,6 @@ def _build_parser():
     parser.add_argument('--log', type=int, default=0)
     parser.add_argument('--tensorboard', type=int, default=1)
     parser.add_argument('--hf_tensorboard_repo', type=str, default='')
-    parser.add_argument('--hf_token', type=str, default='')
     parser.add_argument('--hf_commit_every', type=int, default=5)
     parser.add_argument('--save', type=int, default=1)
     parser.add_argument('--save_all_epochs', type=int, default=0)
@@ -504,6 +518,7 @@ def parse_args():
         parser.set_defaults(**config_data)
 
     args = parser.parse_args()
+    args.topk = _parse_topk(args.topk)
     if args.config is not None:
         args.config = str(Path(args.config).expanduser().resolve())
     return _validate_protocol_args(_apply_stage1_defaults(args))
@@ -517,7 +532,7 @@ args = parse_args()
 # exit()
 my_env = Env(args)
 tool.cprint(f'---------- {my_env.args.suffix} ----------')
-print(f'{my_env.args}')
+print(my_env.format_public_args())
 
 # ----------------------------------- Dataset Init -----------------------------------------------------------
 
@@ -552,9 +567,9 @@ tool.cprint('Init Session')
 if bool(args.eval_only):
     t = time.time()
     hr, recall, ndcg, test_time = my_session.test(
-        mode='test', top_list=eval(args.topk)
+        mode='test', top_list=args.topk
     )
-    for top_k in eval(args.topk):
+    for top_k in args.topk:
         message = (
             f'eval-only test hr@{top_k} = {hr[top_k]:.5f}, '
             f'recall@{top_k} = {recall[top_k]:.5f}, '
@@ -617,7 +632,7 @@ if my_env.args.train_stage in (
         if my_env.args.log:
             my_env.test_logger.info(summary)
 else:
-    for top_k in eval(args.topk):
+    for top_k in args.topk:
         tool.cprint(f'hr@{top_k} = {my_session.test_hr[top_k]:.5f}, recall@{top_k} = {my_session.test_recall[top_k]:.5f}, ndcg@{top_k} = {my_session.test_ndcg[top_k]:.5f}')
         if my_env.args.log:
             my_env.test_logger.info(f'hr@{top_k} = {my_session.test_hr[top_k]:.5f}, recall@{top_k} = {my_session.test_recall[top_k]:.5f}, ndcg@{top_k} = {my_session.test_ndcg[top_k]:.5f}')

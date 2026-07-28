@@ -222,7 +222,7 @@ class MILK_session(object):
         try:
             self._restore_model_state(self.best_model_state)
             self._refresh_joint_item_graph(self.best_epoch, force=True)
-            thr, trecall, tndcg, test_time = self.test(mode='test', top_list=eval(self.env.args.topk))
+            thr, trecall, tndcg, test_time = self.test(mode='test', top_list=self.env.args.topk)
             for key in thr.keys():
                 tool.cprint(
                     f'final strict test hr@{key} = {thr[key]:.5f}, recall@{key} = {trecall[key]:.5f}, ndcg@{key} = {tndcg[key]:.5f}, test_time = {test_time:.2f}'
@@ -964,7 +964,7 @@ class MILK_session(object):
                         if should_probe_recommender:
                             hr, recall, ndcg, val_time = self.test(
                                 mode=self.env.args.selection_mode,
-                                top_list=eval(self.env.args.topk),
+                                top_list=self.env.args.topk,
                             )
                             metric_name, metric_topk, metric_value = self._resolve_recommendation_selection(hr, recall, ndcg)
                             probe_topk = 20 if 20 in recall else metric_topk
@@ -1052,7 +1052,7 @@ class MILK_session(object):
             if epoch % self.env.args.eva_interval == 0:
                 self.early_stop += self.env.args.eva_interval
                 selection_mode = self.env.args.selection_mode
-                hr, recall, ndcg, val_time = self.test(mode=selection_mode, top_list=eval(self.env.args.topk))
+                hr, recall, ndcg, val_time = self.test(mode=selection_mode, top_list=self.env.args.topk)
                 if self.env.args.tensorboard:
                     for key in hr.keys():
                         self.env.w.add_scalar(
@@ -1079,7 +1079,7 @@ class MILK_session(object):
                         if selection_mode == 'test':
                             thr, trecall, tndcg, test_time = hr, recall, ndcg, val_time
                         else:
-                            thr, trecall, tndcg, test_time = self.test(mode='test', top_list=eval(self.env.args.topk))
+                            thr, trecall, tndcg, test_time = self.test(mode='test', top_list=self.env.args.topk)
                         for key in thr.keys():
                             tool.cprint(
                                 f'epoch = {epoch} hr@{key} = {thr[key]:.5f}, recall@{key} = {trecall[key]:.5f}, ndcg@{key} = {tndcg[key]:.5f}, test_time = {test_time:.2f}')
@@ -1110,7 +1110,7 @@ class MILK_session(object):
                 and (epoch + 1) % strict_probe_test_interval == 0
             )
             if should_probe_test:
-                test_hr, test_recall, test_ndcg, test_time = self.test(mode='test', top_list=eval(self.env.args.topk))
+                test_hr, test_recall, test_ndcg, test_time = self.test(mode='test', top_list=self.env.args.topk)
                 test_key = 20 if 20 in test_hr else list(test_hr.keys())[0]
                 print(
                     f'strict_probe epoch = {epoch} hr@{test_key} = {test_hr[test_key]:.5f}, '

@@ -65,16 +65,23 @@ class Env(object):
                                       os.path.join(self.LOG_PATH, f'{self.time_stamp}_val_log_{self.args.suffix}.log'))
         self.test_logger = tool.Log('test', os.path.join(self.LOG_PATH,
                                                             f'{self.time_stamp}_test_log_{self.args.suffix}.log'))
-        self.train_logger.info(self.args)
-        self.val_logger.info(self.args)
-        self.test_logger.info(self.args)
+        public_args = self.format_public_args()
+        self.train_logger.info(public_args)
+        self.val_logger.info(public_args)
+        self.test_logger.info(public_args)
         tool.cprint(f'Init Logger')
 
+    def format_public_args(self):
+        sensitive_tokens = ('token', 'password', 'secret', 'credential')
+        public = {}
+        for key, value in vars(self.args).items():
+            public[key] = '<redacted>' if any(token in key.lower() for token in sensitive_tokens) else value
+        return str(public)
 
     def _init_tensorboard(self):
         run_dir = os.path.join(self.BOARD_PATH, self.time_stamp + "-" + self.args.suffix)
         hf_repo = getattr(self.args, 'hf_tensorboard_repo', '')
-        hf_token = getattr(self.args, 'hf_token', '')
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGING_FACE_HUB_TOKEN', '')
         hf_commit_every = getattr(self.args, 'hf_commit_every', 5)
 
         if hf_repo:

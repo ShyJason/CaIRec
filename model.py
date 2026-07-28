@@ -14,6 +14,15 @@ from promrl_core.utils.eigen import (
 from promrl_core.promrl_variants import _build_mlp
 
 
+def _load_tensor_checkpoint(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        # PyTorch < 1.13 has no weights_only parameter. Public releases should
+        # pin a newer PyTorch; this fallback keeps the development environment usable.
+        return torch.load(path, map_location="cpu")
+
+
 class MGCN(torch.nn.Module):
     def __init__(self, edge_index, num_user, num_item, dim_feat, dim_latent, frontend_mode="deep_mlp"):
         super(MGCN, self).__init__()
@@ -497,13 +506,13 @@ class MILK_model(torch.nn.Module):
         return self._trainable_parameters(self._recommender_modules(), exclude)
 
     def load_full_checkpoint(self, ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        checkpoint = _load_tensor_checkpoint(ckpt_path)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
-        self.load_state_dict(state_dict, strict=False)
+        self.load_state_dict(state_dict, strict=True)
         return len(state_dict)
 
     def load_projection_checkpoint(self, ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        checkpoint = _load_tensor_checkpoint(ckpt_path)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         projection_prefixes = []
         if self.use_decoupled_latent_bridge:
@@ -551,7 +560,7 @@ class MILK_model(torch.nn.Module):
         return sorted(matched_state.keys())
 
     def load_imputer_checkpoint(self, ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        checkpoint = _load_tensor_checkpoint(ckpt_path)
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         prefixes = [
             "itm_cross_attn",

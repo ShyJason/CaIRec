@@ -100,7 +100,6 @@ LOG_DIR="${LOG_DIR:-${ROOT_DIR}/exp_report/${DATASET}/${SUFFIX}/log}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log}"
 TENSORBOARD="${TENSORBOARD:-1}"
 HF_TENSORBOARD_REPO="${HF_TENSORBOARD_REPO:-}"
-HF_TOKEN="${HF_TOKEN:-}"
 HF_COMMIT_EVERY="${HF_COMMIT_EVERY:-5}"
 CONFIG="${CONFIG:-}"
 
@@ -219,10 +218,6 @@ fi
 
 if [[ -n "${HF_TENSORBOARD_REPO}" ]]; then
   cmd+=(--hf_tensorboard_repo "${HF_TENSORBOARD_REPO}")
-fi
-
-if [[ -n "${HF_TOKEN}" ]]; then
-  cmd+=(--hf_token "${HF_TOKEN}")
 fi
 
 if [[ -n "${HF_COMMIT_EVERY}" ]]; then
