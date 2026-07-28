@@ -593,7 +593,7 @@ def _build_parser():
         '--fusion_mode',
         type=str,
         default='mean',
-        choices=['mean', 'rum', 'global_weighted_mean', 'posterior_reliability'],
+        choices=['mean', 'posterior_reliability'],
         help=(
             'Item modality fusion. posterior_reliability uses the linear-Gaussian '
             'completion posterior predictive variance in the components selected '
@@ -619,11 +619,6 @@ def _build_parser():
         default=0.0,
         help='Optional lower bound for missing-modality posterior reliability.',
     )
-    parser.add_argument('--rum_tau', type=float, default=1.0)
-    parser.add_argument('--rum_reliability_coeff', type=float, default=1.0)
-    parser.add_argument('--rum_match_coeff', type=float, default=1.0)
-    parser.add_argument('--rum_eval_user_batch_size', type=int, default=256)
-    parser.add_argument('--rum_eval_item_chunk_size', type=int, default=4096)
     parser.add_argument('--alpha_intra', type=float, default=1.0)
     parser.add_argument('--alpha_inter', type=float, default=1.0)
     parser.add_argument('--alpha_itm', type=float, default=1.0)

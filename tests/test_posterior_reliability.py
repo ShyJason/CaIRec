@@ -27,7 +27,6 @@ class PosteriorReliabilityTest(unittest.TestCase):
         )
         model.posterior_reliability_scale = 1.0
         model.posterior_reliability_floor = 0.0
-        model.use_global_weighted_fusion = False
         model.use_posterior_reliability = True
         model.posterior_reliability_scope = "both"
         return model

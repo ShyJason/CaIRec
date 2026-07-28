@@ -349,10 +349,8 @@ class MILK_model(torch.nn.Module):
             and self.item_graph_modal_layers > 0
         )
         self.fusion_mode = getattr(self.env.args, "fusion_mode", "mean")
-        if self.fusion_mode not in {"mean", "rum", "global_weighted_mean", "posterior_reliability"}:
+        if self.fusion_mode not in {"mean", "posterior_reliability"}:
             raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
-        self.use_rum_fusion = self.fusion_mode == "rum"
-        self.use_global_weighted_fusion = self.fusion_mode == "global_weighted_mean"
         self.use_posterior_reliability = self.fusion_mode == "posterior_reliability"
         self.posterior_reliability_scope = getattr(
             self.env.args, "posterior_reliability_scope", "both"
@@ -463,21 +461,6 @@ class MILK_model(torch.nn.Module):
         self.item_emb = torch.nn.Embedding(
             num_embeddings=self.m_item, embedding_dim=self.free_emb_dimension
         )
-        self.user_modality_pref = torch.nn.Embedding(
-            num_embeddings=self.n_user, embedding_dim=len(self.modalities)
-        )
-        self.rum_modality_bias = nn.Parameter(torch.zeros(len(self.modalities)))
-        self.rum_observed_bias = nn.Parameter(torch.zeros(len(self.modalities)))
-        self.rum_biases = nn.ParameterList([
-            self.rum_modality_bias,
-            self.rum_observed_bias,
-        ])
-        self.global_fusion_params = nn.ParameterList()
-        if self.use_global_weighted_fusion:
-            self.global_fusion_params.append(
-                nn.Parameter(torch.zeros(len(self.modalities)))
-            )
-
         self.fusion_linear = nn.Sequential(
             nn.Linear(self.free_emb_dimension, self.free_emb_dimension, bias=False),
             nn.Dropout(),
@@ -488,7 +471,6 @@ class MILK_model(torch.nn.Module):
         self.final_user = None
         self.activate = torch.nn.Sigmoid()
         self.latest_promrl_losses = {}
-        self.latest_rum_fusion_metrics = {}
         self._gcn_cache = None
         self._imputer_updates_enabled = True
         self._pending_em_updates = []
@@ -498,7 +480,6 @@ class MILK_model(torch.nn.Module):
 
         torch.nn.init.normal_(self.user_emb.weight, std=0.1)
         torch.nn.init.normal_(self.item_emb.weight, std=0.1)
-        torch.nn.init.zeros_(self.user_modality_pref.weight)
         torch.nn.init.eye_(self.fusion_linear[0].weight)
 
         self.to(self.env.device)
@@ -667,10 +648,6 @@ class MILK_model(torch.nn.Module):
 
     def _recommender_modules(self):
         modules = [self.user_emb, self.item_emb, self.fusion_linear]
-        if self.use_rum_fusion:
-            modules.extend([self.user_modality_pref, self.rum_biases])
-        if self.use_global_weighted_fusion:
-            modules.append(self.global_fusion_params)
         modules.extend(getattr(self, f"{modality}_gcn") for modality in self.modalities)
         if self.use_decoupled_latent_bridge:
             modules.extend(getattr(self, f"comp_to_rec_{modality}") for modality in self.modalities)
@@ -2811,23 +2788,12 @@ class MILK_model(torch.nn.Module):
 
         raise ValueError(f"Unsupported item graph normalization: {norm_type}")
 
-    def _global_weighted_item_source(self, item_outputs):
-        weights = F.softmax(self.global_fusion_params[0], dim=0)
-        for idx, modality in enumerate(self.modalities):
-            self.latest_rum_fusion_metrics[f"global_fusion_weight_{modality}"] = float(
-                weights[idx].detach().cpu()
-            )
-        return sum(weights[idx] * item_outputs[modality] for idx, modality in enumerate(self.modalities))
-
     def _uses_posterior_reliability_for(self, component):
         if not self.use_posterior_reliability:
             return False
         return self.posterior_reliability_scope == "both" or self.posterior_reliability_scope == component
 
     def _fuse_item_sources(self, item_outputs, modal_features=None, raw_features=None, observed_masks=None):
-        if self.use_global_weighted_fusion:
-            return self._global_weighted_item_source(item_outputs)
-
         if self._uses_posterior_reliability_for("fusion"):
             if observed_masks is None:
                 if raw_features is None:
@@ -4181,118 +4147,6 @@ class MILK_model(torch.nn.Module):
 
         return user_emb, item_emb
 
-    def _rum_tau(self):
-        return max(float(getattr(self.env.args, "rum_tau", 1.0)), 1e-6)
-
-    def _rum_logit_terms(self, outputs, batch_users, batch_items, matrix=False, detach_items=False):
-        observed = outputs["observed_masks"]
-        pref = self.user_modality_pref(batch_users)
-        scores = []
-        logits = []
-        rel_values = []
-        obs_values = []
-        user_id_emb = outputs["user_id"][batch_users]
-        match_coeff = float(getattr(self.env.args, "rum_match_coeff", 1.0))
-
-        for modality_idx, modality in enumerate(self.modalities):
-            modal_user_emb, modal_item_emb = outputs[modality]
-            modal_users = user_id_emb + modal_user_emb[batch_users]
-            modal_items = modal_item_emb[batch_items]
-            if detach_items:
-                modal_items = modal_items.detach()
-            if matrix:
-                modal_score = modal_users @ modal_items.T
-                obs = observed[modality][batch_items].float().unsqueeze(0)
-                rel = torch.ones_like(obs)
-                pref_term = pref[:, modality_idx].unsqueeze(1)
-            else:
-                modal_score = torch.sum(modal_users * modal_items, dim=1)
-                obs = observed[modality][batch_items].float()
-                rel = torch.ones_like(obs)
-                pref_term = pref[:, modality_idx]
-
-            logit = (
-                pref_term
-                + match_coeff * torch.tanh(modal_score)
-                + self.rum_modality_bias[modality_idx]
-                + self.rum_observed_bias[modality_idx] * obs
-            )
-            scores.append(modal_score)
-            logits.append(logit)
-            rel_values.append(rel.expand_as(modal_score))
-            obs_values.append(obs.expand_as(modal_score))
-
-        return (
-            torch.stack(scores, dim=-1),
-            torch.stack(logits, dim=-1),
-            torch.stack(rel_values, dim=-1),
-            torch.stack(obs_values, dim=-1),
-        )
-
-    def _update_rum_fusion_metrics(self, weights, reliability, observed):
-        with torch.no_grad():
-            weights = weights.detach()
-            reliability = reliability.detach()
-            observed = observed.detach().bool()
-            metrics = {}
-            entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
-            metrics["rum_fusion_entropy"] = float(entropy.cpu())
-            for modality_idx, modality in enumerate(self.modalities):
-                modality_weights = weights[..., modality_idx]
-                modality_reliability = reliability[..., modality_idx]
-                modality_observed = observed[..., modality_idx]
-                metrics[f"rum_weight_{modality}_mean"] = float(modality_weights.mean().cpu())
-                metrics[f"rum_reliability_{modality}_mean"] = float(modality_reliability.mean().cpu())
-                if modality_observed.any():
-                    metrics[f"rum_weight_{modality}_observed_mean"] = float(
-                        modality_weights[modality_observed].mean().cpu()
-                    )
-                if (~modality_observed).any():
-                    metrics[f"rum_weight_{modality}_imputed_mean"] = float(
-                        modality_weights[~modality_observed].mean().cpu()
-                    )
-            self.latest_rum_fusion_metrics = metrics
-
-    def rum_pair_scores(self, batch_users, batch_items, outputs=None, allow_modal_grad=False, collect_metrics=True):
-        if outputs is None:
-            outputs = self._run_modal_gcn()
-        scores, logits, reliability, observed = self._rum_logit_terms(
-            outputs,
-            batch_users,
-            batch_items,
-            matrix=False,
-            detach_items=not allow_modal_grad,
-        )
-        weights = F.softmax(logits / self._rum_tau(), dim=-1)
-        if collect_metrics:
-            self._update_rum_fusion_metrics(weights, reliability, observed)
-        return torch.sum(weights * scores, dim=-1)
-
-    def rum_score_matrix(self, batch_users, batch_items, outputs=None):
-        if outputs is None:
-            outputs = self._run_modal_gcn()
-        scores, logits, _, _ = self._rum_logit_terms(
-            outputs,
-            batch_users,
-            batch_items,
-            matrix=True,
-        )
-        weights = F.softmax(logits / self._rum_tau(), dim=-1)
-        return torch.sum(weights * scores, dim=-1)
-
-    def _rum_reg_loss(self, outputs, batch_users, batch_pos_items, batch_neg_items):
-        user_terms = outputs["user_id"][batch_users].norm(2).pow(2)
-        item_terms = []
-        for modality in self.modalities:
-            _, modal_item_emb = outputs[modality]
-            item_terms.append(modal_item_emb[batch_pos_items].norm(2).pow(2))
-            item_terms.append(modal_item_emb[batch_neg_items].norm(2).pow(2))
-        pref_terms = self.user_modality_pref(batch_users).norm(2).pow(2)
-        total = user_terms + pref_terms
-        for term in item_terms:
-            total = total + term
-        return 0.5 * total.mean()
-
     def basic_recommendation_loss(
         self,
         batch_users,
@@ -4302,29 +4156,6 @@ class MILK_model(torch.nn.Module):
         return_embeddings=False,
     ):
         """Base recommender loss without the original I3 IRM/MI objectives."""
-        if self.use_rum_fusion:
-            outputs = self._run_modal_gcn()
-            pos_scores = self.rum_pair_scores(
-                batch_users,
-                batch_pos_items,
-                outputs=outputs,
-                allow_modal_grad=allow_modal_grad,
-                collect_metrics=True,
-            )
-            neg_scores = self.rum_pair_scores(
-                batch_users,
-                batch_neg_items,
-                outputs=outputs,
-                allow_modal_grad=allow_modal_grad,
-                collect_metrics=True,
-            )
-            bpr_loss = torch.mean(torch.nn.functional.softplus(neg_scores - pos_scores))
-            reg_loss = self._rum_reg_loss(outputs, batch_users, batch_pos_items, batch_neg_items)
-            if return_embeddings:
-                all_user_emb, all_item_emb = self.forward()
-                return bpr_loss, reg_loss, all_user_emb, all_item_emb
-            return bpr_loss, reg_loss
-
         if allow_modal_grad:
             all_user_emb, all_item_emb = self.compute_recommendation_embeddings(
                 raw_features=self._current_raw_modal_features(full=False),
