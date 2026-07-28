@@ -25,7 +25,7 @@ verify_sha256() {
   }
 }
 
-verify_sha256 d552ad98989c7a99347e9b2efda644a1cd3d6aeb2389d089612f0a197268aefb "${CONFIG}"
+verify_sha256 d89b7799819c1637c85330bc94a0bb136c52d0ba29f8e7fecb61db5cf0593fd4 "${CONFIG}"
 verify_sha256 00f2960cd4eeef41af65ad9769b9d9af118240f57e7c37cfd398056e243a0569 "${IMPUTER_CKPT}"
 verify_sha256 408e3c8bfffd8322412e63b77cc87b07ae4ce1f02329f0500d61c2aee95e0cf4 "${PAYLOAD}"
 test -f Data/beauty/beauty.inter

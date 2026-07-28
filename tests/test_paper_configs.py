@@ -32,17 +32,19 @@ class PaperConfigTest(unittest.TestCase):
 
     def test_stage2_matches_canonical_dataset_specific_settings(self):
         expected = {
-            "clothing": (0, 50, 0.005),
-            "beauty": (2023, 20, 0.010),
-            "sports": (0, 30, 0.005),
+            "clothing": (0, 50),
+            "beauty": (2023, 20),
+            "sports": (0, 30),
         }
         for dataset, values in expected.items():
             with self.subTest(dataset=dataset):
                 config = self._load(dataset, "stage2")
-                dataset_seed, patience, cl_weight = values
+                dataset_seed, patience = values
                 self.assertEqual(config["dataset_seed"], dataset_seed)
                 self.assertEqual(config["early_stop"], patience)
-                self.assertEqual(config["rec_neighbor_cl_weight"], cl_weight)
+                self.assertNotIn("rec_neighbor_cl_weight", config)
+                self.assertNotIn("rec_neighbor_cl_temp", config)
+                self.assertNotIn("rec_neighbor_cl_bank_size", config)
                 self.assertEqual(config["fusion_mode"], "mean")
                 self.assertNotIn("posterior_reliability_scope", config)
                 self.assertNotIn("posterior_reliability_scale", config)

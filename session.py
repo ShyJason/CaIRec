@@ -500,7 +500,6 @@ class MILK_session(object):
         self.total_epoch += 1
         current_epoch = self.total_epoch - 1
         self.model.current_epoch = current_epoch
-        rec_neighbor_cl_weight_eff = self._effective_rec_neighbor_cl_weight(current_epoch)
         stage = self.env.args.train_stage
         imputer_only_stage = stage in STAGE1_IMPUTER_STAGES
         if imputer_only_stage:
@@ -528,7 +527,6 @@ class MILK_session(object):
         all_promrl_itm_loss, all_promrl_rec_loss = 0., 0.
         all_promrl_decode_loss = 0.
         all_promrl_decode_kl_loss = 0.
-        all_rec_neighbor_cl_loss = 0.
         all_align_loss = 0.
         self.model.set_missing_modality_via_env()
         if imputer_only_stage:
@@ -577,11 +575,9 @@ class MILK_session(object):
             penalty_loss = zero
             mutual_info = zero
             align_loss = zero
-            rec_neighbor_cl_loss = zero
 
             if effective_stage == 'recommender':
                 allow_recommender_modal_grad = bool(getattr(self.env.args, 'recommender_allow_modal_grad', 0))
-                use_rec_neighbor_cl = rec_neighbor_cl_weight_eff > 0.0
                 all_user_emb = None
                 all_item_emb = None
                 if allow_recommender_modal_grad:
@@ -601,13 +597,6 @@ class MILK_session(object):
                         self.env.args.modality_bpr_coeff
                         * self.model.modality_bpr_loss(user, pos_item, neg_item)
                     )
-                if use_rec_neighbor_cl:
-                    rec_neighbor_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
-                    rec_neighbor_cl_loss = self.model.compute_true_missing_gcn_infonce_loss(
-                        rec_neighbor_items,
-                        temperature=float(getattr(self.env.args, 'rec_neighbor_cl_temp', 0.2)),
-                        bank_size=int(getattr(self.env.args, 'rec_neighbor_cl_bank_size', 256)),
-                    )
                 if float(getattr(self.env.args, 'gamma_align', 0.0)) > 0.0:
                     align_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                     align_loss = self.model.compute_adapter_alignment_loss(
@@ -624,7 +613,6 @@ class MILK_session(object):
                 + reg_loss
                 + penalty_loss
                 + stage_promrl_loss
-                + rec_neighbor_cl_weight_eff * rec_neighbor_cl_loss
                 + self.env.args.gamma_align * align_loss
             )
 
@@ -650,7 +638,6 @@ class MILK_session(object):
             all_promrl_rec_loss += promrl_rec_loss
             all_promrl_decode_loss += promrl_decode_loss
             all_promrl_decode_kl_loss += promrl_decode_kl_loss
-            all_rec_neighbor_cl_loss += rec_neighbor_cl_loss
             all_align_loss += align_loss
         return (
             all_loss / total_batch,
@@ -665,15 +652,9 @@ class MILK_session(object):
             all_promrl_rec_loss / total_batch,
             all_promrl_decode_loss / total_batch,
             all_promrl_decode_kl_loss / total_batch,
-            all_rec_neighbor_cl_loss / total_batch,
-            rec_neighbor_cl_weight_eff,
             all_align_loss / total_batch,
             time.time() - t,
         )
-
-    def _effective_rec_neighbor_cl_weight(self, epoch):
-        del epoch
-        return max(float(getattr(self.env.args, 'rec_neighbor_cl_weight', 0.0)), 0.0)
 
     def train(self, epochs, finalize=True, start_epoch=None):
         strict_probe_test_interval = int(getattr(self.env.args, 'strict_probe_test_interval', 0) or 0)
@@ -701,15 +682,13 @@ class MILK_session(object):
                 promrl_rec_loss,
                 promrl_decode_loss,
                 promrl_decode_kl_loss,
-                rec_neighbor_cl_loss,
-                rec_neighbor_cl_weight_eff,
                 align_loss,
                 train_time,
             ) = self.train_epoch()
             # self.model.show_scores()
             print('-' * 30)
             print(
-                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, rec_neighbor_cl = {rec_neighbor_cl_loss:.5f}, rec_neighbor_cl_weight = {rec_neighbor_cl_weight_eff:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
+                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
             self.last_train_metrics = {
                 'epoch': epoch,
                 'loss_s1': float(loss),
@@ -724,8 +703,6 @@ class MILK_session(object):
                 'promrl_rec': float(promrl_rec_loss),
                 'promrl_decode': float(promrl_decode_loss),
                 'promrl_decode_kl': float(promrl_decode_kl_loss),
-                'rec_neighbor_cl': float(rec_neighbor_cl_loss),
-                'rec_neighbor_cl_weight': float(rec_neighbor_cl_weight_eff),
                 'align_loss': float(align_loss),
                 'train_time': float(train_time),
             }
@@ -741,8 +718,6 @@ class MILK_session(object):
                 self.env.w.add_scalar('Train/promrl_rec', float(promrl_rec_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_decode', float(promrl_decode_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_decode_kl', float(promrl_decode_kl_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/rec_neighbor_cl', float(rec_neighbor_cl_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/rec_neighbor_cl_weight', float(rec_neighbor_cl_weight_eff), self.total_epoch)
                 self.env.w.add_scalar('Train/align_loss', float(align_loss), self.total_epoch)
                 for group_idx, group in enumerate(self.representation_optimizer.param_groups if self.representation_optimizer is not None else []):
                     self.env.w.add_scalar(f'Train/lr_group_{group_idx}', group['lr'], self.total_epoch)

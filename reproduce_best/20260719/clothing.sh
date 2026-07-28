@@ -25,7 +25,7 @@ verify_sha256() {
   }
 }
 
-verify_sha256 70dc101c7b403470dd95e199a75d241306c11d7cb7eaece39ee979281acaa726 "${CONFIG}"
+verify_sha256 f2f3e90102e777d3c2885321c8ee5297801de4c4294b762fa12199a00895b95d "${CONFIG}"
 verify_sha256 dfe03cc6dbab74a2f4d651fff603f8be57696ed18c6a861b51cd9c7e0975cd46 "${IMPUTER_CKPT}"
 verify_sha256 34e09412a337e19906b16bb7bdb9e097d824e1e85a1b1908e501e5a29bc1873c "${PAYLOAD}"
 test -f Data/clothing/clothing.inter

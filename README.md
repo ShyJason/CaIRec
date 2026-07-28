@@ -20,8 +20,9 @@ The payload seed and model seed are both `2023`.
 Clothing and Sports values above are retained as historical references from
 the former posterior-reliability setting. The current canonical Stage 2
 configurations disable posterior reliability and use unweighted mean modality
-fusion for all three datasets. Fresh Clothing and Sports runs are required
-before replacing their reported values.
+fusion for all three datasets. They also remove the Stage 2 Rec Neighbor
+contrastive objective. Fresh runs are required before replacing the reported
+values.
 
 The shared Stage 2 setting uses a frozen completion module, learning rate
 `0.005`, batch size `2048`, strict validation-based checkpoint selection, and

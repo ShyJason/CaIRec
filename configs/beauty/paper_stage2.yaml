@@ -30,9 +30,6 @@ freeze_recommender: -1
 recommender_allow_modal_grad: 0
 disable_imputation: 0
 
-rec_neighbor_cl_weight: 0.010
-rec_neighbor_cl_temp: 0.2
-rec_neighbor_cl_bank_size: 256
 gamma_align: 0.00125
 adapter_align_pseudo_ratio: 1.0
 

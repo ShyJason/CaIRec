@@ -373,24 +373,6 @@ def _build_parser():
         help='Fraction of eligible observed modalities to pseudo-mask for decoupled adapter alignment.',
     )
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
-    parser.add_argument(
-        '--rec_neighbor_cl_weight',
-        type=float,
-        default=0.0,
-        help='Stage2 true-missing GCN InfoNCE loss weight.',
-    )
-    parser.add_argument(
-        '--rec_neighbor_cl_temp',
-        type=float,
-        default=0.2,
-        help='Temperature for stage2 true-missing GCN InfoNCE.',
-    )
-    parser.add_argument(
-        '--rec_neighbor_cl_bank_size',
-        type=int,
-        default=256,
-        help='Max number of in-batch items used for stage2 true-missing GCN InfoNCE.',
-    )
     parser.add_argument('--imputation_val_rate', type=float, default=0.0)
     parser.add_argument(
         '--imputation_selection_policy',

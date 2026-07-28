@@ -8,7 +8,8 @@ strict validation-based checkpoint selection.
 These measurements predate the switch to mean fusion. Clothing and Sports used
 posterior reliability in this verification and therefore serve only as
 historical references; they are not results for the current canonical
-configurations.
+configurations. All three measurements also used the subsequently removed Rec
+Neighbor contrastive loss.
 
 | Dataset | Recorded Recall@20 | Verified Recall@20 | Delta | Recorded NDCG@20 | Verified NDCG@20 | Delta | Recorded / verified best epoch |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
