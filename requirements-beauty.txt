@@ -1,0 +1,9 @@
+# Additional environment used to prepare the local Amazon Beauty dataset.
+# Install PyTorch/torchvision wheels compatible with your CUDA runtime.
+torch==1.13.0
+torchvision==0.14.0
+numpy==1.26.4
+pillow==12.2.0
+requests==2.34.2
+sentence-transformers==2.7.0
+transformers==4.35.2

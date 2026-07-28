@@ -2,37 +2,36 @@
 
 Tag: `v1.0-assets`
 
-This release contains the minimal assets required by the retained Clothing,
-Beauty, and Sports paper configurations. Historical feature variants, graph
-caches, experiment logs, and result directories are intentionally excluded.
+This release contains only CaIRec-generated auxiliary assets required by the
+retained Clothing, Beauty, and Sports paper configurations. Third-party
+datasets and extracted content features are intentionally not redistributed.
 
 ## Assets
 
 | Asset | Installed path |
 | --- | --- |
-| `cair-data-clothing-v1.tar.gz` | `Data/clothing/` |
-| `cair-data-beauty-v1.tar.gz` | `Data/beauty/` |
-| `cair-data-sports-v1.tar.gz` | `Data/sports/` |
+| `cair-missing-payloads-v1.tar.gz` | one fixed payload under each `Data/<dataset>/` |
 | `cair-projection-checkpoints-v1.tar.gz` | `projection_checkpoints/` |
 | `SHA256SUMS` | integrity manifest |
 
-Each dataset archive contains the interaction table, train/validation/test
-splits, original image and text features, user/item mappings, and the unified
-50% missing-item payload generated with seed 2023.
+The payload archive contains the unified 50% missing-item payloads generated
+with seed 2023. The projection archive mirrors the three small initializers
+already committed to the repository.
 
-## Installation
+## Data and installation
 
-After cloning CaIRec:
+Obtain Clothing and Sports from MMRec and build Beauty from the 2014 Amazon
+Product Data source as documented in `docs/DATASETS.md`. After the three
+dataset directories exist, install the CaIRec payloads:
 
 ```bash
-python scripts/download_assets.py --datasets all
+python scripts/download_assets.py --payloads all
 ```
 
-The projection checkpoints are already committed in the source repository.
-To restore them from this release as well:
+To restore only the projection checkpoint mirror:
 
 ```bash
-python scripts/download_assets.py --datasets all --with-checkpoints --overwrite
+python scripts/download_assets.py --with-checkpoints --overwrite
 ```
 
 The downloader verifies every archive against the SHA-256 values recorded in
