@@ -3,6 +3,7 @@ exp_mode: mm
 train_stage: recommender
 feature_bridge_mode: decoupled_latent
 gcn_frontend_mode: original_linear
+promrl_projection_mode: learned
 selection_mode: val
 recommendation_selection_metric: recall
 recommendation_selection_topk: 20
@@ -11,8 +12,12 @@ evaluation_protocol: strict
 device_id: 0
 use_gpu: 1
 seed: 2023
-dataset_seed: 0
-missing_mask_protocol: i3
+dataset_seed: 2023
+missing_mask_protocol: unified_static
+unified_payload_seed: 2023
+missing_rate: 0.5
+eval_missing_rate: 0.5
+train_missing_modality: random
 
 epoch: 400
 eva_interval: 1
@@ -22,14 +27,10 @@ topk: [10, 20, 30, 40, 50]
 lr: 0.005
 lr_rec: 0.005
 lr_imp: 0.0002
-lr_decoder: 0.00005
 freeze_imputer: 1
-freeze_decoder: 1
+freeze_recommender: -1
 recommender_allow_modal_grad: 0
 disable_imputation: 0
-
-missing_rate: 0.3
-eval_missing_rate: 0.5
 
 rec_neighbor_cl_weight: 0.010
 rec_neighbor_cl_temp: 0.2
@@ -38,6 +39,8 @@ gamma_align: 0.00125
 adapter_align_pseudo_ratio: 1.0
 
 item_graph_kind: modality_completed
+item_graph_missing_scope: train
+item_graph_feature_space: shared
 item_graph_topk: 10
 item_graph_norm: rw
 item_graph_cf_weight: 0.4
@@ -52,10 +55,10 @@ item_graph_modal_alpha: 0.25
 item_graph_modal_layers: 1
 item_graph_modal_target: all
 
+fusion_mode: mean
 reg_coeff: 0.01
 penalty_coeff: 1.0
 modality_bpr_coeff: 1.0
-
 contra_dim: 64
 d_beta: 32
 tau1: 0.1
@@ -65,9 +68,8 @@ itm_temp: 0.07
 itm_num_heads: 4
 ema_eta: 0.01
 
+strict_probe_test_interval: 0
 tensorboard: 0
-hf_tensorboard_repo: ""
-hf_token: ""
-hf_commit_every: 5
 save: 1
-suffix: stage2_beauty_modality_graph_mainline_cl010
+save_all_epochs: 0
+suffix: paper_stage2_beauty

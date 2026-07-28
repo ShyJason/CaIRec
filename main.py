@@ -67,6 +67,11 @@ def _load_config_file(config_path):
 def _build_parser():
     parser = argparse.ArgumentParser(description="MILK")
     parser.add_argument('--config', type=str, default=None, help='Path to a YAML/JSON config file')
+    parser.add_argument(
+        '--check_config',
+        action='store_true',
+        help='Validate configuration and exit before creating data or output directories.',
+    )
 
     # ----------------------- File Identification
     parser.add_argument('--suffix', type=str, default='default')
@@ -528,6 +533,9 @@ def parse_args():
 # ----------------------------------- Env Init -----------------------------------------------------------
 tool.cprint('Init Env')
 args = parse_args()
+if args.check_config:
+    print(f"configuration valid: {args.config or '<command line>'}")
+    sys.exit(0)
 # print(vars(args))
 # exit()
 my_env = Env(args)

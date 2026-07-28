@@ -1,6 +1,6 @@
-dataset: beauty
+dataset: clothing
 exp_mode: mm
-train_stage: imputer_backprop
+train_stage: imputer_param
 feature_bridge_mode: decoupled_latent
 gcn_frontend_mode: original_linear
 promrl_projection_mode: learned
@@ -10,15 +10,14 @@ device_id: 0
 use_gpu: 1
 seed: 2023
 dataset_seed: 0
-missing_mask_protocol: i3
+missing_mask_protocol: unified_static
+unified_payload_seed: 2023
 
-epoch: 50
+epoch: 5
 eva_interval: 1
 batch_size: 256
-lr: 0.0005
-lr_imp: 0.0005
-lr_decoder: 0.0002
-freeze_decoder: 1
+lr: 0.001
+alpha_rec: 1.0
 
 contra_dim: 64
 d_beta: 32
@@ -29,20 +28,10 @@ itm_temp: 0.07
 itm_num_heads: 4
 ema_eta: 0.01
 
-imputation_val_rate: 0.1
-imputation_selection_policy: stage1_default
-save_all_epochs: 1
-
-alpha_intra: 1.0
-alpha_inter: 1.0
-alpha_itm: 1.0
-alpha_rec: 1.0
-alpha_decode: 0.0
-missing_rate: 0.3
+missing_rate: 0.5
 eval_missing_rate: 0.5
 tensorboard: 0
 hf_tensorboard_repo: ""
-hf_token: ""
 hf_commit_every: 5
 save: 1
-suffix: stage1_2_beauty_mainline_completion
+suffix: stage1_1_clothing_mainline_param
