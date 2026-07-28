@@ -16,7 +16,6 @@ BPR optimization.
 ├── ckpt/                               # fixed Stage 1 projection initializers
 ├── run_mmrec_mainline.sh                # complete Stage 1.1 → 1.2 → 2 pipeline
 ├── scripts/                            # Beauty preparation, assets, significance
-├── docs/DATASETS.md                    # dataset sources and exact provenance
 └── tests/                              # focused regression tests
 ```
 
@@ -59,9 +58,37 @@ redistributed by this repository:
   then run `scripts/prepare_amazon_beauty.py`.
 
 Beauty is derived from the 2014 `Beauty` 5-core data, not the later 2018
-`All Beauty` dataset. See [`docs/DATASETS.md`](docs/DATASETS.md) for the exact
-raw-file checksums, preprocessing environment, expected output statistics, and
-directory layout.
+`All Beauty` dataset. Verify the raw files before preprocessing:
+
+```text
+e5925ec99023f1dc9c7d3dff7ef34cfeacd40d1b981b5525e1e4ba9c8abc18fe  reviews_Beauty_5.json.gz
+c7977dc0e0ead14ac7df8c1c6de74da00e4bebfad87a0f0c5763d4c5bc9b53a0  meta_Beauty.json.gz
+```
+
+Prepare Beauty with the separately recorded dependencies:
+
+```bash
+python3.10 -m venv .venv-beauty
+. .venv-beauty/bin/activate
+python -m pip install -r requirements-beauty.txt
+python scripts/prepare_amazon_beauty.py \
+  --source-dir /path/to/beauty-raw \
+  --target-dir Data/beauty \
+  --device cuda:0
+```
+
+The script retains products with both descriptions and downloadable images,
+deduplicates user-item reviews by timestamp, retains users with at least three
+interactions, and performs chronological leave-two-out splitting. Text
+features use `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions); image
+features use torchvision VGG16 before its final classifier layer (4096
+dimensions). The expected output contains 21,752 users, 11,161 items, and
+165,325 interactions, split into 121,821 training, 21,752 validation, and
+21,752 test interactions.
+
+Product image URLs are external and can disappear. A source rebuild that does
+not match the expected statistics should not be treated as an exact
+reproduction.
 
 The fixed missing-item payloads are CaIRec-generated files. Install them after
 the dataset directories exist:
