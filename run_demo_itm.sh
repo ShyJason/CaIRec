@@ -7,7 +7,11 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
-  PYTHON_BIN="python"
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    PYTHON_BIN="python"
+  fi
 fi
 
 export MKL_THREADING_LAYER="${MKL_THREADING_LAYER:-GNU}"
@@ -19,6 +23,7 @@ USE_GPU="${USE_GPU:-1}"
 SEED="${SEED:-2023}"
 DATASET_SEED="${DATASET_SEED:-0}"
 EVA_INTERVAL="${EVA_INTERVAL:-1}"
+EARLY_STOP="${EARLY_STOP:-}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 LR="${LR:-1e-3}"
 LR_REC="${LR_REC:-}"
@@ -47,49 +52,50 @@ EMA_ETA="${EMA_ETA:-0.01}"
 DISABLE_IMPUTATION="${DISABLE_IMPUTATION:-0}"
 FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE:-raw_decoder}"
 GCN_FRONTEND_MODE="${GCN_FRONTEND_MODE:-original_linear}"
+PROMRL_PROJECTION_MODE="${PROMRL_PROJECTION_MODE:-learned}"
+GENERATIVE_UPDATE_MODE="${GENERATIVE_UPDATE_MODE:-em}"
+MODAL_FEATURE_OVERRIDE_DIR="${MODAL_FEATURE_OVERRIDE_DIR:-${FEATURE_DIR:-}}"
+MODAL_FEATURE_TRAIN_DIR="${MODAL_FEATURE_TRAIN_DIR:-}"
+MODAL_FEATURE_EVAL_DIR="${MODAL_FEATURE_EVAL_DIR:-}"
+MODAL_FEATURE_IMAGE_FILE="${MODAL_FEATURE_IMAGE_FILE:-agg_image_items.npy}"
+MODAL_FEATURE_TEXT_FILE="${MODAL_FEATURE_TEXT_FILE:-agg_text_items.npy}"
+MODAL_FEATURE_AUDIO_FILE="${MODAL_FEATURE_AUDIO_FILE:-agg_audio_items.npy}"
+MODAL_FEATURE_VIDEO_FILE="${MODAL_FEATURE_VIDEO_FILE:-agg_video_items.npy}"
+MODAL_FEATURE_MASK_SOURCE="${MODAL_FEATURE_MASK_SOURCE:-nonzero}"
+MODAL_FEATURE_IMAGE_MASK_FILE="${MODAL_FEATURE_IMAGE_MASK_FILE:-image_observed_mask.npy}"
+MODAL_FEATURE_TEXT_MASK_FILE="${MODAL_FEATURE_TEXT_MASK_FILE:-text_observed_mask.npy}"
+MODAL_FEATURE_AUDIO_MASK_FILE="${MODAL_FEATURE_AUDIO_MASK_FILE:-audio_observed_mask.npy}"
+MODAL_FEATURE_VIDEO_MASK_FILE="${MODAL_FEATURE_VIDEO_MASK_FILE:-video_observed_mask.npy}"
+MODAL_FEATURE_OVERRIDE_IS_COMPLETED="${MODAL_FEATURE_OVERRIDE_IS_COMPLETED:-0}"
 ALPHA_INTRA="${ALPHA_INTRA:-1.0}"
 ALPHA_INTER="${ALPHA_INTER:-1.0}"
 ALPHA_ITM="${ALPHA_ITM:-1.0}"
+STRUCTURE_LOSS_VARIANT="${STRUCTURE_LOSS_VARIANT:-original}"
 if [[ "${DATASET}" == "clothing" && "${TRAIN_STAGE}" == "imputer_backprop" ]]; then
   ALPHA_REC="${ALPHA_REC:-1.0}"
 else
   ALPHA_REC="${ALPHA_REC:-0.1}"
 fi
-ALPHA_DECODE="${ALPHA_DECODE:-1.0}"
-ALPHA_DECODE_KL="${ALPHA_DECODE_KL:-0.0}"
-DECODE_KL_TEMP="${DECODE_KL_TEMP:-0.2}"
-if [[ "${DATASET}" == "clothing" && "${TRAIN_STAGE}" == "imputer_backprop" ]]; then
-  DECODE_LOSS_GRAD_MODE="${DECODE_LOSS_GRAD_MODE:-detached}"
-else
-  DECODE_LOSS_GRAD_MODE="${DECODE_LOSS_GRAD_MODE:-coupled}"
-fi
-DECODE_LOSS_TARGET_MODE=observed
+ALPHA_DECODE="${ALPHA_DECODE:-0.0}"
 BETA_INTRA="${BETA_INTRA:-0.05}"
 BETA_INTER="${BETA_INTER:-0.05}"
 BETA_ITM="${BETA_ITM:-0.05}"
 BETA_REC="${BETA_REC:-0.01}"
 BETA_DECODE="${BETA_DECODE:-0.01}"
-BETA_DECODE_KL="${BETA_DECODE_KL:-0.0}"
 GAMMA_ALIGN="${GAMMA_ALIGN:-0.0}"
+ADAPTER_ALIGN_PSEUDO_RATIO="${ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
 GAMMA_DISTILL="${GAMMA_DISTILL:-0.0}"
 RECOMMENDER_ALLOW_MODAL_GRAD="${RECOMMENDER_ALLOW_MODAL_GRAD:-0}"
 MLP_IMPUTE_TRAIN_PROJECTION="${MLP_IMPUTE_TRAIN_PROJECTION:-0}"
 SEMANTIC_IMPUTE_CONFIDENCE_FLOOR="${SEMANTIC_IMPUTE_CONFIDENCE_FLOOR:-0.2}"
-STAGE1_PROFILE="${STAGE1_PROFILE:-legacy}"
-STAGE1_V2_LOSS_PRESET="${STAGE1_V2_LOSS_PRESET:-legacy}"
-STAGE1_2_MODE="${STAGE1_2_MODE:-}"
-if [[ "${DATASET}" == "clothing" && "${TRAIN_STAGE}" == "imputer_backprop" ]]; then
-  GENERATIVE_UPDATE_MODE="${GENERATIVE_UPDATE_MODE:-fixed}"
-else
-  GENERATIVE_UPDATE_MODE="${GENERATIVE_UPDATE_MODE:-em}"
-fi
-STAGE1_REC_LOSS_MODE=observed
-STAGE1_MASKING_POLICY="${STAGE1_MASKING_POLICY:-fixed}"
 ALPHA_MISSING_SHARED="${ALPHA_MISSING_SHARED:-}"
 ALPHA_MISSING_DECODE="${ALPHA_MISSING_DECODE:-}"
 BETA_MISSING_SHARED="${BETA_MISSING_SHARED:-0.0}"
 BETA_MISSING_DECODE="${BETA_MISSING_DECODE:-0.0}"
 MISSING_RATE="${MISSING_RATE:-0.3}"
+TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY:-random}"
+EVAL_MISSING_RATE="${EVAL_MISSING_RATE:-}"
+MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL:-i3}"
 IMPUTATION_VAL_RATE="${IMPUTATION_VAL_RATE:-0.0}"
 IMPUTATION_SELECTION_POLICY="${IMPUTATION_SELECTION_POLICY:-legacy}"
 IMPUTATION_SELECTION_SPLIT="${IMPUTATION_SELECTION_SPLIT:-train}"
@@ -109,19 +115,6 @@ HF_TENSORBOARD_REPO="${HF_TENSORBOARD_REPO:-}"
 HF_TOKEN="${HF_TOKEN:-}"
 HF_COMMIT_EVERY="${HF_COMMIT_EVERY:-5}"
 CONFIG="${CONFIG:-}"
-SMORE_BETA_PRIOR_DIR="${SMORE_BETA_PRIOR_DIR:-}"
-SMORE_BETA_PRIOR_TRAIN_DIR="${SMORE_BETA_PRIOR_TRAIN_DIR:-}"
-SMORE_BETA_PRIOR_EVAL_DIR="${SMORE_BETA_PRIOR_EVAL_DIR:-}"
-SMORE_BETA_PRIOR_IMAGE_FILE="${SMORE_BETA_PRIOR_IMAGE_FILE:-image_item_embeds.npy}"
-SMORE_BETA_PRIOR_TEXT_FILE="${SMORE_BETA_PRIOR_TEXT_FILE:-text_item_embeds.npy}"
-SMORE_BETA_PRIOR_LAMBDA="${SMORE_BETA_PRIOR_LAMBDA:-0.0}"
-SMORE_BETA_PRIOR_RHO="${SMORE_BETA_PRIOR_RHO:-1.0}"
-SMORE_BETA_PRIOR_HIDDEN_DIM="${SMORE_BETA_PRIOR_HIDDEN_DIM:-128}"
-SMORE_BETA_PRIOR_DROPOUT="${SMORE_BETA_PRIOR_DROPOUT:-0.0}"
-SMORE_BETA_PRIOR_NORMALIZE="${SMORE_BETA_PRIOR_NORMALIZE:-0}"
-SMORE_BETA_PRIOR_VAR_MIN="${SMORE_BETA_PRIOR_VAR_MIN:-0.1}"
-SMORE_BETA_PRIOR_VAR_MAX="${SMORE_BETA_PRIOR_VAR_MAX:-2.0}"
-SMORE_BETA_PRIOR_SCOPE="${SMORE_BETA_PRIOR_SCOPE:-stage12_recommender}"
 
 if [[ "${AUTO_LOG_FILE}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
@@ -131,8 +124,7 @@ fi
 echo "[demo] root=${ROOT_DIR}"
 echo "[demo] dataset=${DATASET} exp_mode=${EXP_MODE} device_id=${DEVICE_ID}"
 echo "[demo] seed=${SEED} dataset_seed=${DATASET_SEED}"
-echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} disable_imputation=${DISABLE_IMPUTATION} bridge=${FEATURE_BRIDGE_MODE} frontend=${GCN_FRONTEND_MODE} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
-echo "[demo] stage1_2_mode=${STAGE1_2_MODE:-<none>}"
+echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} structure_loss_variant=${STRUCTURE_LOSS_VARIANT} disable_imputation=${DISABLE_IMPUTATION} bridge=${FEATURE_BRIDGE_MODE} frontend=${GCN_FRONTEND_MODE} train_missing_modality=${TRAIN_MISSING_MODALITY} missing_rate=${MISSING_RATE} eval_missing_rate=${EVAL_MISSING_RATE:-config/default} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
 echo "[demo] log_file=${LOG_FILE}"
 echo "[demo] tensorboard=${TENSORBOARD} hf_tensorboard_repo=${HF_TENSORBOARD_REPO:-<none>}"
 echo "[demo] config=${CONFIG:-<none>}"
@@ -164,30 +156,26 @@ cmd=(
   --disable_imputation "${DISABLE_IMPUTATION}"
   --feature_bridge_mode "${FEATURE_BRIDGE_MODE}"
   --gcn_frontend_mode "${GCN_FRONTEND_MODE}"
+  --promrl_projection_mode "${PROMRL_PROJECTION_MODE}"
+  --generative_update_mode "${GENERATIVE_UPDATE_MODE}"
   --alpha_intra "${ALPHA_INTRA}"
   --alpha_inter "${ALPHA_INTER}"
   --alpha_itm "${ALPHA_ITM}"
+  --structure_loss_variant "${STRUCTURE_LOSS_VARIANT}"
   --alpha_rec "${ALPHA_REC}"
   --alpha_decode "${ALPHA_DECODE}"
-  --alpha_decode_kl "${ALPHA_DECODE_KL}"
-  --decode_kl_temp "${DECODE_KL_TEMP}"
-  --decode_loss_grad_mode "${DECODE_LOSS_GRAD_MODE}"
-  --decode_loss_target_mode "${DECODE_LOSS_TARGET_MODE}"
   --beta_intra "${BETA_INTRA}"
   --beta_inter "${BETA_INTER}"
   --beta_itm "${BETA_ITM}"
   --beta_rec "${BETA_REC}"
   --beta_decode "${BETA_DECODE}"
-  --beta_decode_kl "${BETA_DECODE_KL}"
   --gamma_align "${GAMMA_ALIGN}"
+  --adapter_align_pseudo_ratio "${ADAPTER_ALIGN_PSEUDO_RATIO}"
   --gamma_distill "${GAMMA_DISTILL}"
   --recommender_allow_modal_grad "${RECOMMENDER_ALLOW_MODAL_GRAD}"
-  --stage1_profile "${STAGE1_PROFILE}"
-  --stage1_v2_loss_preset "${STAGE1_V2_LOSS_PRESET}"
-  --generative_update_mode "${GENERATIVE_UPDATE_MODE}"
-  --stage1_masking_policy "${STAGE1_MASKING_POLICY}"
-  --stage1_rec_loss_mode "${STAGE1_REC_LOSS_MODE}"
+  --train_missing_modality "${TRAIN_MISSING_MODALITY}"
   --missing_rate "${MISSING_RATE}"
+  --missing_mask_protocol "${MISSING_MASK_PROTOCOL}"
   --imputation_val_rate "${IMPUTATION_VAL_RATE}"
   --imputation_selection_policy "${IMPUTATION_SELECTION_POLICY}"
   --imputation_selection_split "${IMPUTATION_SELECTION_SPLIT}"
@@ -195,16 +183,6 @@ cmd=(
   --selection_mode "${SELECTION_MODE}"
   --evaluation_protocol "${EVALUATION_PROTOCOL}"
   --strict_probe_test_interval "${STRICT_PROBE_TEST_INTERVAL}"
-  --smore_beta_prior_image_file "${SMORE_BETA_PRIOR_IMAGE_FILE}"
-  --smore_beta_prior_text_file "${SMORE_BETA_PRIOR_TEXT_FILE}"
-  --smore_beta_prior_lambda "${SMORE_BETA_PRIOR_LAMBDA}"
-  --smore_beta_prior_rho "${SMORE_BETA_PRIOR_RHO}"
-  --smore_beta_prior_hidden_dim "${SMORE_BETA_PRIOR_HIDDEN_DIM}"
-  --smore_beta_prior_dropout "${SMORE_BETA_PRIOR_DROPOUT}"
-  --smore_beta_prior_normalize "${SMORE_BETA_PRIOR_NORMALIZE}"
-  --smore_beta_prior_var_min "${SMORE_BETA_PRIOR_VAR_MIN}"
-  --smore_beta_prior_var_max "${SMORE_BETA_PRIOR_VAR_MAX}"
-  --smore_beta_prior_scope "${SMORE_BETA_PRIOR_SCOPE}"
   --tensorboard "${TENSORBOARD}"
   --save "${SAVE}"
   --save_all_epochs "${SAVE_ALL_EPOCHS}"
@@ -213,22 +191,6 @@ cmd=(
 
 if [[ -n "${CONFIG}" ]]; then
   cmd+=(--config "${CONFIG}")
-fi
-
-if [[ -n "${SMORE_BETA_PRIOR_DIR}" ]]; then
-  cmd+=(--smore_beta_prior_dir "${SMORE_BETA_PRIOR_DIR}")
-fi
-
-if [[ -n "${SMORE_BETA_PRIOR_TRAIN_DIR}" ]]; then
-  cmd+=(--smore_beta_prior_train_dir "${SMORE_BETA_PRIOR_TRAIN_DIR}")
-fi
-
-if [[ -n "${SMORE_BETA_PRIOR_EVAL_DIR}" ]]; then
-  cmd+=(--smore_beta_prior_eval_dir "${SMORE_BETA_PRIOR_EVAL_DIR}")
-fi
-
-if [[ -n "${STAGE1_2_MODE}" ]]; then
-  cmd+=(--stage1_2_mode "${STAGE1_2_MODE}")
 fi
 
 if [[ -n "${LR_REC}" ]]; then
@@ -251,8 +213,40 @@ if [[ -n "${CKPT_START_EPOCH}" ]]; then
   cmd+=(--ckpt_start_epoch "${CKPT_START_EPOCH}")
 fi
 
+if [[ -n "${EARLY_STOP}" ]]; then
+  cmd+=(--early_stop "${EARLY_STOP}")
+fi
+
 if [[ -n "${IMPUTER_CKPT}" ]]; then
   cmd+=(--imputer_ckpt "${IMPUTER_CKPT}")
+fi
+
+if [[ -n "${EVAL_MISSING_RATE}" ]]; then
+  cmd+=(--eval_missing_rate "${EVAL_MISSING_RATE}")
+fi
+
+if [[ -n "${MODAL_FEATURE_OVERRIDE_DIR}" ]]; then
+  cmd+=(
+    --modal_feature_override_dir "${MODAL_FEATURE_OVERRIDE_DIR}"
+    --modal_feature_image_file "${MODAL_FEATURE_IMAGE_FILE}"
+    --modal_feature_text_file "${MODAL_FEATURE_TEXT_FILE}"
+    --modal_feature_audio_file "${MODAL_FEATURE_AUDIO_FILE}"
+    --modal_feature_video_file "${MODAL_FEATURE_VIDEO_FILE}"
+    --modal_feature_mask_source "${MODAL_FEATURE_MASK_SOURCE}"
+    --modal_feature_image_mask_file "${MODAL_FEATURE_IMAGE_MASK_FILE}"
+    --modal_feature_text_mask_file "${MODAL_FEATURE_TEXT_MASK_FILE}"
+    --modal_feature_audio_mask_file "${MODAL_FEATURE_AUDIO_MASK_FILE}"
+    --modal_feature_video_mask_file "${MODAL_FEATURE_VIDEO_MASK_FILE}"
+    --modal_feature_override_is_completed "${MODAL_FEATURE_OVERRIDE_IS_COMPLETED}"
+  )
+fi
+
+if [[ -n "${MODAL_FEATURE_TRAIN_DIR}" ]]; then
+  cmd+=(--modal_feature_train_dir "${MODAL_FEATURE_TRAIN_DIR}")
+fi
+
+if [[ -n "${MODAL_FEATURE_EVAL_DIR}" ]]; then
+  cmd+=(--modal_feature_eval_dir "${MODAL_FEATURE_EVAL_DIR}")
 fi
 
 if [[ -n "${HF_TENSORBOARD_REPO}" ]]; then

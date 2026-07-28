@@ -3,7 +3,7 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 
-/Data
+Data/
 .dataset_downloads/
 exp_report/
 
@@ -30,4 +30,4 @@ nohup.out
 *.launcher.log
 bg_stage*.log
 *.log
-/.venv
+.venv/

@@ -1,4 +1,4 @@
-dataset: clothing
+dataset: beauty
 exp_mode: mm
 train_stage: recommender
 feature_bridge_mode: decoupled_latent
@@ -16,7 +16,7 @@ missing_mask_protocol: i3
 
 epoch: 400
 eva_interval: 1
-early_stop: 50
+early_stop: 20
 batch_size: 2048
 topk: [10, 20, 30, 40, 50]
 lr: 0.005
@@ -28,31 +28,26 @@ freeze_decoder: 1
 recommender_allow_modal_grad: 0
 disable_imputation: 0
 
-# Current Clothing mainline: 30% missing during training, fixed 50% missing
-# masks during validation/test.
 missing_rate: 0.3
 eval_missing_rate: 0.5
 
-# Keep only the post-GCN true-missing InfoNCE objective.
-rec_neighbor_cl_weight: 0.005
+rec_neighbor_cl_weight: 0.010
 rec_neighbor_cl_temp: 0.2
 rec_neighbor_cl_bank_size: 256
 gamma_align: 0.00125
 adapter_align_pseudo_ratio: 1.0
 
-# Current Clothing mainline: one completed item graph per modality. Each
-# modality graph blends CF with that modality's semantic graph, then propagation
-# happens on the matching modality graph instead of one fused graph. The
-# semantic graph follows the verified 0.08069 path: observed completion
-# projection plus missing imputed completion latent in shared space.
 item_graph_kind: modality_completed
-item_graph_feature_space: shared
 item_graph_topk: 10
 item_graph_norm: rw
 item_graph_cf_weight: 0.4
+item_graph_cf_scale: raw
+item_graph_cf_power: 0.5
+item_graph_cf_clip: 3.0
 item_graph_image_weight: 0.6
 item_graph_text_weight: 0.6
 item_graph_audio_weight: 0.0
+item_graph_video_weight: 0.0
 item_graph_modal_alpha: 0.25
 item_graph_modal_layers: 1
 item_graph_modal_target: all
@@ -77,4 +72,4 @@ hf_tensorboard_repo: ""
 hf_token: ""
 hf_commit_every: 5
 save: 1
-suffix: stage2_clothing_mr0p3_modality_graph_mainline
+suffix: stage2_beauty_modality_graph_mainline_cl010

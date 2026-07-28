@@ -1,4 +1,4 @@
-dataset: clothing
+dataset: beauty
 exp_mode: mm
 train_stage: imputer_param
 feature_bridge_mode: decoupled_latent
@@ -34,4 +34,4 @@ hf_tensorboard_repo: ""
 hf_token: ""
 hf_commit_every: 5
 save: 1
-suffix: stage1_1_clothing_mainline_param
+suffix: stage1_1_beauty_mainline_param

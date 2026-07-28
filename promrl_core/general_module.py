@@ -24,11 +24,9 @@ class GELU(nn.Module):
 
 
 class Contra_head(nn.Module):
-    def __init__(self, input_dim, contra_dim, bias=True):
+    def __init__(self, input_dim, contra_dim):
         super().__init__()
-        self.linear = nn.Linear(input_dim, contra_dim, bias=bias)
-        if self.linear.bias is not None:
-            nn.init.zeros_(self.linear.bias)
+        self.linear = nn.Linear(input_dim, contra_dim, bias=False)
     def forward(self, cls_token):
         return self.linear(cls_token)
 
@@ -572,13 +570,9 @@ class MMGeneralModule(nn.Module):
                                 use_checkpoint=swin_config.TRAIN.USE_CHECKPOINT,
                                 fused_window_process=swin_config.FUSED_WINDOW_PROCESS)
 
-        
+
         missing_keys, unexpected_keys = self.vision_encoder.load_state_dict(swin_weight,strict=False)
 
         del(swin_weight)
         #LOGGER.info(f'missing_keys in vision encoder: {missing_keys}')
         LOGGER.info(f'unexpected_keys in vision encoder: {unexpected_keys}')
-
-
-
-

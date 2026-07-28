@@ -1,4 +1,5 @@
 import argparse
+import sys
 import json
 from pathlib import Path
 import time
@@ -60,8 +61,40 @@ def _build_parser():
     parser.add_argument('--device_id', type=int, default=0)
     parser.add_argument('--seed', type=int, default=2023)
     parser.add_argument('--dataset_seed', type=int, default=0)
-    parser.add_argument('--missing_mask_protocol', type=str, default='i3', choices=['i3', 'default_rng'])
+    parser.add_argument(
+        '--unified_payload_seed',
+        type=int,
+        default=-1,
+        help='Seed of the pre-generated unified_static missing payload; defaults to --seed.',
+    )
+    parser.add_argument(
+        '--unified_payload_file',
+        type=str,
+        default='',
+        help=(
+            'Optional unified_static payload filename. Relative paths are resolved '
+            'inside Data/<dataset>; when omitted, the seed-based default is used.'
+        ),
+    )
+    parser.add_argument(
+        '--missing_mask_protocol',
+        type=str,
+        default='i3',
+        choices=['i3', 'default_rng', 'unified_static'],
+        help='unified_static loads the pre-generated, phase-invariant missing-item payload',
+    )
+    parser.add_argument(
+        '--train_missing_modality',
+        type=str,
+        default='random',
+        choices=['random', 'image', 'text'],
+        help=(
+            'Training-only missing-modality policy. Validation/test keep the '
+            'random-modality protocol controlled by eval_missing_rate.'
+        ),
+    )
     parser.add_argument('--ckpt', type=str, default=None)
+    parser.add_argument('--eval_only', type=int, default=0)
     parser.add_argument('--imputer_ckpt', type=str, default=None)
     parser.add_argument('--ckpt_start_epoch', type=int, default=0)
 
@@ -88,12 +121,44 @@ def _build_parser():
     parser.add_argument('--evaluation_protocol', type=str, default='strict', choices=['legacy', 'strict'])
     parser.add_argument('--strict_record_test_each_epoch', type=int, default=0)
     parser.add_argument(
+        '--report_test_modality_subsets',
+        type=int,
+        default=0,
+        help=(
+            'Report test metrics separately for positive items with all modalities '
+            'observed and positive items selected by the test missing-modality mask. '
+            'The ranking candidate set remains unchanged.'
+        ),
+    )
+    parser.add_argument(
         '--strict_probe_test_interval',
         type=int,
         default=0,
         help='Strict protocol only: log test metrics every N epochs without using them for selection. 0 disables.',
     )
     parser.add_argument('--dataset', type=str, default='clothing')
+    parser.add_argument(
+        '--cold_start_protocol',
+        type=str,
+        default='none',
+        choices=['none', 'milk'],
+        help='milk loads a pre-generated 80/10/10 item-disjoint split.',
+    )
+    parser.add_argument('--cold_start_seed', type=int, default=2023)
+    parser.add_argument('--cold_start_missing_seed', type=int, default=2023)
+    parser.add_argument(
+        '--cold_start_eval_candidates',
+        type=str,
+        default='milk_union',
+        choices=['milk_union', 'split'],
+        help='Use the official MILK cold union or split-specific cold candidates.',
+    )
+    parser.add_argument(
+        '--cold_start_data_dir',
+        type=str,
+        default='',
+        help='Optional split directory. Relative paths are resolved below Data/<dataset>.',
+    )
     parser.add_argument('--exp_mode', type=str, default='fm')
     parser.add_argument('--model', type=str, default='MILK')
     parser.add_argument(
@@ -101,13 +166,9 @@ def _build_parser():
         type=str,
         default='imputer_backprop',
         choices=[
-            'imputer',
             'imputer_param',
             'imputer_backprop',
-            'imputer_init',
-            'imputer_align',
-            'imputer_promrl_main',
-            'imputer_adapter',
+            'projection_pretrain',
             'recommender',
             'joint',
         ],
@@ -132,12 +193,6 @@ def _build_parser():
 
     parser.add_argument('--alpha', type=float, default=0.1)
     parser.add_argument('--contra_dim', type=int, default=256)
-    parser.add_argument(
-        '--promrl_projection_bias',
-        type=int,
-        default=1,
-        help='Whether learned ProMRL projection heads use bias. Enabled to match I3 MGCN Linear projection heads.',
-    )
     parser.add_argument('--d_beta', type=int, default=128)
     parser.add_argument('--tau1', type=float, default=0.1)
     parser.add_argument('--tau2', type=float, default=0.1)
@@ -150,20 +205,63 @@ def _build_parser():
         '--feature_bridge_mode',
         type=str,
         default='raw_decoder',
-        choices=['raw_decoder', 'shared_identity'],
+        choices=['raw_decoder', 'latent_direct', 'decoupled_latent'],
+    )
+    parser.add_argument(
+        '--enable_raw_completion_decoder',
+        type=int,
+        default=0,
+        help=(
+            'Attach a decoder from the completion space back to each raw modality '
+            'space without changing feature_bridge_mode. This is intended for '
+            'decoder-only training on a frozen decoupled-latent checkpoint.'
+        ),
+    )
+    parser.add_argument(
+        '--decoder_loss_mode',
+        type=str,
+        default='observed_projection',
+        choices=['observed_projection', 'pseudo_missing'],
+        help=(
+            'observed_projection reconstructs raw features from their own projected '
+            'representations; pseudo_missing reconstructs a held-out observed modality '
+            'from the actual completion produced using the remaining modalities.'
+        ),
+    )
+    parser.add_argument(
+        '--decoder_pseudo_missing_ratio',
+        type=float,
+        default=1.0,
+        help='Fraction of eligible batch items used for pseudo-missing decoder supervision.',
+    )
+    parser.add_argument(
+        '--decoder_output_mode',
+        type=str,
+        default='normalized',
+        choices=['normalized', 'native_direction_norm'],
+        help=(
+            'normalized preserves the historical unit-vector decoder; '
+            'native_direction_norm predicts raw direction and item-specific magnitude '
+            'with separate heads.'
+        ),
+    )
+    parser.add_argument('--decoder_raw_loss_weight', type=float, default=1.0)
+    parser.add_argument('--decoder_cosine_loss_weight', type=float, default=1.0)
+    parser.add_argument('--decoder_norm_loss_weight', type=float, default=0.25)
+    parser.add_argument('--decoder_relation_loss_weight', type=float, default=0.1)
+    parser.add_argument('--decoder_relation_max_items', type=int, default=64)
+    parser.add_argument(
+        '--gcn_frontend_mode',
+        type=str,
+        default='original_linear',
+        choices=['original_linear', 'deep_mlp', 'identity'],
     )
     parser.add_argument(
         '--promrl_projection_mode',
         type=str,
         default='learned',
         choices=['learned', 'identity'],
-        help='Projection used before ProMRL/imputation. identity uses normalized modal features directly and requires feature_dim == contra_dim.',
-    )
-    parser.add_argument(
-        '--gcn_frontend_mode',
-        type=str,
-        default='original_linear',
-        choices=['original_linear', 'deep_mlp', 'identity'],
+        help='Projection before completion/imputation. identity uses normalized modal features directly and requires feature_dim == promrl_dim.',
     )
     parser.add_argument(
         '--modal_feature_override_dir',
@@ -196,13 +294,26 @@ def _build_parser():
         help='Text feature filename used with modal_feature_override_dir.',
     )
     parser.add_argument(
+        '--modal_feature_audio_file',
+        type=str,
+        default='agg_audio_items.npy',
+        help='Optional audio feature filename used with modal_feature_override_dir when present.',
+    )
+    parser.add_argument(
+        '--modal_feature_video_file',
+        type=str,
+        default='agg_video_items.npy',
+        help='Optional video feature filename used with modal_feature_override_dir when present.',
+    )
+    parser.add_argument(
         '--modal_feature_mask_source',
         type=str,
         default='nonzero',
         choices=['nonzero', 'external_observed'],
         help=(
             'How to derive observed modality masks when using modal_feature_override_dir. '
-            'nonzero preserves legacy behavior; external_observed loads exported observed-mask files.'
+            'external_observed reads exported observed-mask files so completed nonzero rows '
+            'are still treated as originally missing.'
         ),
     )
     parser.add_argument(
@@ -218,88 +329,22 @@ def _build_parser():
         help='Text observed-mask filename used when modal_feature_mask_source=external_observed.',
     )
     parser.add_argument(
-        '--smore_beta_prior_dir',
+        '--modal_feature_audio_mask_file',
         type=str,
-        default='',
-        help='Optional directory with SMORE item embeddings used as a conditional beta prior.',
+        default='audio_observed_mask.npy',
+        help='Audio observed-mask filename used when modal_feature_mask_source=external_observed.',
     )
     parser.add_argument(
-        '--smore_beta_prior_train_dir',
+        '--modal_feature_video_mask_file',
         type=str,
-        default='',
-        help='Optional explicit train-phase SMORE prior feature directory.',
+        default='video_observed_mask.npy',
+        help='Video observed-mask filename used when modal_feature_mask_source=external_observed.',
     )
     parser.add_argument(
-        '--smore_beta_prior_eval_dir',
-        type=str,
-        default='',
-        help='Optional explicit eval/test-phase SMORE prior feature directory.',
-    )
-    parser.add_argument(
-        '--smore_beta_prior_image_file',
-        type=str,
-        default='image_item_embeds.npy',
-        help='Image SMORE item embedding filename for beta prior.',
-    )
-    parser.add_argument(
-        '--smore_beta_prior_text_file',
-        type=str,
-        default='text_item_embeds.npy',
-        help='Text SMORE item embedding filename for beta prior.',
-    )
-    parser.add_argument(
-        '--smore_beta_prior_lambda',
-        type=float,
-        default=0.0,
-        help='Weight for SMORE conditional beta prior. Zero disables the prior.',
-    )
-    parser.add_argument(
-        '--smore_beta_prior_rho',
-        type=float,
-        default=1.0,
-        help='Deprecated for learned covariance prior; kept for old scripts.',
-    )
-    parser.add_argument('--smore_beta_prior_hidden_dim', type=int, default=128)
-    parser.add_argument('--smore_beta_prior_dropout', type=float, default=0.0)
-    parser.add_argument('--smore_beta_prior_normalize', type=int, default=0)
-    parser.add_argument('--smore_beta_prior_var_min', type=float, default=0.1)
-    parser.add_argument('--smore_beta_prior_var_max', type=float, default=2.0)
-    parser.add_argument(
-        '--smore_beta_prior_scope',
-        type=str,
-        default='stage12_recommender',
-        choices=['stage12', 'stage12_recommender', 'all_nonparam'],
-        help='Stages where the SMORE beta prior is active; imputer_param is always excluded.',
-    )
-    parser.add_argument(
-        '--beta_completion_mode',
-        type=str,
-        default='linear',
-        choices=['linear', 'decoder'],
-        help=(
-            'Mapping from closed-form beta posterior to shared modal features. '
-            'linear keeps CalMRL W beta + mu; decoder uses an MLP D_m(beta).'
-        ),
-    )
-    parser.add_argument('--beta_completion_decoder_hidden_dim', type=int, default=128)
-    parser.add_argument('--beta_completion_decoder_dropout', type=float, default=0.0)
-    parser.add_argument(
-        '--beta_completion_rec_weight',
-        type=float,
-        default=1.0,
-        help='Extra observed-modality reconstruction weight for beta_completion_mode != linear.',
-    )
-    parser.add_argument(
-        '--beta_completion_rec_loss',
-        type=str,
-        default='mse_cosine',
-        choices=['mse', 'cosine', 'mse_cosine'],
-    )
-    parser.add_argument(
-        '--beta_completion_detach_beta',
+        '--modal_feature_override_is_completed',
         type=int,
-        default=1,
-        help='Detach closed-form beta before the beta completion decoder reconstruction loss.',
+        default=0,
+        help='Set to 1 when external override files already contain completed features for missing modalities.',
     )
     parser.add_argument(
         '--completion_gate_mode',
@@ -308,7 +353,6 @@ def _build_parser():
         choices=[
             'off',
             'reliability',
-            'missing_reliability',
             'alignment',
             'rank_residual',
             'rank_residual_norm',
@@ -325,9 +369,7 @@ def _build_parser():
     parser.add_argument('--completion_gate_hidden_dim', type=int, default=64)
     parser.add_argument('--completion_gate_dropout', type=float, default=0.1)
     parser.add_argument('--completion_gate_init_logit', type=float, default=1.5)
-    parser.add_argument('--completion_gate_lr', type=float, default=None)
     parser.add_argument('--completion_gate_detach_inputs', type=int, default=1)
-    parser.add_argument('--completion_gate_stats_norm', type=int, default=1)
     parser.add_argument('--completion_gate_use_item_context', type=int, default=1)
     parser.add_argument(
         '--completion_gate_item_context_source',
@@ -337,27 +379,60 @@ def _build_parser():
     )
     parser.add_argument('--item_graph_topk', type=int, default=20)
     parser.add_argument(
+        '--item_graph_fuse_before_topk',
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            'Experimental completed-item graph construction order. When enabled for '
+            'modality_completed, compute weighted CF+semantic scores over all items first '
+            'and apply top-k only once; the default keeps the legacy per-source top-k '
+            'followed by fusion and a final top-k.'
+        ),
+    )
+    parser.add_argument(
+        '--item_graph_missing_scope',
+        type=str,
+        default='train',
+        choices=['all', 'train'],
+        help=(
+            'Missing-mask scope used only when building completed item graphs. '
+            'train excludes validation/test missing masks from the training-time item graph; '
+            'all preserves the old transductive behavior for reproduction only.'
+        ),
+    )
+    parser.add_argument(
         '--item_graph_kind',
         type=str,
         default='none',
         choices=[
             'none',
+            'modality_masked',
             'fused_completed',
             'modality_completed',
+            'modality_completed_inductive',
             'modality_completed_confidence',
             'modality_completed_dynamic_confidence',
             'fused_completed_confidence',
             'fused_completed_dynamic_confidence',
+            'fused_completed_reliability',
+            'fused_completed_reliability_topk',
         ],
         help=(
-            'Item-item graph adapter kind. fused_completed fuses CF plus completed-feature '
+            'Item-item graph adapter kind. modality_masked builds per-modality CF plus semantic '
+            'graphs directly from masked raw features for strict Stage2-only no-completion ablations; '
+            'fused_completed fuses CF plus completed-feature '
             'modality graphs before propagation; modality_completed propagates each modality '
             'embedding with its own CF plus completed-feature modality graph; '
+            'modality_completed_inductive restricts semantic references to warm items and '
+            'attaches cold query rows only during evaluation; '
             'modality_completed_confidence adds learnable edge confidence (rr/ri/ii) for each modality completed graph; '
             'modality_completed_dynamic_confidence recomputes per-modality topk from the learned confidences during propagation; '
             'fused_completed_confidence learns edge confidence for real-real, real-imputed, '
             'and imputed-imputed completed-feature edges after a fixed initial topk; '
-            'fused_completed_dynamic_confidence recomputes topk from the learned confidences during propagation.'
+            'fused_completed_dynamic_confidence recomputes topk from the learned confidences during propagation; '
+            'fused_completed_reliability downweights completed-feature graph edges using per-item completion reliability; '
+            'fused_completed_reliability_topk applies the same reliability before top-k neighbor selection.'
         ),
     )
     parser.add_argument(
@@ -392,60 +467,9 @@ def _build_parser():
     )
     parser.add_argument('--item_graph_image_weight', type=float, default=0.25)
     parser.add_argument('--item_graph_text_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--item_graph_image_cf_weight',
-        type=float,
-        default=None,
-        help='CF graph weight used only for the image modality-specific item graph. Defaults to item_graph_cf_weight.',
-    )
-    parser.add_argument(
-        '--item_graph_image_semantic_weight',
-        type=float,
-        default=None,
-        help='Image semantic graph weight used only for the image modality-specific item graph. Defaults to item_graph_image_weight.',
-    )
-    parser.add_argument(
-        '--item_graph_text_cf_weight',
-        type=float,
-        default=None,
-        help='CF graph weight used only for the text modality-specific item graph. Defaults to item_graph_cf_weight.',
-    )
-    parser.add_argument(
-        '--item_graph_text_semantic_weight',
-        type=float,
-        default=None,
-        help='Text semantic graph weight used only for the text modality-specific item graph. Defaults to item_graph_text_weight.',
-    )
-    parser.add_argument(
-        '--item_graph_audio_cf_weight',
-        type=float,
-        default=None,
-        help='CF graph weight used only for the audio modality-specific item graph. Defaults to item_graph_cf_weight.',
-    )
-    parser.add_argument(
-        '--item_graph_audio_semantic_weight',
-        type=float,
-        default=None,
-        help='Audio semantic graph weight used only for the audio modality-specific item graph. Defaults to item_graph_audio_weight.',
-    )
     parser.add_argument('--item_graph_rr_confidence_init', type=float, default=1.0)
     parser.add_argument('--item_graph_ri_confidence_init', type=float, default=1.0)
     parser.add_argument('--item_graph_ii_confidence_init', type=float, default=1.0)
-    parser.add_argument('--item_graph_text_rr_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_text_ri_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_text_ii_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_image_rr_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_image_ri_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_image_ii_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_audio_rr_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_audio_ri_confidence_init', type=float, default=None)
-    parser.add_argument('--item_graph_audio_ii_confidence_init', type=float, default=None)
-    parser.add_argument(
-        '--item_graph_confidence_lr',
-        type=float,
-        default=None,
-        help='Optional optimizer learning rate for learnable item graph edge confidences. Defaults to lr_rec.',
-    )
     parser.add_argument(
         '--item_graph_modality_specific_confidence',
         type=int,
@@ -497,15 +521,6 @@ def _build_parser():
     parser.add_argument('--item_graph_rr_confidence_reg_target', type=float, default=None)
     parser.add_argument('--item_graph_ri_confidence_reg_target', type=float, default=None)
     parser.add_argument('--item_graph_ii_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_text_rr_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_text_ri_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_text_ii_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_image_rr_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_image_ri_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_image_ii_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_audio_rr_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_audio_ri_confidence_reg_target', type=float, default=None)
-    parser.add_argument('--item_graph_audio_ii_confidence_reg_target', type=float, default=None)
     parser.add_argument(
         '--item_graph_confidence_reg_start_epoch',
         type=int,
@@ -544,62 +559,11 @@ def _build_parser():
         type=str,
         default='shared',
         choices=['shared', 'raw_decoder'],
-        help='Feature space used to build completed modality item graphs. raw_decoder uses observed raw features plus decoded imputed raw features.',
-    )
-    parser.add_argument(
-        '--item_graph_feature_source',
-        type=str,
-        default='internal_completion',
-        choices=['internal_completion', 'external_completed'],
         help=(
-            'Feature source used to build completed modality item graphs. '
-            'internal_completion preserves the original MMRec path that masks raw features and runs the configured imputer. '
-            'external_completed uses externally exported completed modal features; auto directory selection follows item_graph_mask_scope.'
+            'Feature space used to build completed modality item graphs. '
+            'shared uses observed projected completion latents plus imputed completion latents; '
+            'raw_decoder uses observed raw features plus decoded imputed raw features.'
         ),
-    )
-    parser.add_argument(
-        '--item_graph_mask_scope',
-        type=str,
-        default='train',
-        choices=['train', 'train_val', 'all'],
-        help=(
-            'Missing-mask scope used to build completed item graphs. '
-            'train is strict and excludes recommendation val/test masks; '
-            'all preserves the legacy all-split graph construction and is not valid under strict evaluation.'
-        ),
-    )
-    parser.add_argument(
-        '--item_graph_feature_dir',
-        type=str,
-        default='',
-        help=(
-            'Directory containing external completed item-graph features. '
-            'If empty and item_graph_feature_source=external_completed, phase_train under modal_feature_override_dir is used by default.'
-        ),
-    )
-    parser.add_argument(
-        '--item_graph_feature_image_file',
-        type=str,
-        default='',
-        help='Image feature filename for external completed item-graph features. Defaults to modal_feature_image_file.',
-    )
-    parser.add_argument(
-        '--item_graph_feature_text_file',
-        type=str,
-        default='',
-        help='Text feature filename for external completed item-graph features. Defaults to modal_feature_text_file.',
-    )
-    parser.add_argument(
-        '--item_graph_feature_image_mask_file',
-        type=str,
-        default='image_observed_mask.npy',
-        help='Optional observed-mask filename for external image item-graph features. True means observed.',
-    )
-    parser.add_argument(
-        '--item_graph_feature_text_mask_file',
-        type=str,
-        default='text_observed_mask.npy',
-        help='Optional observed-mask filename for external text item-graph features. True means observed.',
     )
     parser.add_argument(
         '--item_graph_audio_weight',
@@ -607,7 +571,37 @@ def _build_parser():
         default=0.0,
         help='Audio graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
     )
+    parser.add_argument(
+        '--item_graph_video_weight',
+        type=float,
+        default=0.0,
+        help='Video graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
+    )
     parser.add_argument('--item_graph_feature_chunk_size', type=int, default=1024)
+    parser.add_argument(
+        '--item_graph_reliability_floor',
+        type=float,
+        default=0.4,
+        help='Minimum per-item reliability for missing completed modality features in fused_completed_reliability.',
+    )
+    parser.add_argument(
+        '--item_graph_reliability_blend',
+        type=float,
+        default=1.0,
+        help='Blend strength for reliability edge reweighting. 0 keeps original completed graphs; 1 fully applies q_i*q_j.',
+    )
+    parser.add_argument(
+        '--item_graph_reliability_missing_penalty',
+        type=float,
+        default=1.0,
+        help='Extra multiplier for missing-item reliability before clamping to [floor, 1].',
+    )
+    parser.add_argument(
+        '--item_graph_reliability_missing_boost',
+        type=float,
+        default=0.0,
+        help='Optional boost for high-consistency missing completed modality features; 0 keeps reliability in [floor, 1].',
+    )
     parser.add_argument(
         '--item_graph_modal_alpha',
         type=float,
@@ -645,17 +639,6 @@ def _build_parser():
     parser.add_argument('--completion_gate_softmax_temp', type=float, default=1.0)
     parser.add_argument('--completion_gate_advantage_coeff', type=float, default=0.0)
     parser.add_argument('--completion_gate_advantage_margin', type=float, default=0.0)
-    parser.add_argument('--completion_gate_supervision_coeff', type=float, default=0.0)
-    parser.add_argument('--completion_gate_supervision_observed_target', type=float, default=1.0)
-    parser.add_argument('--completion_gate_counterfactual_coeff', type=float, default=0.0)
-    parser.add_argument('--completion_gate_counterfactual_ratio', type=float, default=0.5)
-    parser.add_argument('--completion_gate_counterfactual_mse_temp', type=float, default=0.1)
-    parser.add_argument(
-        '--completion_gate_apply_observed',
-        type=int,
-        default=1,
-        help='If 0, learned completion/reliability gates are applied only to originally missing modalities.',
-    )
     parser.add_argument('--completion_gate_score_residual_alpha', type=float, default=0.0)
     parser.add_argument('--completion_gate_learn_mix', type=int, default=0)
     parser.add_argument('--completion_gate_mix_max', type=float, default=1.0)
@@ -666,9 +649,32 @@ def _build_parser():
         '--fusion_mode',
         type=str,
         default='mean',
-        choices=['mean', 'rum', 'missing_weighted_mean', 'global_weighted_mean', 'reliability_weighted_mean'],
+        choices=['mean', 'rum', 'global_weighted_mean', 'posterior_reliability'],
+        help=(
+            'Item modality fusion. posterior_reliability uses the linear-Gaussian '
+            'completion posterior predictive variance in the components selected '
+            'by posterior_reliability_scope.'
+        ),
     )
-    parser.add_argument('--missing_fusion_imputed_weight', type=float, default=0.7)
+    parser.add_argument(
+        '--posterior_reliability_scope',
+        type=str,
+        default='both',
+        choices=['both', 'graph', 'fusion'],
+        help='Apply posterior reliability to semantic graph top-k, modality fusion, or both.',
+    )
+    parser.add_argument(
+        '--posterior_reliability_scale',
+        type=float,
+        default=1.0,
+        help='Lambda in c=exp(-lambda * mean posterior predictive variance).',
+    )
+    parser.add_argument(
+        '--posterior_reliability_floor',
+        type=float,
+        default=0.0,
+        help='Optional lower bound for missing-modality posterior reliability.',
+    )
     parser.add_argument('--rum_tau', type=float, default=1.0)
     parser.add_argument('--rum_reliability_coeff', type=float, default=1.0)
     parser.add_argument('--rum_match_coeff', type=float, default=1.0)
@@ -678,28 +684,28 @@ def _build_parser():
     parser.add_argument('--alpha_inter', type=float, default=1.0)
     parser.add_argument('--alpha_itm', type=float, default=1.0)
     parser.add_argument('--alpha_rec', type=float, default=0.1)
-    parser.add_argument('--alpha_decode', type=float, default=1.0)
-    parser.add_argument('--alpha_decode_kl', type=float, default=0.0)
-    parser.add_argument('--decode_kl_temp', type=float, default=0.2)
+    parser.add_argument('--alpha_decode', type=float, default=0.0)
     parser.add_argument(
-        '--decode_loss_grad_mode',
+        '--structure_loss_variant',
         type=str,
-        default='coupled',
-        choices=['coupled', 'detached'],
-        help='Whether decoder reconstruction loss updates completed/shared features.',
+        default='original',
+        choices=['original', 'shifted_lifted'],
+        help=(
+            'Structure loss used by Stage 1 contrastive training. shifted_lifted '
+            'uses a shifted-cosine modality relation matrix and compares squared '
+            'lifted semantic principal-direction similarities.'
+        ),
     )
     parser.add_argument(
-        '--decode_loss_target_mode',
+        '--generative_update_mode',
         type=str,
-        default='observed',
-        choices=['observed'],
-        help='Stage1 decoder reconstruction target. Only observed targets are supported.',
-    )
-    parser.add_argument(
-        '--decode_loss_pseudo_ratio',
-        type=float,
-        default=1.0,
-        help='Deprecated; stage1 pseudo-missing decoder targets have been removed.',
+        default='em',
+        choices=['em', 'fixed'],
+        help=(
+            'Whether Stage 1 applies queued closed-form EM updates to W/mu/log_sigma. '
+            'Stage 1.2 (imputer_backprop) is always forced to fixed; EM is only '
+            'available to stages that estimate generative parameters.'
+        ),
     )
     parser.add_argument('--modality_bpr_coeff', type=float, default=0.2)
     parser.add_argument('--beta_intra', type=float, default=0.05)
@@ -707,8 +713,63 @@ def _build_parser():
     parser.add_argument('--beta_itm', type=float, default=0.05)
     parser.add_argument('--beta_rec', type=float, default=0.01)
     parser.add_argument('--beta_decode', type=float, default=0.01)
-    parser.add_argument('--beta_decode_kl', type=float, default=0.0)
+    parser.add_argument(
+        '--joint_completion_batch_size',
+        type=int,
+        default=0,
+        help=(
+            'Joint stage only: use an independent uniformly shuffled item batch of this '
+            'size for completion losses. 0 preserves the legacy behavior that reuses '
+            'unique positive/negative items from the interaction batch.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_grad_audit',
+        type=int,
+        default=0,
+        help='Joint stage only: print and validate first-batch imputer/recommender gradient norms.',
+    )
+    parser.add_argument(
+        '--joint_item_graph_refresh_interval',
+        type=int,
+        default=0,
+        help=(
+            'Joint stage only: rebuild completed-feature item graphs every N epochs '
+            'from the current completion module. 0 keeps the initialization-time graph.'
+        ),
+    )
+    parser.add_argument(
+        '--joint_log_sigma_min',
+        type=float,
+        default=-100.0,
+        help='Joint stage only: lower bound applied to generative log_sigma after each update.',
+    )
     parser.add_argument('--gamma_align', type=float, default=0.0)
+    parser.add_argument(
+        '--adapter_align_pseudo_ratio',
+        type=float,
+        default=1.0,
+        help='Fraction of eligible observed modalities to pseudo-mask for decoupled adapter alignment.',
+    )
+    parser.add_argument(
+        '--completion_adapter_mode',
+        type=str,
+        default='linear_ln',
+        choices=['linear_ln', 'identity', 'residual_mlp'],
+        help='Adapter from completion latent space to recommendation space in decoupled_latent mode.',
+    )
+    parser.add_argument(
+        '--completion_adapter_hidden_dim',
+        type=int,
+        default=128,
+        help='Hidden dimension for residual_mlp completion adapter.',
+    )
+    parser.add_argument(
+        '--completion_adapter_dropout',
+        type=float,
+        default=0.0,
+        help='Dropout for residual_mlp completion adapter.',
+    )
     parser.add_argument('--gamma_distill', type=float, default=0.0)
     parser.add_argument('--joint_allow_modal_grad', type=int, default=0)
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
@@ -729,6 +790,76 @@ def _build_parser():
         type=int,
         default=256,
         help='Max number of in-batch items used for stage2 true-missing GCN InfoNCE.',
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_stage',
+        type=str,
+        default='gcn',
+        choices=['frontend', 'gcn', 'post_item_graph'],
+        help=(
+            'Representation stage used by true-missing CL. frontend applies CL before '
+            'user-item and item-item propagation; gcn applies it after user-item GCN but '
+            'before the II residual; post_item_graph matches final modality propagation.'
+        ),
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_anchor_weighting',
+        type=str,
+        default='uniform',
+        choices=['uniform', 'posterior_reliability'],
+        help='Optionally weight true-missing CL anchors by posterior completion reliability.',
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_false_negative_threshold',
+        type=float,
+        default=1.1,
+        help='Ignore negatives whose cosine similarity to the positive teacher is at least this value; >1 disables filtering.',
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_objective',
+        type=str,
+        default='infonce',
+        choices=['infonce', 'positive_cosine'],
+        help='Use standard in-batch InfoNCE or a positive-only cosine consistency objective.',
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_positive_source',
+        type=str,
+        default='cross_modal',
+        choices=['cross_modal', 'cf_neighbor'],
+        help=(
+            'Positive teacher for true-missing recommendation CL. cross_modal uses '
+            "the same item's observed modalities; cf_neighbor aggregates observed "
+            'same-modality representations from the training CF item graph.'
+        ),
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_negative_source',
+        type=str,
+        default='same_modal',
+        choices=['same_modal', 'cross_modal'],
+        help=(
+            'Key bank used by InfoNCE. same_modal preserves the original mixed-space '
+            'objective; cross_modal draws negatives from the same observed other-modal '
+            'space as the positive and therefore implements cross-modal retrieval CL.'
+        ),
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_similarity_space',
+        type=str,
+        default='embedding',
+        choices=['embedding', 'user_preference'],
+        help=(
+            'Similarity space for recommendation InfoNCE. user_preference compares '
+            'same-item modalities through detached user-score profiles and adds no '
+            'CL-specific trainable parameters.'
+        ),
+    )
+    parser.add_argument(
+        '--rec_neighbor_cl_user_bank_size',
+        type=int,
+        default=256,
+        help='Maximum number of detached batch-user embeddings in a CL preference profile.',
     )
     parser.add_argument(
         '--rec_neighbor_cl_start_epoch',
@@ -754,42 +885,12 @@ def _build_parser():
         default=-1.0,
         help='Final CL weight at rec_neighbor_cl_end_epoch. Negative keeps the base weight.',
     )
-    parser.add_argument('--stage1_profile', type=str, default='legacy', choices=['legacy', 'v2'])
-    parser.add_argument('--stage1_v2_loss_preset', type=str, default='legacy', choices=['legacy', 'balanced'])
-    parser.add_argument(
-        '--stage1_2_mode',
-        type=str,
-        default=None,
-        choices=['observed'],
-        help='Stage1.2 target mode. Only observed mode is supported.',
-    )
-    parser.add_argument('--generative_update_mode', type=str, default='em', choices=['em', 'fixed'])
-    parser.add_argument('--stage1_masking_policy', type=str, default='fixed', choices=['fixed', 'dynamic'])
-    parser.add_argument(
-        '--stage1_rec_loss_mode',
-        type=str,
-        default='observed',
-        choices=['observed'],
-        help='How stage1 rec/NLL loss is computed. Only observed reconstruction is supported.',
-    )
-    parser.add_argument(
-        '--stage1_rec_pseudo_ratio',
-        type=float,
-        default=1.0,
-        help='Deprecated; stage1 pseudo-missing rec loss has been removed.',
-    )
-    parser.add_argument(
-        '--alpha_stage1_rec_guidance',
-        type=float,
-        default=0.0,
-        help='Extra frozen-recommender BPR guidance used during imputer_backprop.',
-    )
     parser.add_argument('--imputation_val_rate', type=float, default=0.0)
     parser.add_argument(
         '--imputation_selection_policy',
         type=str,
         default='legacy',
-        choices=['legacy', 'stage1_default', 'promrl_shared', 'adapter_default', 'recommender_probe'],
+        choices=['legacy', 'stage1_default', 'decoder_default'],
     )
     parser.add_argument('--imputation_selection_split', type=str, default='train', choices=['train', 'val', 'test'])
     parser.add_argument('--imputation_selection_metric', type=str, default='mse', choices=['mse', 'cosine'])
@@ -801,39 +902,15 @@ def _build_parser():
     parser.add_argument('--hf_commit_every', type=int, default=5)
     parser.add_argument('--save', type=int, default=1)
     parser.add_argument('--save_all_epochs', type=int, default=0)
-    parser.add_argument(
-        '--alternating_stage12_stage2',
-        type=int,
-        default=0,
-        help='Test mode: alternate one epoch of stage1.2 imputer_backprop and one epoch of stage2 recommender.',
-    )
-    parser.add_argument(
-        '--alternating_cycles',
-        type=int,
-        default=-1,
-        help='Number of stage1.2/stage2 pairs. Negative uses epoch.',
-    )
-    parser.add_argument('--alternating_stage1_batch_size', type=int, default=256)
-    parser.add_argument('--alternating_stage2_batch_size', type=int, default=-1)
-    parser.add_argument('--alternating_stage1_lr_imp', type=float, default=0.0005)
-    parser.add_argument('--alternating_stage1_lr_decoder', type=float, default=0.0002)
-    parser.add_argument('--alternating_stage1_freeze_decoder', type=int, default=0)
-    parser.add_argument('--alternating_stage2_freeze_decoder', type=int, default=1)
-    parser.add_argument('--alternating_stage1_alpha_intra', type=float, default=1.0)
-    parser.add_argument('--alternating_stage1_alpha_inter', type=float, default=1.0)
-    parser.add_argument('--alternating_stage1_alpha_itm', type=float, default=1.0)
-    parser.add_argument('--alternating_stage1_alpha_rec', type=float, default=1.0)
-    parser.add_argument('--alternating_stage1_alpha_decode', type=float, default=1.0)
-
     return parser
 
 
 def _apply_stage1_defaults(args):
-    if getattr(args, 'stage1_2_mode', None) is not None:
-        if args.train_stage != 'imputer_backprop':
-            raise ValueError('--stage1_2_mode is only valid for train_stage=imputer_backprop')
-        args.stage1_rec_loss_mode = 'observed'
-        args.decode_loss_target_mode = 'observed'
+    # Stage 1.2 optimizes the completion projection against the generative
+    # model estimated in Stage 1.1. Keep that model fixed even if a stale
+    # launcher explicitly requests EM.
+    if args.train_stage == 'imputer_backprop':
+        args.generative_update_mode = 'fixed'
     return args
 
 
@@ -843,8 +920,26 @@ def _validate_protocol_args(args):
             raise ValueError('Strict evaluation cannot use selection_mode=test; use validation selection.')
         if args.imputation_selection_split == 'test':
             raise ValueError('Strict evaluation cannot use imputation_selection_split=test; use train or val.')
-        if getattr(args, 'item_graph_mask_scope', 'train') == 'all':
-            raise ValueError('Strict evaluation cannot use item_graph_mask_scope=all; use train or train_val.')
+    if args.cold_start_protocol == 'milk':
+        if args.exp_mode != 'mm':
+            raise ValueError('This MILK cold-start implementation is restricted to exp_mode=mm.')
+        if args.evaluation_protocol != 'strict':
+            raise ValueError('MILK cold-start requires evaluation_protocol=strict.')
+        if getattr(args, 'item_graph_kind', 'none') not in ('none', 'modality_completed_inductive'):
+            raise ValueError(
+                'MILK cold-start requires item_graph_kind=none or modality_completed_inductive; '
+                'the other semantic item graphs expose cold features during training.'
+            )
+        if getattr(args, 'item_graph_kind', 'none') == 'modality_completed_inductive':
+            if args.train_stage != 'recommender':
+                raise ValueError('modality_completed_inductive is only supported in cold-start Stage2 recommender training.')
+            if int(getattr(args, 'freeze_imputer', -1)) == 0:
+                raise ValueError('modality_completed_inductive requires a frozen Stage1 imputer.')
+        if getattr(args, 'missing_mask_protocol', 'i3') == 'unified_static':
+            raise ValueError(
+                'MILK cold-start does not support unified_static masks because the shared payload can '
+                'place cold items in the training missing-modality set.'
+            )
     return args
 
 
@@ -892,12 +987,16 @@ if args.imputer_ckpt is not None:
     matched_keys = my_model.load_imputer_checkpoint(args.imputer_ckpt)
     tool.cprint(f'Loaded imputer checkpoint from {args.imputer_ckpt} ({len(matched_keys)} tensors)')
 if getattr(args, 'item_graph_kind', None) in (
+    'modality_masked',
     'fused_completed',
     'modality_completed',
+    'modality_completed_inductive',
     'modality_completed_confidence',
     'modality_completed_dynamic_confidence',
     'fused_completed_confidence',
     'fused_completed_dynamic_confidence',
+    'fused_completed_reliability',
+    'fused_completed_reliability_topk',
 ):
     my_model.build_completed_item_graph()
 tool.cprint('Init Model')
@@ -907,13 +1006,29 @@ tool.cprint('Init Model')
 my_session = MILK_session(my_env, my_model, my_loader)
 tool.cprint('Init Session')
 
+if bool(args.eval_only):
+    t = time.time()
+    hr, recall, ndcg, test_time = my_session.test(
+        mode='test', top_list=eval(args.topk)
+    )
+    for top_k in eval(args.topk):
+        message = (
+            f'eval-only test hr@{top_k} = {hr[top_k]:.5f}, '
+            f'recall@{top_k} = {recall[top_k]:.5f}, '
+            f'ndcg@{top_k} = {ndcg[top_k]:.5f}, test_time = {test_time:.2f}'
+        )
+        tool.cprint(message)
+        if args.log:
+            my_env.test_logger.info(message)
+    my_session.log_test_modality_subsets(prefix='eval-only')
+    tool.cprint(f'eval-only stage cost time: {time.time() - t}')
+    my_env.close_env()
+    sys.exit(0)
+
 # ---------------------------------------- Main -----------------------------------------------------------
 
 t = time.time()
-if my_env.args.alternating_stage12_stage2:
-    my_session.train_alternating_stage12_stage2(my_env.args.alternating_cycles)
-else:
-    my_session.train(my_env.args.epoch)
+my_session.train(my_env.args.epoch)
 # my_session.save_memory()
 my_env.close_env()
 tool.cprint(f'training stage cost time: {time.time() - t}')
@@ -959,13 +1074,8 @@ if my_env.args.log:
 
 tool.cprint(f'--------- {my_env.args.suffix} best epoch {my_session.best_epoch}------------')
 if my_env.args.train_stage in (
-    'imputer',
     'imputer_param',
     'imputer_backprop',
-    'imputer_init',
-    'imputer_align',
-    'imputer_promrl_main',
-    'imputer_adapter',
 ):
     final_metrics = my_session.last_train_metrics
     if final_metrics:

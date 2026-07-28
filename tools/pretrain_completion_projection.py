@@ -27,32 +27,18 @@ class ProjectionCompletionPretrainer(nn.Module):
         pred_v_from_t = F.normalize(self.t_to_v(z_t_raw), dim=-1)
         return z_v, z_t, pred_t_from_v, pred_v_from_t
 
-    def projection_state_dict(self, key_style):
-        state = {}
-        if key_style in {"raw_decoder", "both"}:
-            state.update(
-                {
-                    "contra_head_v.linear.weight": self.v.weight.detach().cpu(),
-                    "contra_head_v.linear.bias": self.v.bias.detach().cpu(),
-                    "contra_head_t.linear.weight": self.t.weight.detach().cpu(),
-                    "contra_head_t.linear.bias": self.t.bias.detach().cpu(),
-                }
-            )
-        if key_style in {"decoupled_latent", "both"}:
-            state.update(
-                {
-                    "comp_proj_v.weight": self.v.weight.detach().cpu(),
-                    "comp_proj_v.bias": self.v.bias.detach().cpu(),
-                    "comp_proj_t.weight": self.t.weight.detach().cpu(),
-                    "comp_proj_t.bias": self.t.bias.detach().cpu(),
-                }
-            )
-        return state
+    def projection_state_dict(self):
+        return {
+            "comp_proj_v.weight": self.v.weight.detach().cpu(),
+            "comp_proj_v.bias": self.v.bias.detach().cpu(),
+            "comp_proj_t.weight": self.t.weight.detach().cpu(),
+            "comp_proj_t.bias": self.t.bias.detach().cpu(),
+        }
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Standalone completion-aware projection pretraining for MMRec Stage1."
+        description="Standalone Stage0 completion-aware projection pretraining."
     )
     parser.add_argument("--dataset", default="clothing")
     parser.add_argument("--data_root", default="Data")
@@ -75,12 +61,6 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=2023)
     parser.add_argument("--use_gpu", type=int, default=1)
     parser.add_argument("--device_id", type=int, default=0)
-    parser.add_argument(
-        "--checkpoint_key_style",
-        choices=["raw_decoder", "decoupled_latent", "both"],
-        default="raw_decoder",
-        help="raw_decoder writes contra_head_* keys that MMRec/raw_decoder Stage1 loads directly.",
-    )
     return parser.parse_args()
 
 
@@ -194,7 +174,7 @@ def evaluate(model, image_feat, text_feat, item_ids, batch_size, device, tempera
 
 def save_projection_checkpoint(path, model, args, metrics, epoch):
     payload = {
-        "model_state_dict": model.projection_state_dict(args.checkpoint_key_style),
+        "model_state_dict": model.projection_state_dict(),
         "epoch": epoch,
         "metrics": metrics,
         "meta": {
@@ -204,7 +184,6 @@ def save_projection_checkpoint(path, model, args, metrics, epoch):
             "image_file": args.image_file,
             "text_file": args.text_file,
             "train_file": args.train_file,
-            "checkpoint_key_style": args.checkpoint_key_style,
         },
     }
     torch.save(payload, path)
@@ -274,8 +253,7 @@ def main():
     print(
         f"[projection-pretrain] dataset={args.dataset} device={device} "
         f"items={len(train_items)} fit={len(fit_items)} val={len(val_items)} "
-        f"image_dim={image_feat.shape[1]} text_dim={text_feat.shape[1]} "
-        f"latent_dim={args.latent_dim} key_style={args.checkpoint_key_style}"
+        f"image_dim={image_feat.shape[1]} text_dim={text_feat.shape[1]} latent_dim={args.latent_dim}"
     )
 
     best_val = float("inf")

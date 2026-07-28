@@ -1,28 +1,12 @@
-# Clothing Configs
+# Clothing configurations
 
-Use `mainline_mr0p1.yaml` for the current verified Clothing 10% missing-rate
-mainline.
+`mainline_mr0p1.yaml` is the historical filename of the shared Stage 2
+configuration. The recorded paper result uses `unified_static`, train/eval
+missing rate `0.5`, payload seed `2023`, model seed `2023`, posterior
+reliability in fusion with scale `50`, and early stopping patience `50`.
 
-Current canonical setting:
+The recorded strict-test result is Recall@20 `0.08141` and NDCG@20 `0.03612`
+at best epoch `280`.
 
-```text
-stage1.2 style = best-style no-CL
-item_graph_topk = 10
-item_graph_cf_weight = 0.2
-item_graph_image_weight = 0.4
-item_graph_text_weight = 0.4
-item_graph_modal_alpha = 0.25
-rec_neighbor_cl_weight = 0.005
-```
-
-For Clothing Stage 1.2, `stage1_2_decoder_v2.yaml` is the default imputer
-config. It uses the best-style no-CL branch with `stage1_2_mode=observed`
-(observed recommendation guidance, observed decode target, detached decode loss,
-fixed generative update).
-Historical best-style Clothing checkpoints may log this branch as
-`calmrl_pseudo`; that name is historical. New runs should use
-`stage1_2_mode=observed`.
-
-The older `stage2_*` files are kept for historical runs, ablations, and
-reproduction of previous command paths. They should not be treated as the
-current Clothing mainline unless `docs/MAINLINE.md` explicitly says so.
+Use `reproduce_best/20260719/clothing.sh` from the repository root so all
+required runtime overrides are applied consistently.

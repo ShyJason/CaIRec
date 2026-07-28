@@ -6,6 +6,29 @@ import pdb
 import numba as nb
 from numba import prange
 
+
+def split_ratings_by_item_membership(ratings, selected_items):
+    """Split positive interactions without changing the ranking candidate set."""
+    selected_items = set(np.asarray(selected_items, dtype=np.int64).tolist())
+    selected = {}
+    complement = {}
+    for user, items in ratings.items():
+        selected_user_items = [item for item in items if item in selected_items]
+        complement_user_items = [item for item in items if item not in selected_items]
+        if selected_user_items:
+            selected[user] = selected_user_items
+        if complement_user_items:
+            complement[user] = complement_user_items
+    return selected, complement
+
+
+def rating_counts(ratings):
+    return {
+        'users': len(ratings),
+        'interactions': sum(len(items) for items in ratings.values()),
+    }
+
+
 #
 # nb.config.NUMBA_DEFAULT_NUM_THREADS = 4
 @nb.njit()
@@ -41,7 +64,16 @@ def compute_ranking_metrics(testusers, testdata, traindata, topk_list, user_rank
 
 
 
-def num_faiss_evaluate(_test_ratings, _test_user_list, _test_item_list, _train_ratings, _topk_list, _user_matrix, _item_matrix):
+def num_faiss_evaluate(
+    _test_ratings,
+    _test_user_list,
+    _test_item_list,
+    _train_ratings,
+    _topk_list,
+    _user_matrix,
+    _item_matrix,
+    candidate_only=False,
+):
     '''
     Evaluation for ranking results
     Topk-largest based on faiss search
@@ -52,19 +84,32 @@ def num_faiss_evaluate(_test_ratings, _test_user_list, _test_item_list, _train_r
     ndcg_topk_list = defaultdict(list)
     hr_out, recall_out, ndcg_out = {}, {}, {}
     ###  faiss search  ###
+    test_users = list(_test_user_list)
+    if not test_users:
+        raise ValueError('evaluation requires at least one user with a positive item')
     query_vectors = _user_matrix
-    test_users = _test_user_list
     dim = _user_matrix.shape[-1]
     index = faiss.IndexFlatIP(dim)
 
-    index.add(_item_matrix)
-    map_dic = dict(zip(list(range(len(_test_item_list))) , list(_test_item_list)))
-    max_mask_items_length = max(len(_train_ratings[user]) for user in _train_ratings.keys())
-    sim, _user_rank_pred_items = index.search(query_vectors, _topk_list[-1]+max_mask_items_length)
-
-    # _user_rank_pred_items = np.vectorize(map_dic.get)(_user_rank_pred_items)
-    testdata = [list(_test_ratings[user]) for user in _test_ratings.keys()]
-    traindata = [list(_train_ratings[user]) if (user in _train_ratings.keys()) and len(_train_ratings[user]) > 0 else [-1] for user in _test_ratings.keys()]
+    if candidate_only:
+        candidate_items = np.asarray(_test_item_list, dtype=np.int64)
+        if candidate_items.ndim != 1 or candidate_items.size == 0:
+            raise ValueError('candidate_only evaluation requires a non-empty 1-D item list')
+        if np.unique(candidate_items).size != candidate_items.size:
+            raise ValueError('candidate item list contains duplicates')
+        if candidate_items.min() < 0 or candidate_items.max() >= _item_matrix.shape[0]:
+            raise ValueError('candidate item id is outside the item embedding matrix')
+        if candidate_items.size < _topk_list[-1]:
+            raise ValueError('candidate item count must be at least max(topk)')
+        index.add(np.ascontiguousarray(_item_matrix[candidate_items]))
+        _, local_ranked_items = index.search(query_vectors, _topk_list[-1])
+        _user_rank_pred_items = candidate_items[local_ranked_items]
+    else:
+        index.add(_item_matrix)
+        max_mask_items_length = max(len(_train_ratings[user]) for user in _train_ratings.keys())
+        _, _user_rank_pred_items = index.search(query_vectors, _topk_list[-1]+max_mask_items_length)
+    testdata = [list(_test_ratings[user]) for user in test_users]
+    traindata = [list(_train_ratings[user]) if (user in _train_ratings.keys()) and len(_train_ratings[user]) > 0 else [-1] for user in test_users]
     all_metrics = compute_ranking_metrics(nb.typed.List(test_users), nb.typed.List(testdata),
                                           nb.typed.List(traindata), nb.typed.List(_topk_list), nb.typed.List(_user_rank_pred_items))
 

@@ -1,5 +1,4 @@
 import copy
-import os
 import numpy as np
 import scipy.sparse as sp
 import torch
@@ -7,8 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from promrl_core.general_module import Contra_head, Match_head
-from promrl_core.utils.impute import compute_nll_loss
-from promrl_core.utils.eigen import eigenvalue_computation_pmcl
+from promrl_core.utils.impute import update_posterior, compute_nll_loss
+from promrl_core.utils.eigen import (
+    eigenvalue_computation_pmcl,
+    shifted_relation_lifted_directions,
+)
 from promrl_core.promrl_variants import _build_mlp
 
 
@@ -63,6 +65,61 @@ class MGCN(torch.nn.Module):
         return users, items
 
 
+class ResidualCompletionAdapter(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, dropout=0.0):
+        super().__init__()
+        self.skip = nn.Identity() if input_dim == output_dim else nn.Linear(input_dim, output_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.norm = nn.LayerNorm(output_dim)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        return self.norm(self.skip(x) + self.mlp(x))
+
+
+class DirectionNormDecoder(nn.Module):
+    """Decode a completion latent into a native-scale raw feature.
+
+    Direction and magnitude are deliberately predicted by separate heads.  A
+    single normalized output cannot reproduce item-specific raw feature norms,
+    while an unconstrained raw regression head tends to spend most of its
+    capacity on the much larger visual-feature scale.
+    """
+
+    def __init__(self, input_dim, hidden_dim, output_dim, initial_log_norm):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.direction_head = nn.Linear(hidden_dim, output_dim)
+        self.log_norm_head = nn.Sequential(
+            nn.Linear(hidden_dim, max(32, hidden_dim // 4)),
+            nn.GELU(),
+            nn.Linear(max(32, hidden_dim // 4), 1),
+        )
+        nn.init.zeros_(self.log_norm_head[-1].weight)
+        nn.init.constant_(self.log_norm_head[-1].bias, float(initial_log_norm))
+
+    def forward(self, x):
+        hidden = self.trunk(x)
+        direction = F.normalize(self.direction_head(hidden), dim=-1)
+        # The clamp is only a numerical guard.  It spans norms from 6.7e-3 to
+        # 3.0e3, comfortably beyond all modalities used in this repository.
+        log_norm = self.log_norm_head(hidden).clamp(min=-5.0, max=8.0)
+        return direction * log_norm.exp()
+
+
 class MILK_model(torch.nn.Module):
     def __init__(self, env, dataset):
         super(MILK_model, self).__init__()
@@ -76,13 +133,18 @@ class MILK_model(torch.nn.Module):
         self.ItemItemGraph = None
         self.ItemItemGraphs = {}
         self.ItemItemGraphComponents = {}
+        self.InductiveItemItemGraphs = {}
+        self._inductive_item_graph_split = None
         self.item_graph_dynamic_norm_type = "rw"
         self.ItemItemRawGraph = None
         self.free_emb_dimension = self.env.args.free_emb_dimension
         self.has_audio_modality = dataset.audio_feat is not None
+        self.has_video_modality = getattr(dataset, "video_feat", None) is not None
         self.modalities = ["v", "t"]
         if self.has_audio_modality:
             self.modalities.append("a")
+        if self.has_video_modality:
+            self.modalities.append("d")
 
         self.train_missing_modality_items = dataset.train_missing_modality_items
         self.val_missing_modality_items = getattr(dataset, "val_missing_modality_items", {"items": [], "indicator": []})
@@ -92,15 +154,28 @@ class MILK_model(torch.nn.Module):
             {"items": [], "indicator": []},
         )
         self.test_missing_modality_items = dataset.test_missing_modality_items
+        self.modal_feature_mask_source = getattr(self.env.args, "modal_feature_mask_source", "nonzero")
+        self.modal_feature_override_is_completed = bool(
+            getattr(self.env.args, "modal_feature_override_is_completed", 0)
+        )
+        self.train_external_modal_observed_masks = self._tensorize_external_modal_masks(
+            getattr(dataset, "train_external_modal_observed_masks", None)
+        )
+        self.eval_external_modal_observed_masks = self._tensorize_external_modal_masks(
+            getattr(dataset, "eval_external_modal_observed_masks", None)
+        )
 
         self.audio_feat = None
         self.ori_audio_feat = None
+        self.video_feat = None
+        self.ori_video_feat = None
 
-        self.ori_image_feat = torch.tensor(dataset.image_feat, dtype=torch.float32).to(self.env.device)
-        self.ori_image_feat = F.normalize(self.ori_image_feat)
-
-        self.ori_text_feat = torch.tensor(dataset.text_feat, dtype=torch.float32).to(self.env.device)
-        self.ori_text_feat = F.normalize(self.ori_text_feat)
+        native_image_feat = torch.tensor(dataset.image_feat, dtype=torch.float32).to(self.env.device)
+        native_text_feat = torch.tensor(dataset.text_feat, dtype=torch.float32).to(self.env.device)
+        self._register_native_raw_statistics("v", native_image_feat, dataset)
+        self._register_native_raw_statistics("t", native_text_feat, dataset)
+        self.ori_image_feat = F.normalize(native_image_feat)
+        self.ori_text_feat = F.normalize(native_text_feat)
 
         self.eval_ori_image_feat = torch.tensor(
             getattr(dataset, "eval_image_feat", dataset.image_feat),
@@ -115,23 +190,26 @@ class MILK_model(torch.nn.Module):
         self.eval_ori_text_feat = F.normalize(self.eval_ori_text_feat)
 
         if self.has_audio_modality:
-            self.ori_audio_feat = torch.tensor(dataset.audio_feat, dtype=torch.float32).to(self.env.device)
-            self.ori_audio_feat = F.normalize(self.ori_audio_feat)
+            native_audio_feat = torch.tensor(dataset.audio_feat, dtype=torch.float32).to(self.env.device)
+            self._register_native_raw_statistics("a", native_audio_feat, dataset)
+            self.ori_audio_feat = F.normalize(native_audio_feat)
             self.eval_ori_audio_feat = torch.tensor(
                 getattr(dataset, "eval_audio_feat", dataset.audio_feat),
                 dtype=torch.float32,
             ).to(self.env.device)
             self.eval_ori_audio_feat = F.normalize(self.eval_ori_audio_feat)
+        if self.has_video_modality:
+            native_video_feat = torch.tensor(dataset.video_feat, dtype=torch.float32).to(self.env.device)
+            self._register_native_raw_statistics("d", native_video_feat, dataset)
+            self.ori_video_feat = F.normalize(native_video_feat)
+            self.eval_ori_video_feat = torch.tensor(
+                getattr(dataset, "eval_video_feat", dataset.video_feat),
+                dtype=torch.float32,
+            ).to(self.env.device)
+            self.eval_ori_video_feat = F.normalize(self.eval_ori_video_feat)
 
         self.uses_split_modal_feature_override = bool(
             getattr(dataset, "uses_split_modal_feature_override", False)
-        )
-        self.modal_feature_mask_source = getattr(self.env.args, "modal_feature_mask_source", "nonzero")
-        self.train_external_modal_observed_masks = self._tensorize_external_modal_masks(
-            getattr(dataset, "train_external_modal_observed_masks", None)
-        )
-        self.eval_external_modal_observed_masks = self._tensorize_external_modal_masks(
-            getattr(dataset, "eval_external_modal_observed_masks", None)
         )
 
         self.contra_dim = self.env.args.contra_dim
@@ -141,49 +219,21 @@ class MILK_model(torch.nn.Module):
         self.lambda_itm = self.env.args.lambda_itm
         self.disable_imputation = bool(self.env.args.disable_imputation)
         self.feature_bridge_mode = self.env.args.feature_bridge_mode
-        if self.feature_bridge_mode not in ("raw_decoder", "shared_identity"):
-            raise ValueError("feature_bridge_mode must be 'raw_decoder' or 'shared_identity'")
-        self.use_decode_head = True
+        if self.feature_bridge_mode not in ("raw_decoder", "latent_direct", "decoupled_latent"):
+            raise ValueError(f"Unsupported feature_bridge_mode: {self.feature_bridge_mode}")
+        self.use_latent_direct_bridge = self.feature_bridge_mode == "latent_direct"
+        self.use_decoupled_latent_bridge = self.feature_bridge_mode == "decoupled_latent"
+        self.use_latent_completion_bridge = self.use_latent_direct_bridge or self.use_decoupled_latent_bridge
+        self.use_decode_head = (
+            not self.use_latent_completion_bridge
+            or bool(getattr(self.env.args, "enable_raw_completion_decoder", 0))
+        )
+        self.decoder_output_mode = getattr(self.env.args, "decoder_output_mode", "normalized")
+        if self.decoder_output_mode not in ("normalized", "native_direction_norm"):
+            raise ValueError(f"Unsupported decoder_output_mode: {self.decoder_output_mode}")
         self.gcn_frontend_mode = self.env.args.gcn_frontend_mode
         self.promrl_projection_mode = getattr(self.env.args, "promrl_projection_mode", "learned")
-        self.promrl_dim = self.contra_dim
-        self.beta_completion_mode = getattr(self.env.args, "beta_completion_mode", "linear")
-        if self.beta_completion_mode not in ("linear", "decoder"):
-            raise ValueError(f"Unsupported beta_completion_mode: {self.beta_completion_mode}")
-        self.use_beta_completion_decoder = self.beta_completion_mode != "linear"
-        self.beta_completion_rec_weight = max(
-            float(getattr(self.env.args, "beta_completion_rec_weight", 1.0)),
-            0.0,
-        )
-        self.beta_completion_rec_loss = getattr(self.env.args, "beta_completion_rec_loss", "mse_cosine")
-        self.beta_completion_detach_beta = bool(getattr(self.env.args, "beta_completion_detach_beta", 1))
-        self.smore_beta_prior_lambda = max(float(getattr(self.env.args, "smore_beta_prior_lambda", 0.0)), 0.0)
-        self.smore_beta_prior_rho = max(float(getattr(self.env.args, "smore_beta_prior_rho", 1.0)), 0.0)
-        self.smore_beta_prior_var_min = max(float(getattr(self.env.args, "smore_beta_prior_var_min", 0.1)), 1e-8)
-        self.smore_beta_prior_var_max = max(
-            float(getattr(self.env.args, "smore_beta_prior_var_max", 2.0)),
-            self.smore_beta_prior_var_min + 1e-8,
-        )
-        self.uses_split_smore_beta_prior_features = False
-        self.smore_beta_prior_features = self._load_smore_beta_prior_features()
-        self.smore_beta_prior_generators = nn.ModuleDict()
-        if self.smore_beta_prior_lambda > 0.0:
-            if not self.smore_beta_prior_features:
-                raise ValueError(
-                    "smore_beta_prior_lambda > 0 requires --smore_beta_prior_dir "
-                    "or explicit SMORE prior train/eval directories"
-                )
-            hidden_dim = int(getattr(self.env.args, "smore_beta_prior_hidden_dim", 128))
-            dropout = float(getattr(self.env.args, "smore_beta_prior_dropout", 0.0))
-            train_features = self.smore_beta_prior_features["train"]
-            for modality in ("v", "t"):
-                if modality in self.modalities and modality in train_features:
-                    self.smore_beta_prior_generators[modality] = _build_mlp(
-                        train_features[modality].size(1),
-                        hidden_dim,
-                        self.d_beta * 2,
-                        dropout=dropout,
-                    )
+        self.promrl_dim = self.free_emb_dimension if self.use_latent_completion_bridge else self.contra_dim
         self.completion_gate_mode = self.env.args.completion_gate_mode
         self.use_completion_gate = self.completion_gate_mode != "off"
         self.use_rank_residual_completion_gate = self.completion_gate_mode in (
@@ -223,16 +273,12 @@ class MILK_model(torch.nn.Module):
         self.use_softmax_rank_residual_completion_gate = (
             self.completion_gate_mode == "rank_residual_softmax"
         )
-        self.use_missing_aware_reliability_gate = (
-            self.completion_gate_mode == "missing_reliability"
-        )
         self.use_learned_completion_gate_mix = (
             bool(getattr(self.env.args, "completion_gate_learn_mix", 0))
             and self.use_rank_residual_completion_gate
         )
         self.use_learned_completion_gate = self.completion_gate_mode in (
             "reliability",
-            "missing_reliability",
             "rank_residual",
             "rank_residual_norm",
             "rank_residual_allnorm",
@@ -244,10 +290,6 @@ class MILK_model(torch.nn.Module):
             "rank_residual_centered_allgate",
         )
         self.completion_gate_detach_inputs = bool(self.env.args.completion_gate_detach_inputs)
-        self.completion_gate_stats_norm = bool(getattr(self.env.args, "completion_gate_stats_norm", 1))
-        self.completion_gate_apply_observed = bool(
-            getattr(self.env.args, "completion_gate_apply_observed", 1)
-        )
         self.completion_gate_use_item_context = bool(self.env.args.completion_gate_use_item_context)
         self.completion_gate_item_context_source = self.env.args.completion_gate_item_context_source
         if not self.completion_gate_use_item_context:
@@ -259,13 +301,26 @@ class MILK_model(torch.nn.Module):
         self.item_graph_modal_layers = max(int(getattr(self.env.args, "item_graph_modal_layers", 1)), 0)
         self.item_graph_modal_target = getattr(self.env.args, "item_graph_modal_target", "all")
         self.item_graph_kind = getattr(self.env.args, "item_graph_kind", "none")
+        if self.item_graph_kind == "modality_masked":
+            if not self.disable_imputation:
+                raise ValueError("item_graph_kind=modality_masked requires disable_imputation=1")
+            if getattr(self.env.args, "imputer_ckpt", None):
+                raise ValueError("item_graph_kind=modality_masked forbids imputer_ckpt")
+            if getattr(self.env.args, "ckpt", None):
+                raise ValueError("item_graph_kind=modality_masked forbids pretrained ckpt")
+            if getattr(self.env.args, "train_stage", None) != "recommender":
+                raise ValueError("item_graph_kind=modality_masked is only valid for train_stage=recommender")
         self.use_completed_item_graph = self.item_graph_kind in (
+            "modality_masked",
             "fused_completed",
             "modality_completed",
+            "modality_completed_inductive",
             "modality_completed_confidence",
             "modality_completed_dynamic_confidence",
             "fused_completed_confidence",
             "fused_completed_dynamic_confidence",
+            "fused_completed_reliability",
+            "fused_completed_reliability_topk",
         )
         self.use_item_graph_edge_confidence = self.item_graph_kind in (
             "fused_completed_confidence",
@@ -318,37 +373,24 @@ class MILK_model(torch.nn.Module):
             float(getattr(self.env.args, "item_graph_confidence_max", 4.0)),
             self.item_graph_confidence_min,
         )
-        shared_edge_conf_init_values = [
-            max(float(getattr(self.env.args, "item_graph_rr_confidence_init", 1.0)), 1e-6),
-            max(float(getattr(self.env.args, "item_graph_ri_confidence_init", 1.0)), 1e-6),
-            max(float(getattr(self.env.args, "item_graph_ii_confidence_init", 1.0)), 1e-6),
-        ]
-
-        def build_edge_conf_init(modality=None):
-            values = list(shared_edge_conf_init_values)
-            if modality in ("t", "v", "a"):
-                prefix = {"t": "text", "v": "image", "a": "audio"}[modality]
-                for idx, edge_type in enumerate(("rr", "ri", "ii")):
-                    override = getattr(
-                        self.env.args,
-                        f"item_graph_{prefix}_{edge_type}_confidence_init",
-                        None,
-                    )
-                    if override is not None:
-                        values[idx] = max(float(override), 1e-6)
-            return torch.tensor(values, dtype=torch.float32).clamp(
-                min=self.item_graph_confidence_min,
-                max=self.item_graph_confidence_max,
-            )
-
-        def confidence_to_param(conf_init):
-            if self.item_graph_confidence_transform == "sigmoid":
-                span = max(self.item_graph_confidence_max - self.item_graph_confidence_min, 1e-6)
-                normalized_conf = ((conf_init - self.item_graph_confidence_min) / span).clamp(1e-4, 1.0 - 1e-4)
-                return torch.logit(normalized_conf)
-            return torch.log(conf_init)
-
-        edge_conf_param_init = confidence_to_param(build_edge_conf_init())
+        edge_conf_init = torch.tensor(
+            [
+                max(float(getattr(self.env.args, "item_graph_rr_confidence_init", 1.0)), 1e-6),
+                max(float(getattr(self.env.args, "item_graph_ri_confidence_init", 1.0)), 1e-6),
+                max(float(getattr(self.env.args, "item_graph_ii_confidence_init", 1.0)), 1e-6),
+            ],
+            dtype=torch.float32,
+        )
+        edge_conf_init = edge_conf_init.clamp(
+            min=self.item_graph_confidence_min,
+            max=self.item_graph_confidence_max,
+        )
+        if self.item_graph_confidence_transform == "sigmoid":
+            span = max(self.item_graph_confidence_max - self.item_graph_confidence_min, 1e-6)
+            normalized_conf = ((edge_conf_init - self.item_graph_confidence_min) / span).clamp(1e-4, 1.0 - 1e-4)
+            edge_conf_param_init = torch.logit(normalized_conf)
+        else:
+            edge_conf_param_init = torch.log(edge_conf_init)
         self.use_item_graph_modality_specific_confidence = (
             bool(int(getattr(self.env.args, "item_graph_modality_specific_confidence", 0)))
             and self.item_graph_kind in ("modality_completed_confidence", "modality_completed_dynamic_confidence")
@@ -356,9 +398,8 @@ class MILK_model(torch.nn.Module):
         if self.use_item_graph_modality_specific_confidence:
             self.item_graph_edge_confidence_params = nn.ParameterDict(
                 {
-                    "v": nn.Parameter(confidence_to_param(build_edge_conf_init("v"))),
-                    "t": nn.Parameter(confidence_to_param(build_edge_conf_init("t"))),
-                    "a": nn.Parameter(confidence_to_param(build_edge_conf_init("a"))),
+                    modality: nn.Parameter(edge_conf_param_init.clone())
+                    for modality in self.modalities
                 }
             )
         else:
@@ -373,10 +414,27 @@ class MILK_model(torch.nn.Module):
             1.0,
         )
         self.fusion_mode = getattr(self.env.args, "fusion_mode", "mean")
+        if self.fusion_mode not in {"mean", "rum", "global_weighted_mean", "posterior_reliability"}:
+            raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
         self.use_rum_fusion = self.fusion_mode == "rum"
-        self.use_missing_weighted_fusion = self.fusion_mode == "missing_weighted_mean"
         self.use_global_weighted_fusion = self.fusion_mode == "global_weighted_mean"
-        self.use_reliability_weighted_fusion = self.fusion_mode == "reliability_weighted_mean"
+        self.use_posterior_reliability = self.fusion_mode == "posterior_reliability"
+        self.posterior_reliability_scope = getattr(
+            self.env.args, "posterior_reliability_scope", "both"
+        )
+        if self.posterior_reliability_scope not in {"both", "graph", "fusion"}:
+            raise ValueError(
+                "Unsupported posterior reliability scope: "
+                f"{self.posterior_reliability_scope}"
+            )
+        self.posterior_reliability_scale = max(
+            float(getattr(self.env.args, "posterior_reliability_scale", 1.0)),
+            0.0,
+        )
+        self.posterior_reliability_floor = min(
+            max(float(getattr(self.env.args, "posterior_reliability_floor", 0.0)), 0.0),
+            1.0,
+        )
         self.completion_gate_score_residual_alpha = min(
             max(float(getattr(self.env.args, "completion_gate_score_residual_alpha", 0.0)), 0.0),
             1.0,
@@ -400,11 +458,13 @@ class MILK_model(torch.nn.Module):
         self.completion_gate_tail_degree_threshold = float(threshold.detach().cpu())
         self.register_buffer("completion_gate_tail_mask", tail_mask.unsqueeze(1).float())
 
-        projection_bias = bool(getattr(self.env.args, "promrl_projection_bias", 1))
-        self.contra_head_v = Contra_head(self.ori_image_feat.size(1), self.contra_dim, bias=projection_bias)
-        self.contra_head_t = Contra_head(self.ori_text_feat.size(1), self.contra_dim, bias=projection_bias)
-        if "a" in self.modalities:
-            self.contra_head_a = Contra_head(self.ori_audio_feat.size(1), self.contra_dim, bias=projection_bias)
+        if not self.use_latent_completion_bridge:
+            self.contra_head_v = Contra_head(self.ori_image_feat.size(1), self.contra_dim)
+            self.contra_head_t = Contra_head(self.ori_text_feat.size(1), self.contra_dim)
+            if "a" in self.modalities:
+                self.contra_head_a = Contra_head(self.ori_audio_feat.size(1), self.contra_dim)
+            if "d" in self.modalities:
+                self.contra_head_d = Contra_head(self.ori_video_feat.size(1), self.contra_dim)
         self.itm_cross_attn = nn.MultiheadAttention(
             self.promrl_dim,
             num_heads=self.env.args.itm_num_heads,
@@ -425,18 +485,18 @@ class MILK_model(torch.nn.Module):
             for modality in self.modalities
         })
 
-        self.decoder_v = self._build_modal_decoder(self.ori_image_feat.size(1))
-        self.decoder_t = self._build_modal_decoder(self.ori_text_feat.size(1))
-        if "a" in self.modalities:
-            self.decoder_a = self._build_modal_decoder(self.ori_audio_feat.size(1))
-        self.beta_completion_decoders = nn.ModuleDict()
-        if self.use_beta_completion_decoder:
-            for modality in self.modalities:
-                self.beta_completion_decoders[modality] = self._build_beta_completion_decoder()
+        if self.use_decode_head:
+            self.decoder_v = self._build_modal_decoder("v", self.ori_image_feat.size(1))
+            self.decoder_t = self._build_modal_decoder("t", self.ori_text_feat.size(1))
+            if "a" in self.modalities:
+                self.decoder_a = self._build_modal_decoder("a", self.ori_audio_feat.size(1))
+            if "d" in self.modalities:
+                self.decoder_d = self._build_modal_decoder("d", self.ori_video_feat.size(1))
 
         v_input_dim = self.ori_image_feat.size(1)
         t_input_dim = self.ori_text_feat.size(1)
         a_input_dim = self.ori_audio_feat.size(1) if "a" in self.modalities else None
+        d_input_dim = self.ori_video_feat.size(1) if "d" in self.modalities else None
 
         self.v_gcn = MGCN(
             self.Graph,
@@ -463,6 +523,27 @@ class MILK_model(torch.nn.Module):
                 self.free_emb_dimension,
                 frontend_mode=self.gcn_frontend_mode,
             )
+        if "d" in self.modalities:
+            self.d_gcn = MGCN(
+                self.Graph,
+                self.n_user,
+                self.m_item,
+                d_input_dim,
+                self.free_emb_dimension,
+                frontend_mode=self.gcn_frontend_mode,
+            )
+
+        if self.use_decoupled_latent_bridge:
+            self.comp_proj_v = self._build_latent_projection_head(v_input_dim)
+            self.comp_proj_t = self._build_latent_projection_head(t_input_dim)
+            self.comp_to_rec_v = self._build_completion_adapter()
+            self.comp_to_rec_t = self._build_completion_adapter()
+            if "a" in self.modalities:
+                self.comp_proj_a = self._build_latent_projection_head(a_input_dim)
+                self.comp_to_rec_a = self._build_completion_adapter()
+            if "d" in self.modalities:
+                self.comp_proj_d = self._build_latent_projection_head(d_input_dim)
+                self.comp_to_rec_d = self._build_completion_adapter()
 
         self.user_emb = torch.nn.Embedding(
             num_embeddings=self.n_user, embedding_dim=self.free_emb_dimension
@@ -499,8 +580,7 @@ class MILK_model(torch.nn.Module):
                 item_context_dim = self.promrl_dim
             else:
                 item_context_dim = 0
-            gate_extra_dim = 6 if self.use_missing_aware_reliability_gate else 0
-            gate_input_dim = self.promrl_dim + item_context_dim + len(self.modalities) + gate_extra_dim
+            gate_input_dim = self.promrl_dim + item_context_dim + len(self.modalities)
             self.completion_gates = nn.ModuleDict({
                 modality: self._build_completion_gate(gate_input_dim)
                 for modality in self.modalities
@@ -527,11 +607,6 @@ class MILK_model(torch.nn.Module):
         self.latest_completion_gate_metrics = {}
         self.latest_rum_fusion_metrics = {}
         self.latest_completion_gate_regularizer = torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_supervision_loss = torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_counterfactual_loss = torch.zeros((), device=self.env.device)
-        self.latest_reliability_gates = None
-        self.latest_completion_gate_masks = None
-        self.latest_completion_gate_stats = None
         self.latest_completion_gate_ungated_item_emb = None
         self.latest_completion_gate_gated_item_emb = None
         self._gcn_cache = None
@@ -556,10 +631,7 @@ class MILK_model(torch.nn.Module):
         )
 
     def _canonical_stage(self, train_stage=None):
-        canonical_stage = train_stage or self.env.args.train_stage
-        if canonical_stage == "imputer":
-            canonical_stage = "imputer_backprop"
-        return canonical_stage
+        return train_stage or self.env.args.train_stage
 
     def _build_co_interact_positive_items(self, dataset):
         positive_items = torch.arange(self.m_item, dtype=torch.long)
@@ -582,75 +654,67 @@ class MILK_model(torch.nn.Module):
                     item_user_sets[item].add(int(user))
         return item_user_sets
 
-    def _uses_dynamic_stage1_masking(self, train_stage=None):
-        canonical_stage = self._canonical_stage(train_stage)
-        return (
-            getattr(self.env.args, "stage1_masking_policy", "fixed") == "dynamic"
-            and canonical_stage in ("imputer_init", "imputer_align", "imputer_promrl_main")
-        )
-
     def _uses_stage1_holdout_metrics(self, train_stage=None):
         canonical_stage = self._canonical_stage(train_stage)
-        return canonical_stage in (
-            "imputer_backprop",
-            "imputer_init",
-            "imputer_align",
-            "imputer_promrl_main",
-            "imputer_adapter",
+        return canonical_stage in ("imputer_backprop", "projection_pretrain")
+
+    def _training_observed_mask(self, modality, dataset):
+        mask = torch.ones(self.m_item, dtype=torch.bool, device=self.env.device)
+        metadata = getattr(dataset, "train_missing_modality_items", None) or {}
+        items = np.asarray(metadata.get("items", []), dtype=np.int64)
+        indicators = np.asarray(metadata.get("indicator", []), dtype=np.int64)
+        modality_index = self.modalities.index(modality)
+        missing_items = items[indicators == modality_index]
+        if missing_items.size:
+            mask[torch.as_tensor(missing_items, device=self.env.device)] = False
+        return mask
+
+    def _register_native_raw_statistics(self, modality, native_feature, dataset):
+        observed = self._training_observed_mask(modality, dataset)
+        observed_feature = native_feature[observed]
+        observed_norm = observed_feature.norm(dim=-1).clamp_min(1e-8)
+        feature_std = observed_feature.std(dim=0, unbiased=False)
+        # Avoid exploding standardized errors on dimensions which are nearly
+        # constant.  The floor is derived only from train-observed features.
+        std_floor = feature_std.mean().clamp_min(1e-6) * 0.05
+        feature_std = feature_std.clamp_min(std_floor)
+        self.register_buffer(
+            f"native_raw_norm_{modality}",
+            native_feature.norm(dim=-1).clamp_min(1e-8),
+            persistent=False,
+        )
+        self.register_buffer(
+            f"native_raw_std_{modality}",
+            feature_std,
+            persistent=False,
+        )
+        self.register_buffer(
+            f"native_raw_initial_log_norm_{modality}",
+            observed_norm.log().mean(),
+            persistent=False,
         )
 
-    def _uses_smore_beta_prior_for_stage(self, train_stage=None):
-        generators = getattr(self, "smore_beta_prior_generators", None)
-        if (
-            self.smore_beta_prior_lambda <= 0.0
-            or generators is None
-            or len(generators) == 0
-        ):
-            return False
-        canonical_stage = self._canonical_stage(train_stage)
-        if canonical_stage == "imputer_param":
-            return False
-        scope = getattr(self.env.args, "smore_beta_prior_scope", "stage12_recommender")
-        if scope == "stage12":
-            return canonical_stage == "imputer_backprop"
-        if scope == "stage12_recommender":
-            return canonical_stage in ("imputer_backprop", "recommender")
-        if scope == "all_nonparam":
-            return canonical_stage in (
-                "imputer_backprop",
-                "imputer_init",
-                "imputer_align",
-                "imputer_promrl_main",
-                "imputer_adapter",
-                "recommender",
-                "joint",
-            )
-        return False
-
-    def _tensorize_external_modal_masks(self, masks):
-        if masks is None:
-            return None
-        tensor_masks = {}
-        for modality, mask in masks.items():
-            tensor_masks[modality] = torch.as_tensor(mask, dtype=torch.bool, device=self.env.device)
-        return tensor_masks
-
-    def _current_external_modal_observed_masks(self):
-        if self.modal_feature_mask_source != "external_observed":
-            return None
-        masks = self.train_external_modal_observed_masks if self.training else self.eval_external_modal_observed_masks
-        if masks is None:
-            raise ValueError(
-                "modal_feature_mask_source=external_observed requires observed mask files "
-                "in the external modal feature train/eval directories"
-            )
-        return masks
+    def _native_raw_target(self, modality, normalized_feature, item_ids=None):
+        norms = getattr(self, f"native_raw_norm_{modality}")
+        if item_ids is not None:
+            norms = norms[item_ids]
+        return normalized_feature * norms.unsqueeze(-1)
 
     def _decoder_hidden_dim(self, raw_dim):
         return min(1024, max(256, raw_dim // 2))
 
-    def _build_modal_decoder(self, raw_dim):
+    def _build_modal_decoder(self, modality, raw_dim):
         hidden_dim = self._decoder_hidden_dim(raw_dim)
+        if self.decoder_output_mode == "native_direction_norm":
+            initial_log_norm = getattr(
+                self, f"native_raw_initial_log_norm_{modality}"
+            ).item()
+            return DirectionNormDecoder(
+                self.promrl_dim,
+                hidden_dim,
+                raw_dim,
+                initial_log_norm,
+            )
         return nn.Sequential(
             nn.Linear(self.promrl_dim, hidden_dim),
             nn.GELU(),
@@ -658,27 +722,43 @@ class MILK_model(torch.nn.Module):
             nn.Linear(hidden_dim, raw_dim),
         )
 
-    def _build_beta_completion_decoder(self):
-        hidden_dim = int(getattr(self.env.args, "beta_completion_decoder_hidden_dim", 128))
-        dropout = float(getattr(self.env.args, "beta_completion_decoder_dropout", 0.0))
-        layers = [
-            nn.Linear(self.d_beta, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        ]
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
-        layers.extend([
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        ])
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
-        layers.extend([
-            nn.Linear(hidden_dim, self.promrl_dim),
-        ])
-        return nn.Sequential(*layers)
+    def _build_latent_projection_head(self, raw_dim):
+        if self.promrl_projection_mode == "identity":
+            if raw_dim != self.promrl_dim:
+                raise ValueError(
+                    "promrl_projection_mode='identity' requires modal feature dim "
+                    f"to equal promrl_dim ({self.promrl_dim}); got {raw_dim}"
+                )
+            return nn.Identity()
+        if self.gcn_frontend_mode == "original_linear":
+            return nn.Linear(raw_dim, self.free_emb_dimension)
+        return _build_mlp(raw_dim, self.free_emb_dimension * 2, self.free_emb_dimension, dropout=0.1)
+
+    def _build_completion_adapter(self):
+        mode = getattr(self.env.args, "completion_adapter_mode", "linear_ln")
+        if mode == "identity":
+            if self.promrl_dim != self.free_emb_dimension:
+                raise ValueError(
+                    "completion_adapter_mode=identity requires promrl_dim == free_emb_dimension"
+                )
+            return nn.Identity()
+        if mode == "linear_ln":
+            return nn.Sequential(
+                nn.Linear(self.promrl_dim, self.free_emb_dimension),
+                nn.LayerNorm(self.free_emb_dimension),
+            )
+        if mode == "residual_mlp":
+            hidden_dim = int(getattr(self.env.args, "completion_adapter_hidden_dim", 128))
+            if hidden_dim <= 0:
+                raise ValueError("completion_adapter_hidden_dim must be positive")
+            dropout = float(getattr(self.env.args, "completion_adapter_dropout", 0.0))
+            return ResidualCompletionAdapter(
+                self.promrl_dim,
+                self.free_emb_dimension,
+                hidden_dim=hidden_dim,
+                dropout=dropout,
+            )
+        raise ValueError(f"Unsupported completion_adapter_mode: {mode}")
 
     def _build_completion_gate(self, input_dim):
         hidden_dim = self.env.args.completion_gate_hidden_dim
@@ -698,104 +778,30 @@ class MILK_model(torch.nn.Module):
         nn.init.constant_(gate[-1].bias, init_logit)
         return gate
 
-    def _resolve_smore_beta_prior_dir(self, explicit_dir, base_dir, phase_name):
-        if explicit_dir:
-            return os.path.expanduser(explicit_dir)
-        phase_dir = os.path.join(base_dir, phase_name)
-        if os.path.isdir(phase_dir):
-            return phase_dir
-        return base_dir
-
-    def _load_smore_beta_prior_pair(self, feature_dir, label):
-        image_name = getattr(self.env.args, "smore_beta_prior_image_file", "image_item_embeds.npy")
-        text_name = getattr(self.env.args, "smore_beta_prior_text_file", "text_item_embeds.npy")
-        paths = {
-            "v": os.path.join(feature_dir, image_name),
-            "t": os.path.join(feature_dir, text_name),
-        }
-        features = {}
-        for modality, path in paths.items():
-            if modality not in self.modalities:
-                continue
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{label} SMORE beta prior feature not found: {path}")
-            array = np.load(path).astype(np.float32, copy=False)
-            if array.shape[0] != self.m_item:
-                raise ValueError(
-                    f"{label} SMORE beta prior feature item count mismatch: "
-                    f"feature has {array.shape[0]} rows, dataset has {self.m_item} items"
-                )
-            tensor = torch.tensor(array, dtype=torch.float32, device=self.env.device)
-            if bool(getattr(self.env.args, "smore_beta_prior_normalize", 0)):
-                tensor = F.normalize(tensor, dim=-1)
-            features[modality] = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
-        return features
-
-    def _load_smore_beta_prior_features(self):
-        base_dir = getattr(self.env.args, "smore_beta_prior_dir", "") or ""
-        train_dir = getattr(self.env.args, "smore_beta_prior_train_dir", "") or ""
-        eval_dir = getattr(self.env.args, "smore_beta_prior_eval_dir", "") or ""
-        if not base_dir and not train_dir and not eval_dir:
-            return {}
-
-        if base_dir:
-            base_dir = os.path.expanduser(base_dir)
-            if not os.path.isdir(base_dir):
-                raise FileNotFoundError(f"smore_beta_prior_dir not found: {base_dir}")
-        elif not (train_dir and eval_dir):
-            raise ValueError(
-                "Set --smore_beta_prior_dir or both --smore_beta_prior_train_dir "
-                "and --smore_beta_prior_eval_dir"
-            )
-
-        train_feature_dir = self._resolve_smore_beta_prior_dir(
-            train_dir,
-            base_dir,
-            "phase_train",
-        )
-        eval_feature_dir = self._resolve_smore_beta_prior_dir(
-            eval_dir,
-            base_dir,
-            "phase_eval",
-        )
-        train_features = self._load_smore_beta_prior_pair(train_feature_dir, "train")
-        eval_features = self._load_smore_beta_prior_pair(eval_feature_dir, "eval")
-        self.uses_split_smore_beta_prior_features = (
-            os.path.abspath(train_feature_dir) != os.path.abspath(eval_feature_dir)
-        )
-        print(
-            "loaded SMORE beta prior features: "
-            f"train_dir={train_feature_dir}, eval_dir={eval_feature_dir}, "
-            f"modalities={sorted(train_features.keys())}"
-        )
-        return {
-            "train": train_features,
-            "eval": eval_features,
-        }
-
     def _projection_modules(self):
-        modules = [
-            self.contra_head_v,
-            self.contra_head_t,
-        ]
-        if "a" in self.modalities:
-            modules.append(self.contra_head_a)
-        return modules
+        if self.use_decoupled_latent_bridge:
+            return [getattr(self, f"comp_proj_{modality}") for modality in self.modalities]
+
+        if self.use_latent_direct_bridge:
+            return [getattr(self, f"{modality}_gcn").MLP for modality in self.modalities]
+
+        return [getattr(self, f"contra_head_{modality}") for modality in self.modalities]
 
     def _imputer_modules(self):
         modules = self._projection_modules()
-        modules.extend([self.itm_cross_attn, self.itm_head])
-        if hasattr(self, "smore_beta_prior_generators") and len(self.smore_beta_prior_generators) > 0:
-            modules.append(self.smore_beta_prior_generators)
+        modules.extend([
+            self.W,
+            self.mu,
+            self.log_sigma,
+            self.itm_cross_attn,
+            self.itm_head,
+        ])
         return modules
 
     def _decoder_modules(self):
-        modules = [self.decoder_v, self.decoder_t]
-        if "a" in self.modalities:
-            modules.append(self.decoder_a)
-        if hasattr(self, "beta_completion_decoders") and len(self.beta_completion_decoders) > 0:
-            modules.append(self.beta_completion_decoders)
-        return modules
+        if not self.use_decode_head:
+            return []
+        return [getattr(self, f"decoder_{modality}") for modality in self.modalities]
 
     def _recommender_modules(self):
         modules = [self.user_emb, self.item_emb, self.fusion_linear]
@@ -803,9 +809,9 @@ class MILK_model(torch.nn.Module):
             modules.extend([self.user_modality_pref, self.rum_biases])
         if self.use_global_weighted_fusion:
             modules.append(self.global_fusion_params)
-        modules.extend([self.v_gcn, self.t_gcn])
-        if "a" in self.modalities:
-            modules.append(self.a_gcn)
+        modules.extend(getattr(self, f"{modality}_gcn") for modality in self.modalities)
+        if self.use_decoupled_latent_bridge:
+            modules.extend(getattr(self, f"comp_to_rec_{modality}") for modality in self.modalities)
         if self.use_learned_completion_gate:
             modules.append(self.completion_gates)
         if self.use_global_rank_residual_completion_gate:
@@ -824,35 +830,27 @@ class MILK_model(torch.nn.Module):
     def configure_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=0):
         canonical_stage = self._canonical_stage(train_stage)
 
-        auto_freeze_imputer = canonical_stage in ("recommender", "imputer_init", "imputer_adapter")
-        auto_freeze_recommender = canonical_stage in (
-            "imputer_param",
-            "imputer_backprop",
-            "imputer_init",
-            "imputer_align",
-            "imputer_promrl_main",
-            "imputer_adapter",
-        )
-        auto_freeze_decoder = canonical_stage in (
-            "imputer_param",
-            "imputer_init",
-            "imputer_align",
-            "imputer_promrl_main",
-        )
+        auto_freeze_imputer = canonical_stage in ("recommender", "projection_pretrain")
+        auto_freeze_recommender = canonical_stage in ("imputer_param", "imputer_backprop", "projection_pretrain")
+        auto_freeze_decoder = canonical_stage in ("imputer_param", "projection_pretrain")
 
         freeze_imputer = auto_freeze_imputer if freeze_imputer < 0 else bool(freeze_imputer)
         freeze_recommender = auto_freeze_recommender if freeze_recommender < 0 else bool(freeze_recommender)
         freeze_decoder = auto_freeze_decoder if freeze_decoder < 0 else bool(freeze_decoder)
 
         imputer_module_trainable = not freeze_imputer and canonical_stage != "imputer_param"
-        if canonical_stage in ("imputer_init", "imputer_adapter"):
+        if canonical_stage == "projection_pretrain":
             imputer_module_trainable = False
         self._set_modules_trainable(self._imputer_modules(), imputer_module_trainable)
+        if canonical_stage == "projection_pretrain":
+            self._set_modules_trainable(self._projection_modules(), True)
         self._set_modules_trainable(self._recommender_modules(), not freeze_recommender)
+        if self.use_latent_completion_bridge and imputer_module_trainable and freeze_recommender:
+            self._set_modules_trainable(self._projection_modules(), True)
         decoder_trainable = (
             self.use_decode_head
             and not bool(freeze_decoder)
-            and canonical_stage in ("imputer_backprop", "imputer_adapter", "recommender", "joint")
+            and canonical_stage in ("imputer_backprop", "recommender", "joint")
         )
         self._set_modules_trainable(self._decoder_modules(), decoder_trainable)
         if (
@@ -871,61 +869,42 @@ class MILK_model(torch.nn.Module):
             getattr(self.env.args, "generative_update_mode", "em") == "em"
             and canonical_stage in (
                 "imputer_param",
-                "imputer_backprop",
-                "imputer_init",
-                "imputer_align",
-                "imputer_promrl_main",
+                "projection_pretrain",
                 "joint",
             )
-            and not self._uses_smore_beta_prior_for_stage(canonical_stage)
         )
         self.clear_gcn_cache()
 
-    def get_imputer_parameters(self):
+    def _module_param_ids(self, modules):
+        return {id(param) for module in modules for param in module.parameters()}
+
+    def _trainable_parameters(self, modules, exclude_param_ids=None):
+        exclude_param_ids = exclude_param_ids or set()
         params = []
-        for module in self._imputer_modules():
-            params.extend([param for param in module.parameters() if param.requires_grad])
+        seen = set()
+        for module in modules:
+            for param in module.parameters():
+                param_id = id(param)
+                if param_id in exclude_param_ids or param_id in seen or not param.requires_grad:
+                    continue
+                params.append(param)
+                seen.add(param_id)
         return params
+
+    def get_imputer_parameters(self):
+        exclude = set()
+        if self.use_latent_direct_bridge and self._canonical_stage() in ("recommender", "joint"):
+            exclude = self._module_param_ids(self._projection_modules())
+        return self._trainable_parameters(self._imputer_modules(), exclude)
 
     def get_decoder_parameters(self):
-        params = []
-        for module in self._decoder_modules():
-            params.extend([param for param in module.parameters() if param.requires_grad])
-        return params
+        return self._trainable_parameters(self._decoder_modules())
 
     def get_recommender_parameters(self):
-        params = []
-        for module in self._recommender_modules():
-            params.extend([param for param in module.parameters() if param.requires_grad])
-        return params
-
-    def get_completion_gate_parameters(self):
-        params = []
-        if self.use_learned_completion_gate:
-            params.extend([
-                param for param in self.completion_gates.parameters()
-                if param.requires_grad
-            ])
-        if self.use_global_rank_residual_completion_gate:
-            params.extend([
-                param for param in self.completion_gate_global_logits.parameters()
-                if param.requires_grad
-            ])
-        if self.use_learned_completion_gate_mix:
-            params.extend([
-                param for param in self.completion_gate_mix_params.parameters()
-                if param.requires_grad
-            ])
-        return params
-
-    def get_item_graph_confidence_parameters(self):
-        if not self.use_item_graph_edge_confidence:
-            return []
-        return [
-            param
-            for param in self.item_graph_edge_confidence_params.parameters()
-            if param.requires_grad
-        ]
+        exclude = set()
+        if self.use_latent_direct_bridge and self._canonical_stage() not in ("recommender", "joint"):
+            exclude = self._module_param_ids(self._projection_modules())
+        return self._trainable_parameters(self._recommender_modules(), exclude)
 
     def load_full_checkpoint(self, ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location="cpu")
@@ -936,39 +915,25 @@ class MILK_model(torch.nn.Module):
     def load_imputer_checkpoint(self, ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         state_dict = checkpoint.get("model_state_dict", checkpoint)
-        aliased_state_dict = dict(state_dict)
-        for modality in self.modalities:
-            alias_pairs = (
-                (
-                    f"comp_proj_{modality}.weight",
-                    f"contra_head_{modality}.linear.weight",
-                ),
-                (
-                    f"comp_proj_{modality}.bias",
-                    f"contra_head_{modality}.linear.bias",
-                ),
-            )
-            for source_key, target_key in alias_pairs:
-                if source_key in state_dict and target_key not in aliased_state_dict:
-                    aliased_state_dict[target_key] = state_dict[source_key]
         prefixes = [
             "itm_cross_attn",
             "itm_head",
             "W",
             "mu",
             "log_sigma",
-            "smore_beta_prior_generators",
         ]
-        prefixes.extend(["contra_head_v", "contra_head_t", "decoder_v", "decoder_t"])
-        if "a" in self.modalities:
-            prefixes.extend(["contra_head_a", "decoder_a"])
-        if hasattr(self, "beta_completion_decoders") and len(self.beta_completion_decoders) > 0:
-            prefixes.append("beta_completion_decoders")
+        if self.use_decoupled_latent_bridge:
+            prefixes.extend(f"comp_proj_{modality}" for modality in self.modalities)
+        elif self.use_latent_direct_bridge:
+            prefixes.extend(f"{modality}_gcn.MLP" for modality in self.modalities)
+        else:
+            for modality in self.modalities:
+                prefixes.extend([f"contra_head_{modality}", f"decoder_{modality}"])
 
         current_state = self.state_dict()
         matched_state = {
             key: value
-            for key, value in aliased_state_dict.items()
+            for key, value in state_dict.items()
             if (
                 key in current_state
                 and value.shape == current_state[key].shape
@@ -996,31 +961,61 @@ class MILK_model(torch.nn.Module):
             self.miss_train_image_feature,
             self.miss_train_text_feature,
             self.miss_train_audio_feature,
+            self.miss_train_video_feature,
         ) = self._build_missing_feature_view(self.train_missing_modality_items)
         (
             self.miss_val_image_feature,
             self.miss_val_text_feature,
             self.miss_val_audio_feature,
+            self.miss_val_video_feature,
         ) = self._build_missing_feature_view(self.val_missing_modality_items)
         (
             self.miss_eval_val_image_feature,
             self.miss_eval_val_text_feature,
             self.miss_eval_val_audio_feature,
+            self.miss_eval_val_video_feature,
         ) = self._build_missing_feature_view(
             self.eval_val_missing_modality_items,
             image_base=self.eval_ori_image_feat,
             text_base=self.eval_ori_text_feat,
             audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
+            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
         (
             self.miss_test_image_feature,
             self.miss_test_text_feature,
             self.miss_test_audio_feature,
+            self.miss_test_video_feature,
         ) = self._build_missing_feature_view(
             self.test_missing_modality_items,
             image_base=self.eval_ori_image_feat,
             text_base=self.eval_ori_text_feat,
             audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
+            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
+        )
+        missing_all_metadata = {
+            "items": np.concatenate([
+                np.asarray(self.train_missing_modality_items.get("items", []), dtype=np.int64),
+                np.asarray(self.eval_val_missing_modality_items.get("items", []), dtype=np.int64),
+                np.asarray(self.test_missing_modality_items.get("items", []), dtype=np.int64),
+            ]),
+            "indicator": np.concatenate([
+                np.asarray(self.train_missing_modality_items.get("indicator", []), dtype=np.int64),
+                np.asarray(self.eval_val_missing_modality_items.get("indicator", []), dtype=np.int64),
+                np.asarray(self.test_missing_modality_items.get("indicator", []), dtype=np.int64),
+            ]),
+        }
+        (
+            self.miss_cold_union_image_feature,
+            self.miss_cold_union_text_feature,
+            self.miss_cold_union_audio_feature,
+            self.miss_cold_union_video_feature,
+        ) = self._build_missing_feature_view(
+            missing_all_metadata,
+            image_base=self.eval_ori_image_feat,
+            text_base=self.eval_ori_text_feat,
+            audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
+            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
 
     def refresh_dynamic_stage1_missing_views(self):
@@ -1030,18 +1025,30 @@ class MILK_model(torch.nn.Module):
         self.dataset.refresh_stage1_dynamic_train_missing_metadata(seed=dynamic_seed)
         self.init_missing_modality_set()
 
-    def _build_missing_feature_view(self, missing_metadata, image_base=None, text_base=None, audio_base=None):
+    def _build_missing_feature_view(
+        self,
+        missing_metadata,
+        image_base=None,
+        text_base=None,
+        audio_base=None,
+        video_base=None,
+    ):
         image_base = self.ori_image_feat if image_base is None else image_base
         text_base = self.ori_text_feat if text_base is None else text_base
         audio_base = self.ori_audio_feat if audio_base is None and "a" in self.modalities else audio_base
+        video_base = self.ori_video_feat if video_base is None and "d" in self.modalities else video_base
         miss_image_feature = copy.deepcopy(image_base)
         miss_text_feature = copy.deepcopy(text_base)
         miss_audio_feature = copy.deepcopy(audio_base) if "a" in self.modalities else None
+        miss_video_feature = copy.deepcopy(video_base) if "d" in self.modalities else None
+
+        if self.modal_feature_override_is_completed and self.modal_feature_mask_source == "external_observed":
+            return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
 
         selected_missing_items = np.array(missing_metadata["items"], dtype=np.int64)
         selected_missing_modality_indicator = np.array(missing_metadata["indicator"], dtype=np.int64)
         if selected_missing_items.size == 0:
-            return miss_image_feature, miss_text_feature, miss_audio_feature
+            return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
 
         image_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 0]
         if image_missing_indicator.size > 0:
@@ -1055,8 +1062,12 @@ class MILK_model(torch.nn.Module):
             audio_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 2]
             if audio_missing_indicator.size > 0:
                 miss_audio_feature[audio_missing_indicator] = 0
+        if "d" in self.modalities:
+            video_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 3]
+            if video_missing_indicator.size > 0:
+                miss_video_feature[video_missing_indicator] = 0
 
-        return miss_image_feature, miss_text_feature, miss_audio_feature
+        return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
 
     def set_missing_modality_via_env(self, eval_split=None):
         mode = self.env.args.exp_mode
@@ -1066,33 +1077,43 @@ class MILK_model(torch.nn.Module):
         use_missing_test = mode in {"mm", "fm"}
 
         if self.training:
-            if self._uses_dynamic_stage1_masking(canonical_stage):
-                self.refresh_dynamic_stage1_missing_views()
-                self.image_feat = self.miss_train_image_feature
-                self.text_feat = self.miss_train_text_feature
-                if "a" in self.modalities:
-                    self.audio_feat = self.miss_train_audio_feature
-                print("set dynamic missing modality successfully for train step")
-                return
             if use_missing_train:
                 self.image_feat = self.miss_train_image_feature
                 self.text_feat = self.miss_train_text_feature
                 if "a" in self.modalities:
                     self.audio_feat = self.miss_train_audio_feature
+                if "d" in self.modalities:
+                    self.video_feat = self.miss_train_video_feature
                 print("set missing modality successfully for train setp")
             else:
                 self.image_feat = self.ori_image_feat
                 self.text_feat = self.ori_text_feat
                 if "a" in self.modalities:
                     self.audio_feat = self.ori_audio_feat
+                if "d" in self.modalities:
+                    self.video_feat = self.ori_video_feat
                 print("set complete modality successfully for train step")
         else:
             if use_missing_test:
+                if (
+                    getattr(self.dataset, "cold_start_protocol", "none") == "milk"
+                    and getattr(self.env.args, "cold_start_eval_candidates", "milk_union") == "milk_union"
+                ):
+                    self.image_feat = self.miss_cold_union_image_feature
+                    self.text_feat = self.miss_cold_union_text_feature
+                    if "a" in self.modalities:
+                        self.audio_feat = self.miss_cold_union_audio_feature
+                    if "d" in self.modalities:
+                        self.video_feat = self.miss_cold_union_video_feature
+                    print("set MILK missing-all modality view for evaluation")
+                    return
                 if eval_split == "val":
                     self.image_feat = self.miss_eval_val_image_feature
                     self.text_feat = self.miss_eval_val_text_feature
                     if "a" in self.modalities:
                         self.audio_feat = self.miss_eval_val_audio_feature
+                    if "d" in self.modalities:
+                        self.video_feat = self.miss_eval_val_video_feature
                     print("set missing modality successfully for val setp")
                     return
 
@@ -1100,12 +1121,16 @@ class MILK_model(torch.nn.Module):
                 self.text_feat = self.miss_test_text_feature
                 if "a" in self.modalities:
                     self.audio_feat = self.miss_test_audio_feature
+                if "d" in self.modalities:
+                    self.video_feat = self.miss_test_video_feature
                 print("set missing modality successfully for test setp")
             else:
                 self.image_feat = self.eval_ori_image_feat
                 self.text_feat = self.eval_ori_text_feat
                 if "a" in self.modalities:
                     self.audio_feat = self.eval_ori_audio_feat
+                if "d" in self.modalities:
+                    self.video_feat = self.eval_ori_video_feat
                 print("set complete modality successfully for test step")
 
     def _current_raw_modal_features(self, full=False):
@@ -1124,6 +1149,14 @@ class MILK_model(torch.nn.Module):
                     features["a"] = self.ori_audio_feat
             else:
                 features["a"] = self.audio_feat
+        if "d" in self.modalities:
+            if full:
+                if not self.training and self.uses_split_modal_feature_override:
+                    features["d"] = self.eval_ori_video_feat
+                else:
+                    features["d"] = self.ori_video_feat
+            else:
+                features["d"] = self.video_feat
         return features
 
     def get_split_raw_modal_features(self, split="test", full=False):
@@ -1135,22 +1168,37 @@ class MILK_model(torch.nn.Module):
             }
             if "a" in self.modalities:
                 features["a"] = self.eval_ori_audio_feat if use_eval_features else self.ori_audio_feat
+            if "d" in self.modalities:
+                features["d"] = self.eval_ori_video_feat if use_eval_features else self.ori_video_feat
             return features
 
         if split == "train":
             features = {"v": self.miss_train_image_feature, "t": self.miss_train_text_feature}
             if "a" in self.modalities:
                 features["a"] = self.miss_train_audio_feature
+            if "d" in self.modalities:
+                features["d"] = self.miss_train_video_feature
             return features
         if split == "val":
+            features = {"v": self.miss_eval_val_image_feature, "t": self.miss_eval_val_text_feature}
+            if "a" in self.modalities:
+                features["a"] = self.miss_eval_val_audio_feature
+            if "d" in self.modalities:
+                features["d"] = self.miss_eval_val_video_feature
+            return features
+        if split == "imputation_val":
             features = {"v": self.miss_val_image_feature, "t": self.miss_val_text_feature}
             if "a" in self.modalities:
                 features["a"] = self.miss_val_audio_feature
+            if "d" in self.modalities:
+                features["d"] = self.miss_val_video_feature
             return features
         if split == "test":
             features = {"v": self.miss_test_image_feature, "t": self.miss_test_text_feature}
             if "a" in self.modalities:
                 features["a"] = self.miss_test_audio_feature
+            if "d" in self.modalities:
+                features["d"] = self.miss_test_video_feature
             return features
         raise ValueError(f"Unsupported split: {split}")
 
@@ -1158,6 +1206,8 @@ class MILK_model(torch.nn.Module):
         if split == "train":
             metadata = self.train_missing_modality_items
         elif split == "val":
+            metadata = self.eval_val_missing_modality_items
+        elif split == "imputation_val":
             metadata = self.val_missing_modality_items
         elif split == "test":
             metadata = self.test_missing_modality_items
@@ -1168,30 +1218,33 @@ class MILK_model(torch.nn.Module):
         indicators = torch.as_tensor(metadata["indicator"], dtype=torch.long, device=self.env.device)
         return items, indicators
 
-    def _item_graph_mask_scope(self):
-        scope = getattr(self.env.args, "item_graph_mask_scope", "train")
-        if scope not in {"train", "train_val", "all"}:
-            raise ValueError(f"Unsupported item_graph_mask_scope: {scope}")
-        return scope
+    def _completed_item_graph_missing_metadata(self):
+        scope = getattr(self.env.args, "item_graph_missing_scope", "train")
+        if scope == "all":
+            return [
+                self.train_missing_modality_items,
+                self.val_missing_modality_items,
+                self.eval_val_missing_modality_items,
+                self.test_missing_modality_items,
+            ]
+        if scope == "train":
+            return [
+                self.train_missing_modality_items,
+                self.val_missing_modality_items,
+            ]
+        raise ValueError(f"Unsupported item_graph_missing_scope: {scope}")
 
-    def _combined_missing_raw_modal_features(self, scope=None):
-        scope = self._item_graph_mask_scope() if scope is None else scope
+    def _combined_missing_raw_modal_features(self):
         features = {
             "v": self.ori_image_feat.clone(),
             "t": self.ori_text_feat.clone(),
         }
         if "a" in self.modalities:
             features["a"] = self.ori_audio_feat.clone()
+        if "d" in self.modalities:
+            features["d"] = self.ori_video_feat.clone()
 
-        metadata_list = [self.train_missing_modality_items]
-        if scope in {"train_val", "all"}:
-            metadata_list.append(self.val_missing_modality_items)
-        if scope == "all":
-            metadata_list.extend([
-                self.eval_val_missing_modality_items,
-                self.test_missing_modality_items,
-            ])
-        for metadata in metadata_list:
+        for metadata in self._completed_item_graph_missing_metadata():
             if metadata is None:
                 continue
             items = np.asarray(metadata.get("items", []), dtype=np.int64)
@@ -1205,167 +1258,63 @@ class MILK_model(torch.nn.Module):
                     features[modality][selected_tensor] = 0.0
         return features
 
-    def _resolve_external_item_graph_feature_dir(self):
-        explicit_dir = getattr(self.env.args, "item_graph_feature_dir", "") or ""
-        if explicit_dir:
-            return os.path.expanduser(explicit_dir)
-
-        override_dir = getattr(self.env.args, "modal_feature_override_dir", "") or ""
-        if not override_dir:
-            raise ValueError(
-                "item_graph_feature_source=external_completed requires --item_graph_feature_dir "
-                "or --modal_feature_override_dir"
-            )
-
-        base_dir = os.path.expanduser(override_dir)
-        scope = self._item_graph_mask_scope()
-        phase_train_dir = os.path.join(base_dir, "phase_train")
-        phase_graph_dir = os.path.join(base_dir, "phase_graph")
-        explicit_train_dir = getattr(self.env.args, "modal_feature_train_dir", "") or ""
-        if explicit_train_dir:
-            return os.path.expanduser(explicit_train_dir)
-
-        if scope == "all" and os.path.isdir(phase_graph_dir):
-            return phase_graph_dir
-        if os.path.isdir(phase_train_dir):
-            return phase_train_dir
-        if scope != "all" and os.path.isdir(phase_graph_dir):
-            raise ValueError(
-                "Refusing to auto-use phase_graph for strict item-graph construction because it may include "
-                "validation/test missing masks. Provide --item_graph_feature_dir with a train-scope feature "
-                "directory, or set --item_graph_mask_scope all to reproduce the legacy behavior."
-            )
-
-        return base_dir
-
-    def _load_external_item_graph_features(self):
-        feature_dir = self._resolve_external_item_graph_feature_dir()
-        if not os.path.isdir(feature_dir):
-            raise FileNotFoundError(f"external item graph feature dir not found: {feature_dir}")
-
-        image_name = (
-            getattr(self.env.args, "item_graph_feature_image_file", "")
-            or getattr(self.env.args, "modal_feature_image_file", "agg_image_items.npy")
-        )
-        text_name = (
-            getattr(self.env.args, "item_graph_feature_text_file", "")
-            or getattr(self.env.args, "modal_feature_text_file", "agg_text_items.npy")
-        )
-        specs = {
-            "v": (
-                os.path.join(feature_dir, image_name),
-                getattr(self.env.args, "item_graph_feature_image_mask_file", "image_observed_mask.npy"),
-            ),
-            "t": (
-                os.path.join(feature_dir, text_name),
-                getattr(self.env.args, "item_graph_feature_text_mask_file", "text_observed_mask.npy"),
-            ),
-        }
-        raw_features = {}
-        masks = {}
-        for modality, (feature_path, mask_name) in specs.items():
-            if not os.path.exists(feature_path):
-                raise FileNotFoundError(f"external item graph feature file not found: {feature_path}")
-            feature = np.load(feature_path).astype(np.float32, copy=False)
-            if feature.shape[0] != self.m_item:
-                raise ValueError(
-                    f"external item graph feature item count mismatch for {modality}: "
-                    f"feature has {feature.shape[0]} rows, model has {self.m_item} items"
-                )
-            feature_tensor = torch.as_tensor(feature, dtype=torch.float32, device=self.env.device)
-            raw_features[modality] = torch.nan_to_num(
-                F.normalize(feature_tensor, dim=-1),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-
-            mask_path = os.path.join(feature_dir, mask_name)
-            if os.path.exists(mask_path):
-                mask = np.load(mask_path).astype(bool)
-                if mask.shape[0] != self.m_item:
-                    raise ValueError(
-                        f"external item graph mask item count mismatch for {modality}: "
-                        f"mask has {mask.shape[0]} rows, model has {self.m_item} items"
-                    )
-                masks[modality] = torch.as_tensor(mask, dtype=torch.bool, device=self.env.device)
-            else:
-                masks[modality] = raw_features[modality].abs().sum(dim=1) > 0
-
-        if "a" in self.modalities:
-            raise ValueError("external_completed item graph feature source currently supports image/text datasets only")
-
-        print(
-            "loaded external completed item graph features: "
-            f"dir={feature_dir}, image={image_name}, text={text_name}, "
-            f"v_observed={int(masks['v'].sum().item())}, t_observed={int(masks['t'].sum().item())}"
-        )
-        return raw_features, masks, feature_dir
-
-    def _build_item_graph_feature_inputs(self):
-        source = getattr(self.env.args, "item_graph_feature_source", "internal_completion")
-        graph_feature_space = getattr(self.env.args, "item_graph_feature_space", "shared")
-
-        if source == "external_completed":
-            raw_features, masks, feature_dir = self._load_external_item_graph_features()
-            if graph_feature_space == "raw_decoder":
-                graph_features = raw_features
-            elif graph_feature_space == "shared":
-                graph_features = self.project_features(raw_features=raw_features)
-            else:
-                raise ValueError(f"Unsupported item graph feature space: {graph_feature_space}")
-            return graph_features, masks, source, feature_dir
-
-        if source != "internal_completion":
-            raise ValueError(f"Unsupported item graph feature source: {source}")
-
-        mask_scope = self._item_graph_mask_scope()
-        raw_features = self._combined_missing_raw_modal_features(scope=mask_scope)
-        projected = self.project_features(raw_features=raw_features)
-        masks = self._missing_masks(raw_features=raw_features)
-        graph_features = self._build_completed_features(
-            projected,
-            masks,
-            detach_imputed=True,
-            stage=self.env.args.train_stage,
-        )
-        if graph_feature_space == "raw_decoder":
-            decoded_raw = self.bridge_completed_to_recommendation_raw(graph_features)
-            graph_features = {
-                modality: torch.where(
-                    masks[modality].unsqueeze(1),
-                    raw_features[modality],
-                    decoded_raw[modality],
-                )
-                for modality in self.modalities
-            }
-        elif graph_feature_space != "shared":
-            raise ValueError(f"Unsupported item graph feature space: {graph_feature_space}")
-        return graph_features, masks, source, f"internal:{mask_scope}"
-
     def build_completed_item_graph(self):
         if not self.use_completed_item_graph:
             return
 
         kind = getattr(self.env.args, "item_graph_kind", "cf")
         if kind not in (
+            "modality_masked",
             "fused_completed",
             "modality_completed",
+            "modality_completed_inductive",
             "modality_completed_confidence",
             "modality_completed_dynamic_confidence",
             "fused_completed_confidence",
             "fused_completed_dynamic_confidence",
+            "fused_completed_reliability",
+            "fused_completed_reliability_topk",
         ):
             raise ValueError(f"Unsupported completed item graph kind: {kind}")
 
         topk = int(getattr(self.env.args, "item_graph_topk", 20))
         norm_type = getattr(self.env.args, "item_graph_norm", "rw")
         chunk_size = int(getattr(self.env.args, "item_graph_feature_chunk_size", 1024))
+        missing_scope = getattr(self.env.args, "item_graph_missing_scope", "train")
+        graph_label = "masked" if kind == "modality_masked" else "completed"
+        print(f"building {graph_label} item graph with missing_scope={missing_scope}")
 
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            graph_features, masks, graph_feature_source, graph_feature_dir = self._build_item_graph_feature_inputs()
+            raw_features = self._combined_missing_raw_modal_features()
+            masks = self._missing_masks(raw_features=raw_features)
+            graph_feature_space = getattr(self.env.args, "item_graph_feature_space", "shared")
+            if kind == "modality_masked":
+                graph_feature_space = "raw_masked"
+                graph_features = raw_features
+            elif graph_feature_space in ("shared", "raw_decoder"):
+                projected = self.project_features(raw_features=raw_features)
+                graph_features = self._build_completed_features(
+                    projected,
+                    masks,
+                    detach_imputed=True,
+                )
+                if graph_feature_space == "raw_decoder":
+                    if self.use_latent_completion_bridge:
+                        graph_feature_space = "shared"
+                    else:
+                        decoded_raw = self.bridge_completed_to_recommendation_raw(graph_features)
+                        graph_features = {
+                            modality: torch.where(
+                                masks[modality].unsqueeze(1),
+                                raw_features[modality],
+                                decoded_raw[modality],
+                            )
+                            for modality in self.modalities
+                        }
+            else:
+                raise ValueError(f"Unsupported item graph feature space: {graph_feature_space}")
             graph_feature_np = {
                 modality: graph_features[modality].detach().cpu().numpy().astype(np.float32)
                 for modality in self.modalities
@@ -1378,25 +1327,144 @@ class MILK_model(torch.nn.Module):
             "image": float(getattr(self.env.args, "item_graph_image_weight", 0.25)),
             "text": float(getattr(self.env.args, "item_graph_text_weight", 0.25)),
             "audio": float(getattr(self.env.args, "item_graph_audio_weight", 0.0)),
+            "video": float(getattr(self.env.args, "item_graph_video_weight", 0.0)),
         }
-        modality_weights = self._item_graph_modality_weights(weights)
         cf_scale = getattr(self.env.args, "item_graph_cf_scale", "raw")
         cf_power = float(getattr(self.env.args, "item_graph_cf_power", 0.5))
         cf_clip = float(getattr(self.env.args, "item_graph_cf_clip", 3.0))
-        graphs = {
-            "cf": self.dataset._build_cf_item_graph(
+        uses_reliability = kind in ("fused_completed_reliability", "fused_completed_reliability_topk")
+        if uses_reliability:
+            reliabilities = self._compute_item_graph_reliability_scores(graph_features, masks)
+        elif self._uses_posterior_reliability_for("graph"):
+            reliabilities = {
+                modality: scores.detach().cpu().numpy().astype(np.float32)
+                for modality, scores in self._posterior_completion_reliabilities(masks).items()
+            }
+        else:
+            reliabilities = None
+        reliability_blend = min(max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0), 1.0)
+        reliability_topk = (
+            kind == "fused_completed_reliability_topk"
+            or self._uses_posterior_reliability_for("graph")
+        )
+        fuse_before_topk = bool(int(getattr(self.env.args, "item_graph_fuse_before_topk", 0)))
+        if fuse_before_topk and kind != "modality_completed":
+            raise ValueError(
+                "item_graph_fuse_before_topk=1 currently requires item_graph_kind=modality_completed"
+            )
+        full_cf_graph = None
+        if fuse_before_topk:
+            full_cf_graph = self.dataset._build_cf_item_similarity(
+                scale=cf_scale,
+                power=cf_power,
+                clip=cf_clip,
+            )
+            cf_graph = self.dataset._topk_sparse_rows(full_cf_graph, topk)
+        else:
+            cf_graph = self.dataset._build_cf_item_graph(
                 topk,
                 scale=cf_scale,
                 power=cf_power,
                 clip=cf_clip,
-            ),
-        }
-        if max(weights["image"], modality_weights["v"]["semantic"]) > 0.0:
-            graphs["image"] = self.dataset._build_feature_item_graph(graph_feature_np["v"], topk, chunk_size)
-        if max(weights["text"], modality_weights["t"]["semantic"]) > 0.0:
-            graphs["text"] = self.dataset._build_feature_item_graph(graph_feature_np["t"], topk, chunk_size)
-        if "a" in self.modalities and max(weights["audio"], modality_weights["a"]["semantic"]) > 0.0:
-            graphs["audio"] = self.dataset._build_feature_item_graph(graph_feature_np["a"], topk, chunk_size)
+            )
+        graphs = {"cf": cf_graph}
+        inductive_kind = kind == "modality_completed_inductive"
+        warm_items = np.asarray(getattr(self.dataset, "train_item_index", []), dtype=np.int64)
+
+        def build_semantic_graph(feature, reliability):
+            if inductive_kind:
+                return self.dataset._build_inductive_feature_item_graph(
+                    feature,
+                    reference_items=warm_items,
+                    query_items=warm_items,
+                    topk=topk,
+                    chunk_size=chunk_size,
+                    reliability=reliability,
+                    reliability_blend=reliability_blend,
+                )
+            return self.dataset._build_feature_item_graph(
+                feature,
+                topk,
+                chunk_size,
+                reliability=reliability,
+                reliability_blend=reliability_blend,
+            )
+
+        if weights["image"] > 0.0 and not fuse_before_topk:
+            graphs["image"] = build_semantic_graph(
+                graph_feature_np["v"],
+                reliabilities["v"] if reliability_topk else None,
+            )
+        if weights["text"] > 0.0 and not fuse_before_topk:
+            graphs["text"] = build_semantic_graph(
+                graph_feature_np["t"],
+                reliabilities["t"] if reliability_topk else None,
+            )
+        if "a" in self.modalities and weights["audio"] > 0.0 and not fuse_before_topk:
+            graphs["audio"] = build_semantic_graph(
+                graph_feature_np["a"],
+                reliabilities["a"] if reliability_topk else None,
+            )
+        if "d" in self.modalities and weights["video"] > 0.0 and not fuse_before_topk:
+            graphs["video"] = build_semantic_graph(
+                graph_feature_np["d"],
+                reliabilities["d"] if reliability_topk else None,
+            )
+        if kind == "modality_masked":
+            masked_graph_specs = (("image", "v"), ("text", "t"), ("audio", "a"), ("video", "d"))
+            for graph_name, modality in masked_graph_specs:
+                if graph_name not in graphs or modality not in masks:
+                    continue
+                missing = (~masks[modality]).detach().cpu().numpy()
+                if graphs[graph_name][missing].nnz or graphs[graph_name][:, missing].nnz:
+                    raise RuntimeError(
+                        f"modality_masked graph contains semantic edges involving missing {modality} items"
+                    )
+                print(
+                    f"strict masked graph modality={modality} missing_items={int(missing.sum())} "
+                    f"semantic_edges={graphs[graph_name].nnz} missing_semantic_edges=0"
+                )
+        if uses_reliability:
+            reliability_specs = (("image", "v"), ("text", "t"), ("audio", "a"), ("video", "d"))
+            if not reliability_topk:
+                for graph_name, modality in reliability_specs:
+                    if graph_name not in graphs or modality not in reliabilities:
+                        continue
+                    graphs[graph_name] = self._apply_item_graph_reliability(
+                        graphs[graph_name],
+                        reliabilities[modality],
+                    )
+            graph = self._build_weighted_item_item_graph(
+                graphs,
+                weights,
+                topk,
+                norm_type,
+                required_names=None,
+                context="reliability completed item graph",
+            )
+            self.ItemItemGraph = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
+            self.ItemItemGraphs = {}
+            self.ItemItemGraphComponents = {}
+            rel_desc = ",".join(
+                f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}/missing_mean="
+                f"{scores[(~masks[modality]).detach().cpu().numpy()].mean():.4f}"
+                if np.any((~masks[modality]).detach().cpu().numpy())
+                else f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}/missing_mean=NA"
+                for modality, scores in sorted(reliabilities.items())
+            )
+            print(
+                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
+                f"feature_space={graph_feature_space}, "
+                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
+                f"reliability_floor={float(getattr(self.env.args, 'item_graph_reliability_floor', 0.4))}, "
+                f"reliability_blend={float(getattr(self.env.args, 'item_graph_reliability_blend', 1.0))}, "
+                f"reliability_missing_penalty={float(getattr(self.env.args, 'item_graph_reliability_missing_penalty', 1.0))}, "
+                f"reliability_missing_boost={float(getattr(self.env.args, 'item_graph_reliability_missing_boost', 0.0))}, "
+                f"reliability_topk={int(reliability_topk)}, "
+                f"reliability={rel_desc}"
+            )
+            return
         if kind == "fused_completed_dynamic_confidence":
             dynamic_candidates = self._build_dynamic_confidence_item_graph_candidates(
                 graphs,
@@ -1419,9 +1487,8 @@ class MILK_model(torch.nn.Module):
                 f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
                 f"dynamic_topk=1, candidate_width={dynamic_candidates['cols'].shape[1]}, "
                 f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}, "
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
                 f"edge_conf_init=rr:{conf[0]:.4f},ri:{conf[1]:.4f},ii:{conf[2]:.4f}, "
                 f"edge_conf_coeff=rr:{coeff[0]:.4f},ri:{coeff[1]:.4f},ii:{coeff[2]:.4f}, "
                 f"transform={self.item_graph_confidence_transform}, "
@@ -1453,9 +1520,8 @@ class MILK_model(torch.nn.Module):
                 f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
                 f"components={','.join(sorted(self.ItemItemGraphComponents.keys()))}, "
                 f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}, "
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
                 f"edge_conf_init=rr:{conf[0]:.4f},ri:{conf[1]:.4f},ii:{conf[2]:.4f}, "
                 f"edge_conf_coeff=rr:{coeff[0]:.4f},ri:{coeff[1]:.4f},ii:{coeff[2]:.4f}, "
                 f"transform={self.item_graph_confidence_transform}, "
@@ -1464,24 +1530,84 @@ class MILK_model(torch.nn.Module):
             )
             return
 
-        if kind == "modality_completed":
+        if kind in ("modality_masked", "modality_completed", "modality_completed_inductive"):
             self.ItemItemGraphs = {}
             self.ItemItemGraphComponents = {}
+            if fuse_before_topk:
+                modality_specs = {
+                    "v": ("v", weights["image"]),
+                    "t": ("t", weights["text"]),
+                }
+                if "a" in self.modalities:
+                    modality_specs["a"] = ("a", weights["audio"])
+                if "d" in self.modalities:
+                    modality_specs["d"] = ("d", weights["video"])
+
+                cf_only = self._build_weighted_item_item_graph(
+                    {"cf": graphs["cf"]},
+                    {"cf": weights["cf"]},
+                    topk,
+                    norm_type,
+                    required_names=["cf"],
+                    context=f"{graph_label} cf item graph",
+                )
+                self.ItemItemGraphs["cf"] = (
+                    self.dataset._convert_sp_mat_to_sp_tensor(cf_only).coalesce().to(self.env.device)
+                )
+                for key, (modality, feature_weight) in modality_specs.items():
+                    if feature_weight <= 0.0:
+                        continue
+                    reliability = (
+                        reliabilities[modality]
+                        if reliability_topk and reliabilities is not None
+                        else None
+                    )
+                    graph = self.dataset._build_fused_cf_feature_item_graph(
+                        graph_feature_np[modality],
+                        full_cf_graph,
+                        topk,
+                        chunk_size,
+                        weights["cf"],
+                        feature_weight,
+                        reliability=reliability,
+                        reliability_blend=reliability_blend,
+                    )
+                    graph = self.dataset._normalize_item_graph(graph, norm_type)
+                    self.ItemItemGraphs[key] = (
+                        self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
+                    )
+                self.ItemItemGraph = None
+                print(
+                    f"built {graph_label} item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
+                    f"graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
+                    f"feature_space={graph_feature_space}, fusion_order=fuse_then_topk, "
+                    f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
+                    f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},"
+                    f"audio:{weights['audio']},video:{weights['video']}"
+                )
+                return
+            def modality_graph_parts(feature_graph_name):
+                graph_parts = {"cf": graphs["cf"]}
+                graph_weights = {"cf": weights["cf"]}
+                if feature_graph_name in graphs and weights[feature_graph_name] > 0.0:
+                    graph_parts[feature_graph_name] = graphs[feature_graph_name]
+                    graph_weights[feature_graph_name] = weights[feature_graph_name]
+                return graph_parts, graph_weights
+
             modality_graph_specs = {
                 "cf": ({"cf": graphs["cf"]}, {"cf": weights["cf"]}),
-                "v": (
-                    {"cf": graphs["cf"], "image": graphs["image"]},
-                    {"cf": modality_weights["v"]["cf"], "image": modality_weights["v"]["semantic"]},
-                ),
-                "t": (
-                    {"cf": graphs["cf"], "text": graphs["text"]},
-                    {"cf": modality_weights["t"]["cf"], "text": modality_weights["t"]["semantic"]},
-                ),
+                "v": modality_graph_parts("image"),
+                "t": modality_graph_parts("text"),
             }
             if "a" in self.modalities and "audio" in graphs:
                 modality_graph_specs["a"] = (
                     {"cf": graphs["cf"], "audio": graphs["audio"]},
-                    {"cf": modality_weights["a"]["cf"], "audio": modality_weights["a"]["semantic"]},
+                    {"cf": weights["cf"], "audio": weights["audio"]},
+                )
+            if "d" in self.modalities and "video" in graphs:
+                modality_graph_specs["d"] = (
+                    {"cf": graphs["cf"], "video": graphs["video"]},
+                    {"cf": weights["cf"], "video": weights["video"]},
                 )
             for key, (graph_parts, graph_weights) in modality_graph_specs.items():
                 graph = self._build_weighted_item_item_graph(
@@ -1490,19 +1616,36 @@ class MILK_model(torch.nn.Module):
                     topk,
                     norm_type,
                     required_names=list(graph_parts.keys()),
-                    context=f"completed {key} item graph",
+                    context=f"{graph_label} {key} item graph",
                 )
+                if kind == "modality_completed_inductive":
+                    cold_items = np.asarray(self.dataset.cold_item_index, dtype=np.int64)
+                    if graph[cold_items].nnz or graph[:, cold_items].nnz:
+                        raise RuntimeError(
+                            f"inductive training item graph {key} contains an edge involving a cold item"
+                        )
                 self.ItemItemGraphs[key] = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
             self.ItemItemGraph = None
+            if kind == "modality_completed_inductive":
+                self.InductiveItemItemGraphs["train"] = self.ItemItemGraphs
+                self._inductive_item_graph_split = "train"
             print(
-                f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
+                f"built {graph_label} item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
                 f"graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
-                f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
+                f"feature_space={graph_feature_space}, "
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}, "
-                f"modal_weights={self._format_item_graph_modality_weights(modality_weights)}"
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}"
             )
+            if self._uses_posterior_reliability_for("graph"):
+                rel_desc = ",".join(
+                    f"{modality}:mean={scores.mean():.4f}/min={scores.min():.4f}"
+                    for modality, scores in sorted(reliabilities.items())
+                )
+                print(
+                    "posterior reliability applied before semantic topk: "
+                    f"scale={self.posterior_reliability_scale},floor={self.posterior_reliability_floor},"
+                    f"{rel_desc}"
+                )
             return
 
         if kind == "modality_completed_confidence":
@@ -1516,13 +1659,15 @@ class MILK_model(torch.nn.Module):
             }
             if "a" in self.modalities and "audio" in graphs:
                 modality_graph_specs["a"] = ("audio", "a")
+            if "d" in self.modalities and "video" in graphs:
+                modality_graph_specs["d"] = ("video", "d")
 
             effective_weights = {}
             for key, (feature_graph_name, modality_name) in modality_graph_specs.items():
                 if feature_graph_name not in graphs:
                     continue
-                cf_weight = modality_weights[modality_name]["cf"]
-                feature_weight = modality_weights[modality_name]["semantic"]
+                cf_weight = weights["cf"]
+                feature_weight = weights[feature_graph_name]
                 if cf_weight <= 0.0:
                     feature_weight = 1.0
                 components = self._build_confidence_item_item_graph_for_modality(
@@ -1548,10 +1693,8 @@ class MILK_model(torch.nn.Module):
                 f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
                 f"graphs={','.join(sorted(self.ItemItemGraphComponents.keys()))}, "
                 f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}, "
-                f"modal_weights={self._format_item_graph_modality_weights(modality_weights)}, "
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
                 f"effective_modal_weights="
                 f"{','.join(f'{name}:cf={vals[0]},semantic={vals[1]}' for name, vals in sorted(effective_weights.items()))}"
             )
@@ -1569,14 +1712,16 @@ class MILK_model(torch.nn.Module):
             }
             if "a" in self.modalities and "audio" in graphs:
                 modality_graph_specs["a"] = ("audio", "a")
+            if "d" in self.modalities and "video" in graphs:
+                modality_graph_specs["d"] = ("video", "d")
 
             effective_weights = {}
             candidate_widths = {}
             for key, (feature_graph_name, modality_name) in modality_graph_specs.items():
                 if feature_graph_name not in graphs:
                     continue
-                cf_weight = modality_weights[modality_name]["cf"]
-                feature_weight = modality_weights[modality_name]["semantic"]
+                cf_weight = weights["cf"]
+                feature_weight = weights[feature_graph_name]
                 if cf_weight <= 0.0:
                     feature_weight = 1.0
                 candidates = self._build_dynamic_confidence_item_graph_candidates_for_modality(
@@ -1621,10 +1766,8 @@ class MILK_model(torch.nn.Module):
                 f"candidate_widths="
                 f"{','.join(f'{name}:{width}' for name, width in sorted(candidate_widths.items()))}, "
                 f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-                f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
                 f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}, "
-                f"modal_weights={self._format_item_graph_modality_weights(modality_weights)}, "
+                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}, "
                 f"effective_modal_weights="
                 f"{','.join(f'{name}:cf={vals[0]},semantic={vals[1]}' for name, vals in sorted(effective_weights.items()))}, "
                 f"edge_conf_init={edge_conf_desc}, "
@@ -1651,39 +1794,123 @@ class MILK_model(torch.nn.Module):
         print(
             f"built completed item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
             f"feature_space={getattr(self.env.args, 'item_graph_feature_space', 'shared')}, "
-            f"feature_source={graph_feature_source}, feature_dir={graph_feature_dir}, "
             f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']}"
+            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}"
         )
 
-    def _item_graph_modality_weights(self, weights):
-        args = self.env.args
+    def set_inductive_item_graph_split(self, split):
+        """Switch between the warm training graph and cold-query inference graph."""
+        if self.item_graph_kind != "modality_completed_inductive":
+            return
+        if split == "train":
+            self.ItemItemGraphs = self.InductiveItemItemGraphs["train"]
+            self._inductive_item_graph_split = "train"
+            self.clear_gcn_cache()
+            return
+        if split not in ("val", "test"):
+            raise ValueError(f"Unsupported inductive item graph split: {split}")
 
-        def override(name, fallback):
-            value = getattr(args, name, None)
-            return float(fallback if value is None else value)
+        candidate_protocol = getattr(self.env.args, "cold_start_eval_candidates", "milk_union")
+        cache_key = "milk_union" if candidate_protocol == "milk_union" else split
+        if cache_key in self.InductiveItemItemGraphs:
+            self.ItemItemGraphs = self.InductiveItemItemGraphs[cache_key]
+            self._inductive_item_graph_split = cache_key
+            self.clear_gcn_cache()
+            return
 
-        return {
-            "v": {
-                "cf": override("item_graph_image_cf_weight", weights["cf"]),
-                "semantic": override("item_graph_image_semantic_weight", weights["image"]),
-            },
-            "t": {
-                "cf": override("item_graph_text_cf_weight", weights["cf"]),
-                "semantic": override("item_graph_text_semantic_weight", weights["text"]),
-            },
-            "a": {
-                "cf": override("item_graph_audio_cf_weight", weights["cf"]),
-                "semantic": override("item_graph_audio_semantic_weight", weights["audio"]),
-            },
+        topk = int(getattr(self.env.args, "item_graph_topk", 20))
+        norm_type = getattr(self.env.args, "item_graph_norm", "rw")
+        chunk_size = int(getattr(self.env.args, "item_graph_feature_chunk_size", 1024))
+        warm_items = np.asarray(self.dataset.train_item_index, dtype=np.int64)
+        cold_queries = np.asarray(self.dataset.get_eval_candidate_items(split), dtype=np.int64)
+        active_queries = np.unique(np.concatenate([warm_items, cold_queries]))
+        raw_features = self._current_raw_modal_features()
+        with torch.no_grad():
+            masks = self._missing_masks(raw_features=raw_features)
+            projected = self.project_features(raw_features=raw_features)
+            graph_features = self._build_completed_features(
+                projected,
+                masks,
+                detach_imputed=True,
+            )
+            graph_feature_space = getattr(self.env.args, "item_graph_feature_space", "shared")
+            if graph_feature_space == "raw_decoder" and not self.use_latent_completion_bridge:
+                decoded_raw = self.bridge_completed_to_recommendation_raw(graph_features)
+                graph_features = {
+                    modality: torch.where(
+                        masks[modality].unsqueeze(1),
+                        raw_features[modality],
+                        decoded_raw[modality],
+                    )
+                    for modality in self.modalities
+                }
+            graph_feature_np = {
+                modality: graph_features[modality].detach().cpu().numpy().astype(np.float32)
+                for modality in self.modalities
+            }
+            if self.use_posterior_reliability:
+                reliabilities = {
+                    modality: scores.detach().cpu().numpy().astype(np.float32)
+                    for modality, scores in self._posterior_completion_reliabilities(masks).items()
+                }
+            else:
+                reliabilities = None
+
+        weights = {
+            "cf": float(getattr(self.env.args, "item_graph_cf_weight", 0.5)),
+            "image": float(getattr(self.env.args, "item_graph_image_weight", 0.25)),
+            "text": float(getattr(self.env.args, "item_graph_text_weight", 0.25)),
+            "audio": float(getattr(self.env.args, "item_graph_audio_weight", 0.0)),
+            "video": float(getattr(self.env.args, "item_graph_video_weight", 0.0)),
         }
-
-    def _format_item_graph_modality_weights(self, modality_weights):
-        names = (("v", "image"), ("t", "text"), ("a", "audio"))
-        return ",".join(
-            f"{label}:cf={modality_weights[key]['cf']},semantic={modality_weights[key]['semantic']}"
-            for key, label in names
-            if key in modality_weights
+        cf_graph = self.dataset._build_cf_item_graph(
+            topk,
+            scale=getattr(self.env.args, "item_graph_cf_scale", "raw"),
+            power=float(getattr(self.env.args, "item_graph_cf_power", 0.5)),
+            clip=float(getattr(self.env.args, "item_graph_cf_clip", 3.0)),
+        )
+        modality_specs = (("v", "image"), ("t", "text"), ("a", "audio"), ("d", "video"))
+        item_graphs = {}
+        reliability_blend = min(
+            max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0),
+            1.0,
+        )
+        for modality, graph_name in modality_specs:
+            if modality not in self.modalities or weights[graph_name] <= 0.0:
+                continue
+            semantic_graph = self.dataset._build_inductive_feature_item_graph(
+                graph_feature_np[modality],
+                reference_items=warm_items,
+                query_items=active_queries,
+                topk=topk,
+                chunk_size=chunk_size,
+                reliability=reliabilities[modality] if reliabilities is not None else None,
+                reliability_blend=reliability_blend,
+            )
+            graph = self._build_weighted_item_item_graph(
+                {"cf": cf_graph, graph_name: semantic_graph},
+                {"cf": weights["cf"], graph_name: weights[graph_name]},
+                topk,
+                norm_type,
+                required_names=["cf", graph_name],
+                context=f"inductive {split} {modality} item graph",
+            )
+            all_cold_items = np.asarray(self.dataset.cold_item_index, dtype=np.int64)
+            if graph[:, all_cold_items].nnz:
+                raise RuntimeError(
+                    f"inductive evaluation item graph {modality} contains warm-to-cold or cold-to-cold edges"
+                )
+            item_graphs[modality] = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
+        item_graphs["cf"] = self.dataset._convert_sp_mat_to_sp_tensor(
+            self._build_single_item_item_graph(cf_graph, topk, norm_type)
+        ).coalesce().to(self.env.device)
+        self.InductiveItemItemGraphs[cache_key] = item_graphs
+        self.ItemItemGraphs = item_graphs
+        self._inductive_item_graph_split = cache_key
+        self.clear_gcn_cache()
+        print(
+            f"built inductive item graph split={split}, candidates={candidate_protocol}, "
+            f"warm_references={len(warm_items)}, cold_queries={len(cold_queries)}"
         )
 
     def _build_single_item_item_graph(self, graph, topk, norm_type):
@@ -1734,26 +1961,11 @@ class MILK_model(torch.nn.Module):
             return self.item_emb.weight.new_zeros(())
 
         base_target = float(getattr(self.env.args, "item_graph_confidence_reg_target", 1.0))
-        shared_target_values = [
+        target = self.item_emb.weight.new_tensor([
             float(getattr(self.env.args, "item_graph_rr_confidence_reg_target", None) or base_target),
             float(getattr(self.env.args, "item_graph_ri_confidence_reg_target", None) or base_target),
             float(getattr(self.env.args, "item_graph_ii_confidence_reg_target", None) or base_target),
-        ]
-
-        def build_target(modality=None, dtype=None, device=None):
-            values = list(shared_target_values)
-            if modality in ("t", "v", "a"):
-                prefix = {"t": "text", "v": "image", "a": "audio"}[modality]
-                for idx, edge_type in enumerate(("rr", "ri", "ii")):
-                    override = getattr(
-                        self.env.args,
-                        f"item_graph_{prefix}_{edge_type}_confidence_reg_target",
-                        None,
-                    )
-                    if override is not None:
-                        values[idx] = float(override)
-            return self.item_emb.weight.new_tensor(values, dtype=dtype, device=device)
-
+        ])
         conf = self._item_graph_edge_confidences()
         if isinstance(conf, dict):
             active_modalities = set()
@@ -1766,12 +1978,11 @@ class MILK_model(torch.nn.Module):
             if not active_modalities:
                 active_modalities.update(conf.keys())
             losses = [
-                (value - build_target(name, dtype=value.dtype, device=value.device)).pow(2).mean()
+                (value - target.to(dtype=value.dtype, device=value.device)).pow(2).mean()
                 for name, value in conf.items()
                 if name in active_modalities
             ]
         else:
-            target = build_target(dtype=conf.dtype, device=conf.device)
             losses = [(conf - target.to(dtype=conf.dtype, device=conf.device)).pow(2).mean()]
         if not losses:
             return self.item_emb.weight.new_zeros(())
@@ -1818,6 +2029,107 @@ class MILK_model(torch.nn.Module):
                 dtype=np.float32,
             )
         return pieces
+
+    def _compute_item_graph_reliability_scores(self, graph_features, masks):
+        floor = min(max(float(getattr(self.env.args, "item_graph_reliability_floor", 0.4)), 0.0), 1.0)
+        missing_penalty = max(float(getattr(self.env.args, "item_graph_reliability_missing_penalty", 1.0)), 0.0)
+        missing_boost = max(float(getattr(self.env.args, "item_graph_reliability_missing_boost", 0.0)), 0.0)
+        reliabilities = {}
+        for modality in self.modalities:
+            feature = F.normalize(graph_features[modality], dim=-1)
+            observed = masks[modality]
+            ref_sum = torch.zeros_like(feature)
+            ref_weight = torch.zeros(feature.size(0), 1, dtype=feature.dtype, device=feature.device)
+            for other in self.modalities:
+                if other == modality:
+                    continue
+                other_observed = masks[other].to(dtype=feature.dtype).unsqueeze(1)
+                ref_sum = ref_sum + F.normalize(graph_features[other], dim=-1) * other_observed
+                ref_weight = ref_weight + other_observed
+
+            has_ref = ref_weight.squeeze(1) > 0
+            ref = torch.zeros_like(feature)
+            ref[has_ref] = ref_sum[has_ref] / ref_weight[has_ref].clamp_min(1.0)
+            ref = F.normalize(ref, dim=-1)
+            consistency = F.cosine_similarity(feature, ref, dim=-1, eps=1e-8)
+            consistency = torch.where(has_ref, consistency, torch.zeros_like(consistency))
+            consistency = ((consistency + 1.0) * 0.5).clamp(0.0, 1.0)
+            missing_score = floor + (1.0 - floor) * consistency
+            if missing_boost > 0.0:
+                missing_score = missing_score + missing_boost * consistency
+            missing_score = (missing_score * missing_penalty).clamp(floor, 1.0 + missing_boost)
+            reliability = torch.where(observed, torch.ones_like(missing_score), missing_score)
+            reliabilities[modality] = reliability.detach().cpu().numpy().astype(np.float32)
+        return reliabilities
+
+    def _posterior_completion_reliabilities(self, masks):
+        """Return c_i^m from the linear-Gaussian completion predictive variance.
+
+        Observed modalities have reliability one. For a missing modality m,
+        c_i^m = exp(-lambda * tr(W_m V_i W_m^T + sigma_m^2 I) / d_c),
+        where V_i is the latent posterior covariance given the observed modalities.
+        With the current homoscedastic ProMRL model, items sharing an observation
+        pattern also share the same posterior reliability.
+        """
+        first_mask = next(iter(masks.values()))
+        reliabilities = {
+            modality: torch.ones(first_mask.size(0), dtype=torch.float32, device=first_mask.device)
+            for modality in self.modalities
+        }
+        pattern_keys = torch.stack([masks[modality] for modality in self.modalities], dim=1)
+        eye = torch.eye(self.d_beta, dtype=self.W[self.modalities[0]].dtype, device=first_mask.device)
+
+        with torch.no_grad():
+            for pattern in torch.unique(pattern_keys, dim=0):
+                selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
+                if not bool(selector.any()):
+                    continue
+                observed = [
+                    self.modalities[idx]
+                    for idx in range(len(self.modalities))
+                    if bool(pattern[idx])
+                ]
+                missing = [
+                    self.modalities[idx]
+                    for idx in range(len(self.modalities))
+                    if not bool(pattern[idx])
+                ]
+                if not missing:
+                    continue
+
+                posterior_precision = eye.clone()
+                for modality in observed:
+                    W = self.W[modality]
+                    sigma2 = torch.exp(2 * self.log_sigma[modality].squeeze())
+                    posterior_precision = posterior_precision + (W.T @ W) / sigma2
+                posterior_cov = torch.linalg.inv(posterior_precision + 1e-6 * eye)
+
+                for modality in missing:
+                    W = self.W[modality]
+                    sigma2 = torch.exp(2 * self.log_sigma[modality].squeeze())
+                    mean_predictive_variance = (
+                        torch.trace(posterior_cov @ (W.T @ W)) / float(self.promrl_dim)
+                        + sigma2
+                    )
+                    reliability = torch.exp(
+                        -self.posterior_reliability_scale * mean_predictive_variance
+                    ).clamp(min=self.posterior_reliability_floor, max=1.0)
+                    reliabilities[modality][selector] = reliability.to(dtype=torch.float32)
+        return reliabilities
+
+    def _apply_item_graph_reliability(self, graph, reliability):
+        blend = min(max(float(getattr(self.env.args, "item_graph_reliability_blend", 1.0)), 0.0), 1.0)
+        if blend <= 0.0:
+            return graph
+        graph = graph.tocoo().astype(np.float32)
+        edge_reliability = reliability[graph.row] * reliability[graph.col]
+        if blend < 1.0:
+            edge_reliability = 1.0 + blend * (edge_reliability - 1.0)
+        data = graph.data * edge_reliability.astype(np.float32)
+        reweighted = sp.csr_matrix((data, (graph.row, graph.col)), shape=graph.shape, dtype=np.float32)
+        reweighted.setdiag(0.0)
+        reweighted.eliminate_zeros()
+        return reweighted
 
     def _build_confidence_item_item_components(self, graphs, weights, masks, topk, norm_type):
         del norm_type
@@ -2093,10 +2405,57 @@ class MILK_model(torch.nn.Module):
 
 
     def _current_contra_heads(self):
-        heads = {"v": self.contra_head_v, "t": self.contra_head_t}
-        if "a" in self.modalities:
-            heads["a"] = self.contra_head_a
-        return heads
+        return {
+            modality: getattr(self, f"contra_head_{modality}")
+            for modality in self.modalities
+        }
+
+    def _current_projection_heads(self):
+        if self.use_decoupled_latent_bridge:
+            return {
+                modality: getattr(self, f"comp_proj_{modality}")
+                for modality in self.modalities
+            }
+        if self.use_latent_direct_bridge:
+            return {
+                modality: getattr(self, f"{modality}_gcn").MLP
+                for modality in self.modalities
+            }
+        return self._current_contra_heads()
+
+    def _current_recommendation_heads(self):
+        return {
+            modality: getattr(self, f"{modality}_gcn").MLP
+            for modality in self.modalities
+        }
+
+    def _completion_adapters(self):
+        return {
+            modality: getattr(self, f"comp_to_rec_{modality}")
+            for modality in self.modalities
+        }
+
+    def _gcn_skip_mlp(self):
+        return self.use_latent_completion_bridge
+
+    def _tensorize_external_modal_masks(self, masks):
+        if masks is None:
+            return None
+        tensor_masks = {}
+        for modality, mask in masks.items():
+            tensor_masks[modality] = torch.as_tensor(mask, dtype=torch.bool, device=self.env.device)
+        return tensor_masks
+
+    def _current_external_modal_observed_masks(self):
+        if self.modal_feature_mask_source != "external_observed":
+            return None
+        masks = self.train_external_modal_observed_masks if self.training else self.eval_external_modal_observed_masks
+        if masks is None:
+            raise ValueError(
+                "modal_feature_mask_source=external_observed requires observed mask files "
+                "in the external modal feature train/eval directories"
+            )
+        return masks
 
     def _missing_masks(self, raw_features=None):
         if raw_features is None:
@@ -2126,14 +2485,28 @@ class MILK_model(torch.nn.Module):
                 if source.size(1) != self.promrl_dim:
                     raise ValueError(
                         "promrl_projection_mode='identity' requires modal feature dim "
-                        f"to equal contra_dim ({self.promrl_dim}); modality {modality} has {source.size(1)}"
+                        f"to equal promrl_dim ({self.promrl_dim}); modality {modality} has {source.size(1)}"
                     )
                 projected[modality] = torch.nan_to_num(
                     F.normalize(source, dim=-1), nan=0.0, posinf=0.0, neginf=0.0
                 )
             return projected
 
-        heads = self._current_contra_heads()
+        heads = self._current_projection_heads()
+        projected = {}
+        for modality in self.modalities:
+            source = raw_features[modality]
+            if item_ids is not None:
+                source = source[item_ids]
+            projected_feature = torch.nan_to_num(heads[modality](source), nan=0.0, posinf=0.0, neginf=0.0)
+            projected[modality] = torch.nan_to_num(
+                F.normalize(projected_feature, dim=-1), nan=0.0, posinf=0.0, neginf=0.0
+            )
+        return projected
+
+    def project_recommendation_features(self, item_ids=None, raw_features=None):
+        raw_features = raw_features or self._current_raw_modal_features()
+        heads = self._current_recommendation_heads()
         projected = {}
         for modality in self.modalities:
             source = raw_features[modality]
@@ -2155,135 +2528,26 @@ class MILK_model(torch.nn.Module):
     ):
         N = next(iter(obs_feats.values())).size(0) if obs_feats else beta_prior.size(0)
         device = beta_prior.device if beta_prior is not None else next(iter(obs_feats.values())).device
-        eye = torch.eye(self.d_beta, device=device)
-        prior_precision_tensor = None
-        if torch.is_tensor(prior_precision):
-            prior_precision_tensor = prior_precision.to(device=device, dtype=eye.dtype)
-            V_inv = eye.unsqueeze(0) + torch.diag_embed(prior_precision_tensor)
-        else:
-            precision = float(prior_precision)
-            V_inv = precision * eye
+        precision = float(prior_precision)
+        V_inv = precision * torch.eye(self.d_beta, device=device)
         rhs = torch.zeros(N, self.d_beta, device=device)
         if beta_prior is not None:
-            if prior_precision_tensor is not None:
-                rhs = rhs + prior_precision_tensor * beta_prior
-            else:
-                rhs = rhs + float(prior_precision) * beta_prior
+            rhs = rhs + precision * beta_prior
 
         for modality in observed_modalities:
             if obs_feats.get(modality) is None:
                 continue
             W = self.W[modality]
             sigma2 = torch.exp(2 * self.log_sigma[modality].squeeze())
-            observed_precision = (1.0 / sigma2) * (W.T @ W)
-            V_inv = V_inv + observed_precision
+            V_inv = V_inv + (1.0 / sigma2) * (W.T @ W)
             residual = obs_feats[modality] - self.mu[modality].unsqueeze(0)
             rhs = rhs + (1.0 / sigma2) * (residual @ W)
 
-        if prior_precision_tensor is not None:
-            V = torch.inverse(V_inv + 1e-6 * eye.unsqueeze(0))
-            mean = torch.bmm(V, rhs.unsqueeze(-1)).squeeze(-1)
-        else:
-            V = torch.inverse(V_inv + 1e-6 * eye)
-            mean = rhs @ V.T
+        V = torch.inverse(V_inv + 1e-6 * torch.eye(self.d_beta, device=device))
+        mean = rhs @ V.T
         if return_cov:
             return mean, V
         return mean
-
-    def _linear_beta_to_shared(self, beta, modality):
-        return beta @ self.W[modality].transpose(0, 1) + self.mu[modality].unsqueeze(0)
-
-    def _beta_to_completed_shared(self, beta, modality):
-        linear_recon = self._linear_beta_to_shared(beta, modality)
-        if not self.use_beta_completion_decoder:
-            recon = linear_recon
-        elif self.beta_completion_mode == "decoder":
-            recon = self.beta_completion_decoders[modality](beta)
-        else:
-            raise ValueError(f"Unsupported beta_completion_mode: {self.beta_completion_mode}")
-        recon = torch.nan_to_num(recon, nan=0.0, posinf=0.0, neginf=0.0)
-        return F.normalize(recon, dim=-1)
-
-    def _beta_completion_decoder_rec_loss(self, beta, batch_data, observed_modalities):
-        if not self.use_beta_completion_decoder or self.beta_completion_rec_weight <= 0.0:
-            return torch.zeros((), device=self.env.device)
-
-        beta_input = beta.detach() if self.beta_completion_detach_beta else beta
-        losses = []
-        for modality in observed_modalities:
-            if batch_data.get(modality) is None:
-                continue
-            pred = self._beta_to_completed_shared(beta_input, modality)
-            target = batch_data[modality]
-            if self.beta_completion_rec_loss in ("mse", "mse_cosine"):
-                losses.append(F.mse_loss(pred, target, reduction="mean"))
-            if self.beta_completion_rec_loss in ("cosine", "mse_cosine"):
-                cosine = F.cosine_similarity(pred, target, dim=-1)
-                losses.append(1.0 - cosine.mean())
-
-        if not losses:
-            return torch.zeros((), device=self.env.device)
-        return self.beta_completion_rec_weight * torch.stack(losses).mean()
-
-    def _select_smore_beta_prior_features(self, split=None):
-        if not self.smore_beta_prior_features:
-            return None
-        if split in ("val", "test"):
-            return self.smore_beta_prior_features["eval"]
-        if split == "train":
-            return self.smore_beta_prior_features["train"]
-        if not self.training and self.uses_split_smore_beta_prior_features:
-            return self.smore_beta_prior_features["eval"]
-        return self.smore_beta_prior_features["train"]
-
-    def _smore_beta_prior_params(self, item_ids, masks, split=None, stage=None):
-        if not self._uses_smore_beta_prior_for_stage(stage):
-            return None, None, None
-        features = self._select_smore_beta_prior_features(split=split)
-        if not features:
-            return None, None, None
-
-        N = next(iter(masks.values())).size(0)
-        device = next(iter(masks.values())).device
-        mean_sum = torch.zeros(N, self.d_beta, device=device)
-        var_sum = torch.zeros(N, self.d_beta, device=device)
-        prior_count = torch.zeros(N, 1, device=device)
-
-        for modality, generator in self.smore_beta_prior_generators.items():
-            if modality not in masks or modality not in features:
-                continue
-            modality_features = features[modality]
-            if item_ids is not None:
-                modality_features = modality_features[item_ids]
-            modality_features = modality_features.to(device)
-            observed = masks[modality].bool()
-            nonzero = modality_features.abs().sum(dim=1) > 0
-            valid = observed & nonzero
-            if not valid.any():
-                continue
-            generated = torch.nan_to_num(
-                generator(modality_features),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            prior_mean, prior_raw_var = torch.chunk(generated, 2, dim=1)
-            prior_var = (
-                self.smore_beta_prior_var_min
-                + (self.smore_beta_prior_var_max - self.smore_beta_prior_var_min)
-                * torch.sigmoid(prior_raw_var)
-            )
-            mean_sum[valid] = mean_sum[valid] + prior_mean[valid]
-            var_sum[valid] = var_sum[valid] + prior_var[valid]
-            prior_count[valid] = prior_count[valid] + 1.0
-
-        has_prior = prior_count.squeeze(1) > 0
-        if not has_prior.any():
-            return None, None, None
-        prior_mean = mean_sum / prior_count.clamp_min(1.0)
-        prior_var = var_sum / prior_count.clamp_min(1.0)
-        prior_precision = self.smore_beta_prior_lambda / prior_var.clamp_min(1e-8)
-        return prior_mean, prior_precision, has_prior
 
     def _compute_standard_beta_means(self, projected, masks, detach_inputs=True):
         N = projected[self.modalities[0]].size(0)
@@ -2310,7 +2574,7 @@ class MILK_model(torch.nn.Module):
             )
         return beta
 
-    def impute_modalities(self, projected_feats, masks=None, item_ids=None, smore_split=None, stage=None):
+    def impute_modalities(self, projected_feats, masks=None, item_ids=None):
         if self.disable_imputation:
             return {modality: feat.clone() for modality, feat in projected_feats.items()}
 
@@ -2323,57 +2587,39 @@ class MILK_model(torch.nn.Module):
             return completed
 
         pattern_keys = torch.stack([masks[modality] for modality in self.modalities], dim=1)
-        prior_mean_all, prior_precision_all, prior_has_all = self._smore_beta_prior_params(
-            item_ids,
-            masks,
-            split=smore_split,
-            stage=stage,
-        )
+        log_sigma_dict = {modality: self.log_sigma[modality].squeeze() for modality in self.modalities}
+        W_dict = {modality: self.W[modality] for modality in self.modalities}
+        mu_dict = {modality: self.mu[modality] for modality in self.modalities}
         unique_patterns = torch.unique(pattern_keys, dim=0)
         for pattern in unique_patterns:
             missing_modalities = [self.modalities[i] for i in range(len(self.modalities)) if not bool(pattern[i])]
             if not missing_modalities:
                 continue
 
-            pattern_selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
-            if pattern_selector.sum() == 0:
+            selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
+            if selector.sum() == 0:
                 continue
 
             observed_modalities = [self.modalities[i] for i in range(len(self.modalities)) if bool(pattern[i])]
-            if prior_has_all is None:
-                subgroup_specs = [(pattern_selector, False)]
-            else:
-                subgroup_specs = [
-                    (pattern_selector & prior_has_all, True),
-                    (pattern_selector & ~prior_has_all, False),
-                ]
-
-            for selector, use_prior in subgroup_specs:
-                if selector.sum() == 0:
-                    continue
+            if observed_modalities:
                 obs_feats = {
                     modality: projected_feats[modality][selector]
                     for modality in observed_modalities
                 }
-                if use_prior:
-                    m = self._posterior_mean_from_observed(
-                        obs_feats,
-                        observed_modalities,
-                        beta_prior=prior_mean_all[selector],
-                        prior_precision=prior_precision_all[selector],
-                    )
-                elif observed_modalities:
-                    m = self._posterior_mean_from_observed(
-                        obs_feats,
-                        observed_modalities,
-                        beta_prior=None,
-                        prior_precision=1.0,
-                    )
-                else:
-                    m = torch.zeros(selector.sum(), self.d_beta, device=self.env.device)
+                m, _ = update_posterior(
+                    obs_feats,
+                    W_dict,
+                    mu_dict,
+                    log_sigma_dict,
+                    observed_modalities,
+                    self.d_beta,
+                )
+            else:
+                m = torch.zeros(selector.sum(), self.d_beta, device=self.env.device)
 
-                for modality in missing_modalities:
-                    completed[modality][selector] = self._beta_to_completed_shared(m, modality)
+            for modality in missing_modalities:
+                recon = m @ self.W[modality].transpose(0, 1) + self.mu[modality].unsqueeze(0)
+                completed[modality][selector] = F.normalize(recon, dim=-1)
 
         return completed
 
@@ -2382,27 +2628,100 @@ class MILK_model(torch.nn.Module):
         if self.disable_imputation:
             return projected
         item_ids = torch.arange(self.m_item, device=self.env.device)
-        completed = self.impute_modalities(
-            projected,
-            self._missing_masks(),
-            item_ids=item_ids,
-            stage=self.env.args.train_stage,
-        )
+        completed = self.impute_modalities(projected, self._missing_masks(), item_ids=item_ids)
         return completed
 
     def decode_completed_to_raw(self, completed_shared):
+        if not self.use_decode_head:
+            raise RuntimeError(
+                "decode_completed_to_raw is unavailable when feature_bridge_mode uses latent completion"
+            )
         decoded = {
-            "v": F.normalize(self.decoder_v(completed_shared["v"]), dim=-1),
-            "t": F.normalize(self.decoder_t(completed_shared["t"]), dim=-1),
+            modality: getattr(self, f"decoder_{modality}")(completed_shared[modality])
+            for modality in self.modalities
         }
-        if "a" in self.modalities:
-            decoded["a"] = F.normalize(self.decoder_a(completed_shared["a"]), dim=-1)
-        return decoded
+        if self.decoder_output_mode == "native_direction_norm":
+            return decoded
+        return {
+            modality: F.normalize(feature, dim=-1)
+            for modality, feature in decoded.items()
+        }
 
     def bridge_completed_to_recommendation_raw(self, completed_shared):
-        if self.feature_bridge_mode == "shared_identity":
-            return completed_shared
         return self.decode_completed_to_raw(completed_shared)
+
+    def _decoder_target(self, modality, normalized_target, item_ids=None):
+        if self.decoder_output_mode == "native_direction_norm":
+            return self._native_raw_target(modality, normalized_target, item_ids=item_ids)
+        return normalized_target
+
+    def _decoder_reconstruction_loss(self, modality, prediction, target):
+        cosine_loss = 1.0 - F.cosine_similarity(prediction, target, dim=-1).mean()
+        if self.decoder_output_mode != "native_direction_norm":
+            return cosine_loss
+
+        feature_std = getattr(self, f"native_raw_std_{modality}").unsqueeze(0)
+        # Coordinate regression is useful for learning the native feature
+        # direction, but its conditional-mean optimum shrinks magnitude when
+        # the direction is uncertain.  Evaluate it at the target magnitude so
+        # that this term cannot teach the norm head to mark completed items via
+        # systematically smaller norms.  Magnitude is learned exclusively by
+        # the log-norm objective below.
+        target_norm = target.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        direction_scaled_prediction = F.normalize(prediction, dim=-1) * target_norm
+        standardized_error = (direction_scaled_prediction - target) / feature_std
+        raw_loss = F.smooth_l1_loss(
+            standardized_error,
+            torch.zeros_like(standardized_error),
+            reduction="mean",
+        )
+        prediction_log_norm = prediction.norm(dim=-1).clamp_min(1e-8).log()
+        target_log_norm = target.norm(dim=-1).clamp_min(1e-8).log()
+        norm_loss = F.smooth_l1_loss(prediction_log_norm, target_log_norm)
+
+        relation_loss = prediction.new_zeros(())
+        relation_max_items = max(
+            int(getattr(self.env.args, "decoder_relation_max_items", 64)),
+            0,
+        )
+        if relation_max_items > 1 and prediction.size(0) > 1:
+            relation_count = min(relation_max_items, prediction.size(0))
+            pred_direction = F.normalize(prediction[:relation_count], dim=-1)
+            target_direction = F.normalize(target[:relation_count], dim=-1)
+            pred_relation = pred_direction @ pred_direction.transpose(0, 1)
+            target_relation = target_direction @ target_direction.transpose(0, 1)
+            relation_loss = F.smooth_l1_loss(pred_relation, target_relation)
+
+        self.latest_decoder_loss_components = {
+            "raw": float(raw_loss.detach().cpu()),
+            "cosine": float(cosine_loss.detach().cpu()),
+            "norm": float(norm_loss.detach().cpu()),
+            "relation": float(relation_loss.detach().cpu()),
+        }
+        return (
+            float(getattr(self.env.args, "decoder_raw_loss_weight", 1.0)) * raw_loss
+            + float(getattr(self.env.args, "decoder_cosine_loss_weight", 1.0)) * cosine_loss
+            + float(getattr(self.env.args, "decoder_norm_loss_weight", 0.25)) * norm_loss
+            + float(getattr(self.env.args, "decoder_relation_loss_weight", 0.1)) * relation_loss
+        )
+
+    def adapt_completed_to_recommendation(self, completed_shared):
+        adapters = self._completion_adapters()
+        adapted = {}
+        for modality in self.modalities:
+            adapted_feature = torch.nan_to_num(
+                adapters[modality](completed_shared[modality]),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            adapted[modality] = torch.nan_to_num(
+                F.normalize(adapted_feature, dim=-1),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+        return adapted
 
     def _apply_fusion(self, item_source, deterministic=False):
         item_hidden = self.fusion_linear[0](item_source)
@@ -2412,7 +2731,12 @@ class MILK_model(torch.nn.Module):
         return item_emb
 
     def _item_graph_for_modality(self, modality=None):
-        if self.item_graph_kind in ("modality_completed", "modality_completed_confidence"):
+        if self.item_graph_kind in (
+            "modality_masked",
+            "modality_completed",
+            "modality_completed_inductive",
+            "modality_completed_confidence",
+        ):
             if not self.ItemItemGraphs:
                 raise RuntimeError(
                     "modality graph item-item propagation requires modality item-item graphs"
@@ -2600,28 +2924,6 @@ class MILK_model(torch.nn.Module):
 
         raise ValueError(f"Unsupported item graph normalization: {norm_type}")
 
-    def _missing_weighted_item_fusion_weights(self, item_outputs, raw_features=None, observed_masks=None):
-        if observed_masks is None:
-            if raw_features is None:
-                return None
-            observed_masks = self._missing_masks(raw_features=raw_features)
-
-        imputed_weight = min(
-            max(float(getattr(self.env.args, "missing_fusion_imputed_weight", 0.7)), 0.0),
-            1.0,
-        )
-        weights = {}
-        for modality in self.modalities:
-            observed = observed_masks[modality].unsqueeze(1)
-            weights[modality] = torch.where(
-                observed,
-                torch.ones_like(item_outputs[modality][..., :1]),
-                torch.full_like(item_outputs[modality][..., :1], imputed_weight),
-            )
-        denom = torch.stack([weights[modality] for modality in self.modalities], dim=0).sum(dim=0)
-        denom = denom.clamp_min(1e-8)
-        return {modality: weights[modality] / denom for modality in self.modalities}
-
     def _global_weighted_item_source(self, item_outputs):
         weights = F.softmax(self.global_fusion_params[0], dim=0)
         for idx, modality in enumerate(self.modalities):
@@ -2630,47 +2932,32 @@ class MILK_model(torch.nn.Module):
             )
         return sum(weights[idx] * item_outputs[modality] for idx, modality in enumerate(self.modalities))
 
-    def _reliability_weighted_item_source(self, item_outputs, reliability_gates=None):
-        if reliability_gates is None:
-            return sum(item_outputs[modality] for modality in self.modalities) / len(self.modalities)
-        weights = {
-            modality: reliability_gates[modality].to(dtype=item_outputs[modality].dtype)
-            for modality in self.modalities
-        }
-        denom = torch.stack([weights[modality] for modality in self.modalities], dim=0).sum(dim=0)
-        denom = denom.clamp_min(1e-8)
-        weights = {modality: weights[modality] / denom for modality in self.modalities}
-        for modality in self.modalities:
-            self.latest_completion_gate_metrics[f"completion_gate_{modality}_fusion_weight_mean"] = float(
-                weights[modality].detach().mean().cpu()
-            )
-        return sum(weights[modality] * item_outputs[modality] for modality in self.modalities)
+    def _uses_posterior_reliability_for(self, component):
+        if not self.use_posterior_reliability:
+            return False
+        return self.posterior_reliability_scope == "both" or self.posterior_reliability_scope == component
 
-    def _fuse_item_sources(
-        self,
-        item_outputs,
-        modal_features=None,
-        raw_features=None,
-        observed_masks=None,
-        reliability_gates=None,
-    ):
+    def _fuse_item_sources(self, item_outputs, modal_features=None, raw_features=None, observed_masks=None):
         if self.use_global_weighted_fusion:
             return self._global_weighted_item_source(item_outputs)
 
-        if self.use_reliability_weighted_fusion:
-            return self._reliability_weighted_item_source(
-                item_outputs,
-                reliability_gates=reliability_gates,
+        if self._uses_posterior_reliability_for("fusion"):
+            if observed_masks is None:
+                if raw_features is None:
+                    raise ValueError(
+                        "posterior_reliability fusion requires observed_masks or raw_features"
+                    )
+                observed_masks = self._missing_masks(raw_features=raw_features)
+            reliabilities = self._posterior_completion_reliabilities(observed_masks)
+            denominator = torch.stack(
+                [reliabilities[modality] for modality in self.modalities],
+                dim=0,
+            ).sum(dim=0).clamp_min(1e-8)
+            return sum(
+                item_outputs[modality]
+                * (reliabilities[modality] / denominator).unsqueeze(1)
+                for modality in self.modalities
             )
-
-        if self.use_missing_weighted_fusion:
-            weights = self._missing_weighted_item_fusion_weights(
-                item_outputs,
-                raw_features=raw_features,
-                observed_masks=observed_masks,
-            )
-            if weights is not None:
-                return sum(weights[modality] * item_outputs[modality] for modality in self.modalities)
 
         return sum(item_outputs[modality] for modality in self.modalities) / len(self.modalities)
 
@@ -2698,60 +2985,56 @@ class MILK_model(torch.nn.Module):
             getattr(self.env.args, "completion_gate_mix_max", 1.0)
         )
 
-    def _missing_aware_gate_stats(self, modality, raw_features, masks, completed_shared, decoded_raw=None):
-        observed = masks[modality].float().unsqueeze(1)
-        completed = completed_shared[modality]
-        completed_norm = completed.norm(dim=1, keepdim=True)
-
-        if decoded_raw is None:
-            decoded_raw = self.decode_completed_to_raw(completed_shared)
-        decoded = decoded_raw[modality]
-        raw = raw_features[modality]
-        decoded_norm = decoded.norm(dim=1, keepdim=True)
-
-        recon_mse = torch.mean((decoded - raw) ** 2, dim=1, keepdim=True)
-        recon_cos = F.cosine_similarity(decoded, raw, dim=1, eps=1e-8).unsqueeze(1)
-        recon_mse = torch.where(masks[modality].unsqueeze(1), recon_mse, torch.zeros_like(recon_mse))
-        recon_cos = torch.where(masks[modality].unsqueeze(1), recon_cos, torch.zeros_like(recon_cos))
-
-        graph = self.ItemItemGraph
-        if graph is not None:
-            neigh = torch.sparse.mm(graph, completed)
-            neigh = F.normalize(neigh, dim=1)
-            neighbor_cos = F.cosine_similarity(
-                F.normalize(completed, dim=1),
-                neigh,
-                dim=1,
-                eps=1e-8,
-            ).unsqueeze(1)
-        else:
-            neighbor_cos = torch.zeros_like(observed)
-
-        if self.completion_gate_stats_norm:
-            completed_norm = torch.log1p(completed_norm).clamp(max=5.0) / 5.0
-            decoded_norm = torch.log1p(decoded_norm).clamp(max=5.0) / 5.0
-            recon_mse = torch.log1p(recon_mse).clamp(max=5.0) / 5.0
-            recon_cos = (recon_cos + 1.0) * 0.5
-            neighbor_cos = (neighbor_cos + 1.0) * 0.5
-
-        stats = torch.cat(
-            [
-                observed,
-                completed_norm,
-                decoded_norm,
-                recon_mse,
-                recon_cos,
-                neighbor_cos,
-            ],
-            dim=1,
-        )
-        return torch.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
-
     def get_recommender_modal_features(self, raw_features=None, allow_imputer_grad=False):
         item_ids = None
         if raw_features is None:
             item_ids = torch.arange(self.m_item, device=self.env.device)
         raw_features = raw_features or self._current_raw_modal_features()
+
+        if self.use_latent_direct_bridge:
+            projected = self.project_features(raw_features=raw_features)
+            if self.disable_imputation:
+                return projected
+
+            masks = self._missing_masks(raw_features)
+            if all(mask.all() for mask in masks.values()):
+                return projected
+
+            return self._build_completed_features(
+                projected,
+                masks,
+                detach_imputed=not allow_imputer_grad,
+                item_ids=item_ids,
+            )
+
+        if self.use_decoupled_latent_bridge:
+            recommendation_projected = self.project_recommendation_features(raw_features=raw_features)
+            if self.disable_imputation:
+                return recommendation_projected
+
+            masks = self._missing_masks(raw_features)
+            if all(mask.all() for mask in masks.values()):
+                return recommendation_projected
+
+            completion_projected = self.project_features(raw_features=raw_features)
+            completed_shared = self._build_completed_features(
+                completion_projected,
+                masks,
+                detach_imputed=not allow_imputer_grad,
+                item_ids=item_ids,
+            )
+            adapted_completed = self.adapt_completed_to_recommendation(completed_shared)
+
+            modal_features = {}
+            for modality in self.modalities:
+                mask = masks[modality].unsqueeze(1)
+                modal_features[modality] = torch.where(
+                    mask,
+                    recommendation_projected[modality],
+                    adapted_completed[modality],
+                )
+            return modal_features
+
         modal_features = {modality: feature.clone() for modality, feature in raw_features.items()}
         if self.disable_imputation:
             return modal_features
@@ -2766,7 +3049,6 @@ class MILK_model(torch.nn.Module):
             masks,
             detach_imputed=not allow_imputer_grad,
             item_ids=item_ids,
-            stage=self.env.args.train_stage,
         )
         bridged_raw = self.bridge_completed_to_recommendation_raw(completed_shared)
 
@@ -2783,16 +3065,7 @@ class MILK_model(torch.nn.Module):
         }
         self.latest_completion_gate_metrics = {}
         self.latest_completion_gate_regularizer = torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_supervision_loss = torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_counterfactual_loss = torch.zeros((), device=self.env.device)
-        self.latest_reliability_gates = None
-        self.latest_completion_gate_masks = None
-        self.latest_completion_gate_stats = None
-        external_completed_masks = (
-            self.disable_imputation
-            and self.modal_feature_mask_source == "external_observed"
-        )
-        if not self.use_completion_gate or (self.disable_imputation and not external_completed_masks):
+        if not self.use_completion_gate or self.disable_imputation:
             return ones
 
         raw_features = raw_features or self._current_raw_modal_features()
@@ -2801,23 +3074,10 @@ class MILK_model(torch.nn.Module):
             return ones
 
         projected = self.project_features(raw_features=raw_features)
-        if external_completed_masks:
-            completed_shared = projected
-        else:
-            item_ids = None
-            if raw_features is None:
-                item_ids = torch.arange(self.m_item, device=self.env.device)
-            completed_shared = self._build_completed_features(
-                projected,
-                masks,
-                item_ids=item_ids,
-                stage=self.env.args.train_stage,
-            )
-        decoded_raw_for_gate = (
-            self.decode_completed_to_raw(completed_shared)
-            if self.use_missing_aware_reliability_gate and not external_completed_masks
-            else None
-        )
+        item_ids = None
+        if raw_features is None:
+            item_ids = torch.arange(self.m_item, device=self.env.device)
+        completed_shared = self._build_completed_features(projected, masks, item_ids=item_ids)
         pattern = torch.stack([masks[modality].float() for modality in self.modalities], dim=1)
         if self.completion_gate_item_context_source == "id_embedding":
             item_ids = torch.arange(self.m_item, device=self.env.device)
@@ -2841,7 +3101,6 @@ class MILK_model(torch.nn.Module):
         learned_gates = {}
         gate_logits = {}
         missing_masks = {}
-        gate_stats_by_modality = {}
         for modality in self.modalities:
             if self.completion_gate_mode == "alignment":
                 observed_modalities = [m for m in self.modalities if m != modality]
@@ -2888,18 +3147,6 @@ class MILK_model(torch.nn.Module):
                 if item_context is not None:
                     gate_item_context = item_context.detach() if self.completion_gate_detach_inputs else item_context
                     gate_inputs.append(gate_item_context)
-                if self.use_missing_aware_reliability_gate:
-                    gate_stats = self._missing_aware_gate_stats(
-                        modality,
-                        raw_features,
-                        masks,
-                        completed_shared,
-                        decoded_raw=decoded_raw_for_gate,
-                    )
-                    gate_stats_by_modality[modality] = gate_stats
-                    if self.completion_gate_detach_inputs:
-                        gate_stats = gate_stats.detach()
-                    gate_inputs.append(gate_stats)
                 gate_inputs.append(gate_pattern)
                 gate_input = torch.cat(gate_inputs, dim=1)
                 gate_logit = self.completion_gates[modality](gate_input)
@@ -3024,10 +3271,6 @@ class MILK_model(torch.nn.Module):
                 self.use_all_modal_rank_residual_completion_gate
                 or self.use_softmax_rank_residual_completion_gate
                 or self.use_centered_all_modal_rank_residual_completion_gate
-                or (
-                    self.use_missing_aware_reliability_gate
-                    and self.completion_gate_apply_observed
-                )
             ):
                 gate = learned_gate
             else:
@@ -3039,7 +3282,6 @@ class MILK_model(torch.nn.Module):
                 self.use_all_modal_rank_residual_completion_gate
                 or self.use_softmax_rank_residual_completion_gate
                 or self.use_centered_all_modal_rank_residual_completion_gate
-                or self.use_missing_aware_reliability_gate
             ):
                 identity_regularizers.append(torch.mean((gate - 1.0) ** 2))
                 missing_gate_means.append(gate.mean())
@@ -3143,192 +3385,7 @@ class MILK_model(torch.nn.Module):
                 self.latest_completion_gate_regularizer.detach().cpu()
             )
         self.latest_completion_gate_metrics = metrics
-        self.latest_reliability_gates = gates
-        self.latest_completion_gate_masks = masks
-        self.latest_completion_gate_stats = gate_stats_by_modality
         return gates
-
-    def completion_gate_supervision_loss(self):
-        if not self.use_missing_aware_reliability_gate:
-            return torch.zeros((), device=self.env.device)
-        if (
-            self.latest_reliability_gates is None
-            or self.latest_completion_gate_masks is None
-            or self.latest_completion_gate_stats is None
-        ):
-            return torch.zeros((), device=self.env.device)
-
-        observed_target_value = float(
-            getattr(self.env.args, "completion_gate_supervision_observed_target", 1.0)
-        )
-        losses = []
-        for modality in self.modalities:
-            gate = self.latest_reliability_gates.get(modality)
-            stats = self.latest_completion_gate_stats.get(modality)
-            observed_mask = self.latest_completion_gate_masks.get(modality)
-            if gate is None or stats is None or observed_mask is None:
-                continue
-
-            observed = observed_mask.float().unsqueeze(1)
-            observed_target = torch.full_like(gate, observed_target_value)
-            # stats columns: observed, completed_norm, decoded_norm, recon_mse,
-            # recon_cos, neighbor_cos. For true-missing items the reconstruction
-            # target is unavailable, so use graph-neighbor consistency as the
-            # reliability soft target.
-            neighbor_score = stats[:, 5:6]
-            if not self.completion_gate_stats_norm:
-                neighbor_score = (neighbor_score + 1.0) * 0.5
-            neighbor_score = neighbor_score.detach().clamp(0.0, 1.0)
-            missing_target = (
-                self.completion_gate_floor
-                + (1.0 - self.completion_gate_floor) * neighbor_score
-            )
-            target = observed * observed_target + (1.0 - observed) * missing_target
-            losses.append(torch.mean((gate - target.detach()) ** 2))
-
-        if not losses:
-            return torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_supervision_loss = torch.stack(losses).mean()
-        self.latest_completion_gate_metrics["completion_gate_supervision_loss"] = float(
-            self.latest_completion_gate_supervision_loss.detach().cpu()
-        )
-        return self.latest_completion_gate_supervision_loss
-
-    def _missing_aware_gate_stats_local(self, modality, raw_features, masks, completed_shared, decoded_raw):
-        observed = masks[modality].float().unsqueeze(1)
-        completed = completed_shared[modality]
-        decoded = decoded_raw[modality]
-        raw = raw_features[modality]
-        completed_norm = completed.norm(dim=1, keepdim=True)
-        decoded_norm = decoded.norm(dim=1, keepdim=True)
-        recon_mse = torch.mean((decoded - raw) ** 2, dim=1, keepdim=True)
-        recon_cos = F.cosine_similarity(decoded, raw, dim=1, eps=1e-8).unsqueeze(1)
-        # No full item graph is available for mini-batch pseudo missing; use a
-        # neutral neighbor-consistency input so the decoder quality drives this
-        # auxiliary target.
-        neighbor_cos = torch.zeros_like(observed)
-
-        if self.completion_gate_stats_norm:
-            completed_norm = torch.log1p(completed_norm).clamp(max=5.0) / 5.0
-            decoded_norm = torch.log1p(decoded_norm).clamp(max=5.0) / 5.0
-            recon_mse = torch.log1p(recon_mse).clamp(max=5.0) / 5.0
-            recon_cos = (recon_cos + 1.0) * 0.5
-            neighbor_cos = torch.full_like(neighbor_cos, 0.5)
-
-        stats = torch.cat(
-            [
-                observed,
-                completed_norm,
-                decoded_norm,
-                recon_mse,
-                recon_cos,
-                neighbor_cos,
-            ],
-            dim=1,
-        )
-        return torch.nan_to_num(stats, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def completion_gate_counterfactual_loss(self, item_ids):
-        if not self.use_missing_aware_reliability_gate:
-            return torch.zeros((), device=self.env.device)
-        ratio = float(getattr(self.env.args, "completion_gate_counterfactual_ratio", 0.5))
-        if ratio <= 0.0:
-            return torch.zeros((), device=self.env.device)
-
-        item_ids = torch.unique(item_ids)
-        if item_ids.numel() == 0:
-            return torch.zeros((), device=self.env.device)
-
-        full_raw = self._current_raw_modal_features(full=True)
-        raw_batch = {modality: full_raw[modality][item_ids] for modality in self.modalities}
-        masks = self._missing_masks(raw_features=raw_batch)
-        pseudo_masks, pseudo_selected = self._sample_pseudo_missing_masks(masks, ratio=ratio)
-        if pseudo_masks is None or pseudo_selected is None:
-            return torch.zeros((), device=self.env.device)
-
-        projected = self.project_features(item_ids=item_ids, raw_features=full_raw)
-        completed = self._build_completed_features(
-            projected,
-            pseudo_masks,
-            item_ids=item_ids,
-            stage=self.env.args.train_stage,
-        )
-        decoded_raw = self.decode_completed_to_raw(completed)
-        pattern = torch.stack([pseudo_masks[modality].float() for modality in self.modalities], dim=1)
-
-        if self.completion_gate_item_context_source == "id_embedding":
-            item_context = self.item_emb(item_ids)
-        elif self.completion_gate_item_context_source == "shared_mean":
-            item_context = torch.stack(
-                [
-                    torch.where(pseudo_masks[modality].unsqueeze(1), projected[modality], completed[modality])
-                    for modality in self.modalities
-                ],
-                dim=0,
-            ).mean(dim=0)
-        else:
-            item_context = None
-
-        mse_temp = max(float(getattr(self.env.args, "completion_gate_counterfactual_mse_temp", 0.1)), 1e-6)
-        losses = []
-        target_values = []
-        gate_values = []
-        for modality in self.modalities:
-            selected = pseudo_selected[modality]
-            if not selected.any():
-                continue
-
-            gate_source = completed[modality]
-            gate_stats = self._missing_aware_gate_stats_local(
-                modality,
-                raw_batch,
-                pseudo_masks,
-                completed,
-                decoded_raw,
-            )
-            if self.completion_gate_detach_inputs:
-                gate_source = gate_source.detach()
-                gate_pattern = pattern.detach()
-                gate_stats = gate_stats.detach()
-                gate_item_context = item_context.detach() if item_context is not None else None
-            else:
-                gate_pattern = pattern
-                gate_item_context = item_context
-
-            gate_inputs = [gate_source]
-            if gate_item_context is not None:
-                gate_inputs.append(gate_item_context)
-            gate_inputs.extend([gate_stats, gate_pattern])
-            gate = torch.sigmoid(self.completion_gates[modality](torch.cat(gate_inputs, dim=1)))
-            gate = self.completion_gate_floor + (1.0 - self.completion_gate_floor) * gate
-
-            decoded = decoded_raw[modality][selected]
-            raw = raw_batch[modality][selected]
-            cos01 = (F.cosine_similarity(decoded, raw, dim=1, eps=1e-8).unsqueeze(1) + 1.0) * 0.5
-            mse = torch.mean((decoded - raw) ** 2, dim=1, keepdim=True)
-            mse_quality = torch.exp(-mse / mse_temp)
-            quality = (0.5 * cos01 + 0.5 * mse_quality).detach().clamp(0.0, 1.0)
-            target = self.completion_gate_floor + (1.0 - self.completion_gate_floor) * quality
-
-            selected_gate = gate[selected]
-            losses.append(torch.mean((selected_gate - target) ** 2))
-            target_values.append(target.mean())
-            gate_values.append(selected_gate.mean())
-
-        if not losses:
-            return torch.zeros((), device=self.env.device)
-
-        self.latest_completion_gate_counterfactual_loss = torch.stack(losses).mean()
-        self.latest_completion_gate_metrics["completion_gate_counterfactual_loss"] = float(
-            self.latest_completion_gate_counterfactual_loss.detach().cpu()
-        )
-        self.latest_completion_gate_metrics["completion_gate_counterfactual_target_mean"] = float(
-            torch.stack(target_values).mean().detach().cpu()
-        )
-        self.latest_completion_gate_metrics["completion_gate_counterfactual_gate_mean"] = float(
-            torch.stack(gate_values).mean().detach().cpu()
-        )
-        return self.latest_completion_gate_counterfactual_loss
 
     def completion_gate_regularization_loss(self):
         if not self.use_completion_gate:
@@ -3344,37 +3401,23 @@ class MILK_model(torch.nn.Module):
         )
         reliability_gates = self._completion_reliability_gates(raw_features=raw_features)
         observed_masks = self._missing_masks(raw_features=raw_features)
-        v_user_emb, v_item_emb = self.v_gcn(
-            modal_features["v"],
-            user_id_emb,
-            skip_mlp=False,
-        )
-        t_user_emb, t_item_emb = self.t_gcn(
-            modal_features["t"],
-            user_id_emb,
-            skip_mlp=False,
-        )
-        v_item_emb = self._apply_item_graph_modal_residual(v_item_emb, observed_masks["v"], modality="v")
-        t_item_emb = self._apply_item_graph_modal_residual(t_item_emb, observed_masks["t"], modality="t")
-        ungated_item_outputs = {"v": v_item_emb, "t": t_item_emb}
-        if not self.use_rum_fusion and not self.use_reliability_weighted_fusion:
-            v_item_emb = v_item_emb * reliability_gates["v"]
-            t_item_emb = t_item_emb * reliability_gates["t"]
-        user_outputs = {"v": v_user_emb, "t": t_user_emb}
-        item_outputs = {"v": v_item_emb, "t": t_item_emb}
-
-        if "a" in self.modalities:
-            a_user_emb, a_item_emb = self.a_gcn(
-                modal_features["a"],
+        user_outputs = {}
+        item_outputs = {}
+        ungated_item_outputs = {}
+        for modality in self.modalities:
+            modal_user_emb, modal_item_emb = getattr(self, f"{modality}_gcn")(
+                modal_features[modality],
                 user_id_emb,
-                skip_mlp=False,
+                skip_mlp=self._gcn_skip_mlp(),
             )
-            a_item_emb = self._apply_item_graph_modal_residual(a_item_emb, observed_masks["a"], modality="a")
-            ungated_item_outputs["a"] = a_item_emb
-            if not self.use_rum_fusion and not self.use_reliability_weighted_fusion:
-                a_item_emb = a_item_emb * reliability_gates["a"]
-            user_outputs["a"] = a_user_emb
-            item_outputs["a"] = a_item_emb
+            modal_item_emb = self._apply_item_graph_modal_residual(
+                modal_item_emb, observed_masks[modality], modality=modality
+            )
+            ungated_item_outputs[modality] = modal_item_emb
+            if not self.use_rum_fusion:
+                modal_item_emb = modal_item_emb * reliability_gates[modality]
+            user_outputs[modality] = modal_user_emb
+            item_outputs[modality] = modal_item_emb
 
         if self.use_rank_residual_completion_gate and not self.use_rum_fusion and not allow_modal_grad:
             ungated_item_outputs = {
@@ -3406,7 +3449,6 @@ class MILK_model(torch.nn.Module):
                 item_outputs,
                 modal_features=modal_features,
                 raw_features=raw_features,
-                reliability_gates=reliability_gates,
             )
 
         if not allow_modal_grad and not (self.use_rank_residual_completion_gate and not self.use_rum_fusion):
@@ -3429,19 +3471,81 @@ class MILK_model(torch.nn.Module):
         zero = torch.zeros((), device=self.env.device)
         return zero, zero
 
+    def compute_adapter_alignment_loss(self, item_ids, pseudo_ratio=1.0):
+        """Align decoupled completed representations to the recommendation space.
+
+        The target modality is pseudo-masked only when it is observed in the
+        current training mask and at least one other modality remains observed.
+        This keeps the loss within train-visible modalities and avoids using
+        hidden raw features for truly missing train items.
+        """
+        zero = torch.zeros((), device=self.env.device)
+        if (
+            not self.use_decoupled_latent_bridge
+            or self.disable_imputation
+            or item_ids is None
+            or item_ids.numel() == 0
+        ):
+            return zero
+
+        item_ids = torch.unique(item_ids.detach()).long()
+        item_ids = item_ids[(item_ids >= 0) & (item_ids < self.m_item)]
+        if item_ids.numel() == 0:
+            return zero
+
+        raw_features = self._current_raw_modal_features()
+        raw_batch = {modality: raw_features[modality][item_ids] for modality in self.modalities}
+        masks = self._missing_masks(raw_features=raw_batch)
+        if len(self.modalities) < 2:
+            return zero
+
+        completion_projected = self.project_features(raw_features=raw_batch)
+        recommendation_projected = self.project_recommendation_features(raw_features=raw_batch)
+        ratio = min(max(float(pseudo_ratio), 0.0), 1.0)
+        losses = []
+
+        for target_modality in self.modalities:
+            eligible = masks[target_modality].clone()
+            has_other_observed = torch.zeros_like(eligible)
+            for source_modality in self.modalities:
+                if source_modality == target_modality:
+                    continue
+                has_other_observed = has_other_observed | masks[source_modality]
+            eligible = eligible & has_other_observed
+            if ratio < 1.0:
+                eligible = eligible & (torch.rand_like(eligible.float()) < ratio)
+            if not eligible.any():
+                continue
+
+            pseudo_masks = {modality: mask.clone() for modality, mask in masks.items()}
+            pseudo_masks[target_modality][eligible] = False
+            completed = self._build_completed_features(
+                completion_projected,
+                pseudo_masks,
+                detach_imputed=True,
+            )
+            adapted = self.adapt_completed_to_recommendation(completed)[target_modality][eligible]
+            target = recommendation_projected[target_modality][eligible].detach()
+            losses.append(1.0 - F.cosine_similarity(adapted, target, dim=-1).mean())
+
+        if not losses:
+            return zero
+        return torch.stack(losses).mean()
+
     def _recommendation_frontend_item_embeddings(self, raw_features, item_ids, allow_modal_grad=False):
         modal_features = self.get_recommender_modal_features(
             raw_features=raw_features,
             allow_imputer_grad=allow_modal_grad,
         )
         item_outputs = {}
-        modal_gcns = {"v": self.v_gcn, "t": self.t_gcn}
-        if "a" in self.modalities:
-            modal_gcns["a"] = self.a_gcn
+        modal_gcns = {
+            modality: getattr(self, f"{modality}_gcn")
+            for modality in self.modalities
+        }
         observed_masks = self._missing_masks(raw_features)
         for modality in self.modalities:
             features = modal_features[modality][item_ids]
-            item_output = modal_gcns[modality].MLP(features)
+            item_output = features if self._gcn_skip_mlp() else modal_gcns[modality].MLP(features)
             item_outputs[modality] = F.normalize(
                 torch.nan_to_num(item_output, nan=0.0, posinf=0.0, neginf=0.0),
                 dim=-1,
@@ -3457,23 +3561,61 @@ class MILK_model(torch.nn.Module):
         )
         return torch.nan_to_num(self._apply_fusion(item_source, deterministic=True), nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _recommendation_gcn_modality_item_embeddings(self, raw_features=None, allow_modal_grad=False):
+    def _recommendation_gcn_modality_item_embeddings(
+        self,
+        raw_features=None,
+        allow_modal_grad=False,
+        apply_item_graph=False,
+    ):
         raw_features = raw_features or self._current_raw_modal_features()
         modal_features = self.get_recommender_modal_features(
             raw_features=raw_features,
             allow_imputer_grad=allow_modal_grad,
         )
         user_id_emb = self.user_emb.weight
-        modal_gcns = {"v": self.v_gcn, "t": self.t_gcn}
-        if "a" in self.modalities:
-            modal_gcns["a"] = self.a_gcn
+        modal_gcns = {
+            modality: getattr(self, f"{modality}_gcn")
+            for modality in self.modalities
+        }
 
         item_outputs = {}
+        observed_masks = self._missing_masks(raw_features)
         for modality in self.modalities:
             _, item_emb = modal_gcns[modality](
                 modal_features[modality],
                 user_id_emb,
-                skip_mlp=False,
+                skip_mlp=self._gcn_skip_mlp(),
+            )
+            if apply_item_graph:
+                item_emb = self._apply_item_graph_modal_residual(
+                    item_emb,
+                    observed_mask=observed_masks[modality],
+                    modality=modality,
+                )
+            item_outputs[modality] = F.normalize(
+                torch.nan_to_num(item_emb, nan=0.0, posinf=0.0, neginf=0.0),
+                dim=-1,
+            )
+        return item_outputs
+
+    def _recommendation_frontend_modality_item_embeddings(
+        self,
+        raw_features=None,
+        allow_modal_grad=False,
+    ):
+        """Modality item representations before any graph propagation."""
+        raw_features = raw_features or self._current_raw_modal_features()
+        modal_features = self.get_recommender_modal_features(
+            raw_features=raw_features,
+            allow_imputer_grad=allow_modal_grad,
+        )
+        item_outputs = {}
+        for modality in self.modalities:
+            modal_gcn = getattr(self, f"{modality}_gcn")
+            item_emb = (
+                modal_features[modality]
+                if self._gcn_skip_mlp()
+                else modal_gcn.MLP(modal_features[modality])
             )
             item_outputs[modality] = F.normalize(
                 torch.nan_to_num(item_emb, nan=0.0, posinf=0.0, neginf=0.0),
@@ -3484,8 +3626,10 @@ class MILK_model(torch.nn.Module):
     def compute_true_missing_gcn_infonce_loss(
         self,
         item_ids,
+        user_ids=None,
         temperature=0.2,
         bank_size=256,
+        user_bank_size=256,
         allow_modal_grad=False,
     ):
         """InfoNCE for real missing modalities after modality-specific GCNs.
@@ -3495,8 +3639,7 @@ class MILK_model(torch.nn.Module):
         Negatives: other items whose same modality is observed.
         """
         zero = torch.zeros((), device=self.env.device)
-        external_completed_masks = self.modal_feature_mask_source == "external_observed"
-        if (self.disable_imputation and not external_completed_masks) or item_ids is None or item_ids.numel() == 0:
+        if self.disable_imputation or item_ids is None or item_ids.numel() == 0:
             return zero
 
         raw_features = self._current_raw_modal_features()
@@ -3506,22 +3649,111 @@ class MILK_model(torch.nn.Module):
         if item_ids.numel() < 2:
             return zero
 
+        objective = getattr(self.env.args, "rec_neighbor_cl_objective", "infonce")
         max_bank_size = int(bank_size or 0)
         bank_ids = item_ids
-        if max_bank_size > 0 and bank_ids.numel() > max_bank_size:
+        if (
+            objective != "positive_cosine"
+            and max_bank_size > 0
+            and bank_ids.numel() > max_bank_size
+        ):
             perm = torch.randperm(bank_ids.numel(), device=self.env.device)[:max_bank_size]
             bank_ids = bank_ids[perm]
         if bank_ids.numel() < 2:
             return zero
 
-        gcn_item_outputs = self._recommendation_gcn_modality_item_embeddings(
-            raw_features=raw_features,
-            allow_modal_grad=allow_modal_grad,
+        similarity_space = getattr(
+            self.env.args,
+            "rec_neighbor_cl_similarity_space",
+            "embedding",
         )
+        user_basis = None
+        if similarity_space == "user_preference":
+            if user_ids is None or user_ids.numel() == 0:
+                return zero
+            profile_user_ids = torch.unique(user_ids.detach()).long()
+            profile_user_ids = profile_user_ids[
+                (profile_user_ids >= 0) & (profile_user_ids < self.n_user)
+            ]
+            max_user_bank_size = int(user_bank_size or 0)
+            if (
+                max_user_bank_size > 0
+                and profile_user_ids.numel() > max_user_bank_size
+            ):
+                perm = torch.randperm(
+                    profile_user_ids.numel(),
+                    device=self.env.device,
+                )[:max_user_bank_size]
+                profile_user_ids = profile_user_ids[perm]
+            if profile_user_ids.numel() < 2:
+                return zero
+            user_basis = F.normalize(
+                self.user_emb.weight[profile_user_ids].detach(),
+                dim=-1,
+            )
+        elif similarity_space != "embedding":
+            raise ValueError(
+                f"Unsupported rec_neighbor_cl_similarity_space: {similarity_space}"
+            )
+
+        def to_contrast_space(item_embeddings):
+            if user_basis is not None:
+                item_embeddings = torch.matmul(
+                    item_embeddings,
+                    user_basis.transpose(0, 1),
+                )
+            return F.normalize(
+                torch.nan_to_num(
+                    item_embeddings,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ),
+                dim=-1,
+            )
+
+        cl_stage = getattr(self.env.args, "rec_neighbor_cl_stage", "gcn")
+        if cl_stage == "frontend":
+            gcn_item_outputs = self._recommendation_frontend_modality_item_embeddings(
+                raw_features=raw_features,
+                allow_modal_grad=allow_modal_grad,
+            )
+        else:
+            gcn_item_outputs = self._recommendation_gcn_modality_item_embeddings(
+                raw_features=raw_features,
+                allow_modal_grad=allow_modal_grad,
+                apply_item_graph=(cl_stage == "post_item_graph"),
+            )
         temp = max(float(temperature), 1e-6)
         losses = []
+        loss_weights = []
         modality_count = len(self.modalities)
-
+        anchor_weighting = getattr(
+            self.env.args,
+            "rec_neighbor_cl_anchor_weighting",
+            "uniform",
+        )
+        reliabilities = None
+        if anchor_weighting == "posterior_reliability":
+            reliabilities = self._posterior_completion_reliabilities(masks)
+        false_negative_threshold = float(
+            getattr(self.env.args, "rec_neighbor_cl_false_negative_threshold", 1.1)
+        )
+        positive_source = getattr(
+            self.env.args,
+            "rec_neighbor_cl_positive_source",
+            "cross_modal",
+        )
+        negative_source = getattr(
+            self.env.args,
+            "rec_neighbor_cl_negative_source",
+            "same_modal",
+        )
+        if positive_source != "cross_modal" and negative_source == "cross_modal":
+            raise ValueError(
+                "rec_neighbor_cl_negative_source=cross_modal requires "
+                "rec_neighbor_cl_positive_source=cross_modal"
+            )
         for modality in self.modalities:
             anchor_mask = ~masks[modality][item_ids]
             if modality_count > 1:
@@ -3535,37 +3767,121 @@ class MILK_model(torch.nn.Module):
             if anchor_ids.numel() == 0:
                 continue
 
-            negative_ids = bank_ids[masks[modality][bank_ids]]
-            if negative_ids.numel() == 0:
-                continue
-
-            anchor_emb = gcn_item_outputs[modality][anchor_ids]
-            positive_parts = []
-            positive_weights = []
-            for observed_modality in self.modalities:
-                if observed_modality == modality:
+            if positive_source == "cf_neighbor":
+                cf_graph = self.ItemItemGraphs.get("cf")
+                if cf_graph is None:
+                    raise RuntimeError(
+                        "rec_neighbor_cl_positive_source=cf_neighbor requires "
+                        "ItemItemGraphs['cf']"
+                    )
+                observed = masks[modality].to(gcn_item_outputs[modality].dtype).unsqueeze(1)
+                positive_sum_all = torch.sparse.mm(
+                    cf_graph,
+                    gcn_item_outputs[modality] * observed,
+                )
+                positive_weight_all = torch.sparse.mm(cf_graph, observed)
+                has_positive = positive_weight_all[anchor_ids, 0] > 0
+                anchor_ids = anchor_ids[has_positive]
+                if anchor_ids.numel() == 0:
                     continue
-                observed_mask = masks[observed_modality][anchor_ids].float().unsqueeze(1)
-                positive_parts.append(gcn_item_outputs[observed_modality][anchor_ids] * observed_mask)
-                positive_weights.append(observed_mask)
-            if not positive_parts:
-                continue
-            positive_sum = torch.stack(positive_parts, dim=0).sum(dim=0)
-            positive_count = torch.stack(positive_weights, dim=0).sum(dim=0).clamp_min(1.0)
-            positive_emb = F.normalize(positive_sum / positive_count, dim=-1)
-            negative_emb = gcn_item_outputs[modality][negative_ids].detach()
+                positive_emb = F.normalize(
+                    positive_sum_all[anchor_ids]
+                    / positive_weight_all[anchor_ids].clamp_min(1e-8),
+                    dim=-1,
+                )
+                positive_emb = to_contrast_space(positive_emb)
+            else:
+                positive_parts = []
+                positive_weights = []
+                for observed_modality in self.modalities:
+                    if observed_modality == modality:
+                        continue
+                    observed_mask = masks[observed_modality][anchor_ids].float().unsqueeze(1)
+                    positive_parts.append(
+                        to_contrast_space(
+                            gcn_item_outputs[observed_modality][anchor_ids]
+                        )
+                        * observed_mask
+                    )
+                    positive_weights.append(observed_mask)
+                if not positive_parts:
+                    continue
+                positive_sum = torch.stack(positive_parts, dim=0).sum(dim=0)
+                positive_count = torch.stack(positive_weights, dim=0).sum(dim=0).clamp_min(1.0)
+                positive_emb = F.normalize(positive_sum / positive_count, dim=-1)
 
-            pos_logits = (anchor_emb * positive_emb.detach()).sum(dim=1, keepdim=True) / temp
-            neg_logits = torch.matmul(anchor_emb, negative_emb.transpose(0, 1)) / temp
-            same_item = anchor_ids.unsqueeze(1).eq(negative_ids.unsqueeze(0))
-            neg_logits = neg_logits.masked_fill(same_item, -1e9)
-            logits = torch.cat([pos_logits, neg_logits], dim=1)
-            targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.env.device)
-            losses.append(F.cross_entropy(logits, targets))
+            anchor_emb = to_contrast_space(gcn_item_outputs[modality][anchor_ids])
+            positive_target = positive_emb.detach()
+
+            if objective == "positive_cosine":
+                per_anchor_loss = 1.0 - (anchor_emb * positive_target).sum(dim=1)
+            else:
+                if negative_source == "cross_modal":
+                    negative_parts = []
+                    negative_weights = []
+                    for observed_modality in self.modalities:
+                        if observed_modality == modality:
+                            continue
+                        observed_mask = masks[observed_modality][bank_ids].float().unsqueeze(1)
+                        negative_parts.append(
+                            to_contrast_space(
+                                gcn_item_outputs[observed_modality][bank_ids]
+                            )
+                            * observed_mask
+                        )
+                        negative_weights.append(observed_mask)
+                    if not negative_parts:
+                        continue
+                    negative_sum = torch.stack(negative_parts, dim=0).sum(dim=0)
+                    negative_count = torch.stack(negative_weights, dim=0).sum(dim=0)
+                    valid_negative = negative_count[:, 0] > 0
+                    negative_ids = bank_ids[valid_negative]
+                    if negative_ids.numel() == 0:
+                        continue
+                    negative_emb = F.normalize(
+                        negative_sum[valid_negative]
+                        / negative_count[valid_negative].clamp_min(1.0),
+                        dim=-1,
+                    )
+                else:
+                    negative_ids = bank_ids[masks[modality][bank_ids]]
+                    if negative_ids.numel() == 0:
+                        continue
+                    negative_emb = to_contrast_space(
+                        gcn_item_outputs[modality][negative_ids]
+                    )
+                negative_target = negative_emb.detach()
+                pos_logits = (anchor_emb * positive_target).sum(dim=1, keepdim=True) / temp
+                neg_logits = torch.matmul(anchor_emb, negative_target.transpose(0, 1)) / temp
+                same_item = anchor_ids.unsqueeze(1).eq(negative_ids.unsqueeze(0))
+                neg_logits = neg_logits.masked_fill(same_item, -1e9)
+                if false_negative_threshold <= 1.0:
+                    teacher_negative_similarity = torch.matmul(
+                        positive_target.detach(),
+                        negative_target.detach().transpose(0, 1),
+                    )
+                    false_negatives = teacher_negative_similarity >= false_negative_threshold
+                    neg_logits = neg_logits.masked_fill(false_negatives, -1e9)
+                logits = torch.cat([pos_logits, neg_logits], dim=1)
+                targets = torch.zeros(logits.size(0), dtype=torch.long, device=self.env.device)
+                per_anchor_loss = F.cross_entropy(logits, targets, reduction="none")
+
+            if reliabilities is None:
+                anchor_weights = torch.ones_like(per_anchor_loss)
+            else:
+                anchor_weights = reliabilities[modality][anchor_ids].to(per_anchor_loss.dtype)
+            anchor_weight_sum = anchor_weights.sum().clamp_min(1e-8)
+            losses.append((per_anchor_loss * anchor_weights).sum() / anchor_weight_sum)
+            if reliabilities is None:
+                loss_weights.append(torch.ones((), device=self.env.device))
+            else:
+                loss_weights.append(anchor_weights.mean().clamp_min(1e-8))
 
         if not losses:
             return zero
-        return torch.stack(losses).mean()
+        stacked_losses = torch.stack(losses)
+        stacked_weights = torch.stack(loss_weights)
+        return (stacked_losses * stacked_weights).sum() / stacked_weights.sum().clamp_min(1e-8)
 
     @torch.no_grad()
     def compute_imputation_representation_metrics(self, split="test", include_random_baseline=True):
@@ -3580,8 +3896,6 @@ class MILK_model(torch.nn.Module):
             missing_projected,
             missing_masks,
             item_ids=torch.arange(missing_projected[self.modalities[0]].size(0), device=self.env.device),
-            smore_split=split,
-            stage=self.env.args.train_stage,
         )
 
         results = {}
@@ -3664,8 +3978,6 @@ class MILK_model(torch.nn.Module):
             missing_projected,
             missing_masks,
             item_ids=torch.arange(missing_projected[self.modalities[0]].size(0), device=self.env.device),
-            smore_split=split,
-            stage=self.env.args.train_stage,
         )
         decoded_missing = self.decode_completed_to_raw(completed_missing)
 
@@ -3683,7 +3995,11 @@ class MILK_model(torch.nn.Module):
                 continue
 
             decoded = decoded_missing[modality][modality_items]
-            real_raw = full_raw[modality][modality_items]
+            real_raw = self._decoder_target(
+                modality,
+                full_raw[modality][modality_items],
+                item_ids=modality_items,
+            )
 
             mse_value = F.mse_loss(decoded, real_raw, reduction="mean").item()
             cosine_value = F.cosine_similarity(decoded, real_raw, dim=-1).mean().item()
@@ -3701,7 +4017,11 @@ class MILK_model(torch.nn.Module):
                     (modality_items.numel(),),
                     device=self.env.device,
                 )
-                random_raw = full_raw[modality][random_ids]
+                random_raw = self._decoder_target(
+                    modality,
+                    full_raw[modality][random_ids],
+                    item_ids=random_ids,
+                )
                 random_mse = F.mse_loss(random_raw, real_raw, reduction="mean").item()
                 random_cosine = F.cosine_similarity(random_raw, real_raw, dim=-1).mean().item()
                 metric["random_mse"] = float(random_mse)
@@ -3732,6 +4052,94 @@ class MILK_model(torch.nn.Module):
         return results
 
     @torch.no_grad()
+    def compute_pseudo_decode_metrics(self, split="train", include_random_baseline=True, ratio=0.3):
+        """Evaluate raw-space decoding without exposing truly missing raw targets."""
+        if not self.use_decode_head:
+            results = {"_overall": {"count": 0, "mse": 0.0, "cosine": 0.0}}
+            if include_random_baseline:
+                results["_overall"].update({"random_mse": 0.0, "random_cosine": 0.0})
+            return results
+
+        raw_features = self.get_split_raw_modal_features(split=split, full=False)
+        masks = self._missing_masks(raw_features=raw_features)
+        split_offset = {"train": 0, "val": 1, "test": 2, "imputation_val": 3}.get(split, 4)
+        generator = torch.Generator(device=self.env.device)
+        generator.manual_seed(int(getattr(self.env.args, "seed", 0)) + 104729 * (split_offset + 1))
+        pseudo_masks, pseudo_selected = self._sample_pseudo_missing_masks(
+            masks,
+            ratio=float(ratio),
+            generator=generator,
+        )
+        if pseudo_masks is None or pseudo_selected is None:
+            results = {"_overall": {"count": 0, "mse": 0.0, "cosine": 0.0}}
+            if include_random_baseline:
+                results["_overall"].update({"random_mse": 0.0, "random_cosine": 0.0})
+            return results
+
+        projected = self.project_features(raw_features=raw_features)
+        completed = self._build_completed_features(
+            projected,
+            pseudo_masks,
+            detach_imputed=True,
+        )
+        decoded = self.decode_completed_to_raw(completed)
+
+        results = {}
+        total_count = 0
+        weighted = {"mse": 0.0, "cosine": 0.0, "random_mse": 0.0, "random_cosine": 0.0}
+        for modality in self.modalities:
+            selected = pseudo_selected[modality]
+            count = int(selected.sum().item())
+            if count == 0:
+                continue
+            prediction = decoded[modality][selected]
+            selected_item_ids = torch.arange(
+                raw_features[modality].size(0), device=self.env.device
+            )[selected]
+            target = self._decoder_target(
+                modality,
+                raw_features[modality][selected],
+                item_ids=selected_item_ids,
+            )
+            mse_value = F.mse_loss(prediction, target, reduction="mean").item()
+            cosine_value = F.cosine_similarity(prediction, target, dim=-1).mean().item()
+            metric = {"count": count, "mse": float(mse_value), "cosine": float(cosine_value)}
+            weighted["mse"] += mse_value * count
+            weighted["cosine"] += cosine_value * count
+            if include_random_baseline:
+                random_ids = torch.randint(
+                    0,
+                    raw_features[modality].size(0),
+                    (count,),
+                    device=self.env.device,
+                    generator=generator,
+                )
+                random_target = self._decoder_target(
+                    modality,
+                    raw_features[modality][random_ids],
+                    item_ids=random_ids,
+                )
+                random_mse = F.mse_loss(random_target, target, reduction="mean").item()
+                random_cosine = F.cosine_similarity(random_target, target, dim=-1).mean().item()
+                metric.update({"random_mse": float(random_mse), "random_cosine": float(random_cosine)})
+                weighted["random_mse"] += random_mse * count
+                weighted["random_cosine"] += random_cosine * count
+            results[modality] = metric
+            total_count += count
+
+        results["_overall"] = {
+            "count": total_count,
+            "mse": float(weighted["mse"] / max(total_count, 1)),
+            "cosine": float(weighted["cosine"] / max(total_count, 1)),
+        }
+        if include_random_baseline:
+            results["_overall"].update({
+                "random_mse": float(weighted["random_mse"] / max(total_count, 1)),
+                "random_cosine": float(weighted["random_cosine"] / max(total_count, 1)),
+            })
+        return results
+
+    @torch.no_grad()
     def compute_stage1_heldout_metrics(self, split="val", include_random_baseline=True):
         pseudo_shared_metrics = self.compute_pseudo_shared_metrics(
             split=split,
@@ -3741,7 +4149,7 @@ class MILK_model(torch.nn.Module):
         pseudo_shared_cosine = float(pseudo_shared_overall.get("cosine", 0.0))
         random_pseudo_shared_cosine = float(pseudo_shared_overall.get("random_cosine", 0.0))
 
-        return {
+        metrics = {
             "split": split,
             "pseudo_shared_count": int(pseudo_shared_overall.get("count", 0)),
             "pseudo_shared_mse": float(pseudo_shared_overall.get("mse", 0.0)),
@@ -3750,6 +4158,26 @@ class MILK_model(torch.nn.Module):
             "pseudo_shared_random_mse": float(pseudo_shared_overall.get("random_mse", 0.0)),
             "pseudo_shared_random_cosine": random_pseudo_shared_cosine,
         }
+        if self.use_decode_head:
+            pseudo_decode_metrics = self.compute_pseudo_decode_metrics(
+                split=split,
+                include_random_baseline=include_random_baseline,
+            ).get("_overall", {})
+            decode_metrics = self.compute_missing_decode_metrics(
+                split=split,
+                include_random_baseline=include_random_baseline,
+            ).get("_overall", {})
+            metrics.update({
+                "pseudo_decode_count": int(pseudo_decode_metrics.get("count", 0)),
+                "pseudo_decode_mse": float(pseudo_decode_metrics.get("mse", 0.0)),
+                "pseudo_decode_cosine": float(pseudo_decode_metrics.get("cosine", 0.0)),
+                "missing_decode_count": int(decode_metrics.get("count", 0)),
+                "missing_decode_mse": float(decode_metrics.get("mse", 0.0)),
+                "missing_decode_cosine": float(decode_metrics.get("cosine", 0.0)),
+                "missing_decode_random_mse": float(decode_metrics.get("random_mse", 0.0)),
+                "missing_decode_random_cosine": float(decode_metrics.get("random_cosine", 0.0)),
+            })
+        return metrics
 
     def _collect_observed_projected(self, item_ids=None):
         projected = self.project_features(item_ids=item_ids)
@@ -3832,15 +4260,24 @@ class MILK_model(torch.nn.Module):
             return zero, zero
 
         all_features = [completed_feats[modality] for modality in self.modalities]
-        eigenvectors, S_V = eigenvalue_computation_pmcl(all_features)
-        eigenvalues = S_V ** 2
+        structure_loss_variant = getattr(
+            self.env.args, "structure_loss_variant", "original"
+        )
+        if structure_loss_variant == "shifted_lifted":
+            eigenvalues, item_directions = shifted_relation_lifted_directions(all_features)
+            sim = (item_directions @ item_directions.T).pow(2) / self.env.args.tau2
+        else:
+            eigenvectors, S_V = eigenvalue_computation_pmcl(all_features)
+            eigenvalues = S_V ** 2
+            principal_eigenvector = eigenvectors[:, :, 0]
+            sim = (
+                principal_eigenvector @ principal_eigenvector.T
+            ) / self.env.args.tau2
 
         targets = torch.zeros(eigenvalues.size(0), dtype=torch.long, device=eigenvalues.device)
         loss_intra = F.cross_entropy(eigenvalues / self.env.args.tau1, targets)
 
-        principal_eigenvector = eigenvectors[:, :, 0]
-        bs = principal_eigenvector.size(0)
-        sim = principal_eigenvector @ principal_eigenvector.T / self.env.args.tau2
+        bs = sim.size(0)
         targets = torch.arange(bs, device=sim.device)
         loss_inter = F.cross_entropy(sim, targets)
 
@@ -3868,12 +4305,7 @@ class MILK_model(torch.nn.Module):
         if completed_feats is None:
             masks = self._missing_masks()
             masks = {modality: mask[item_ids] for modality, mask in masks.items()}
-            completed_feats = self._build_completed_features(
-                projected,
-                masks,
-                item_ids=item_ids,
-                stage=self.env.args.train_stage,
-            )
+            completed_feats = self._build_completed_features(projected, masks, item_ids=item_ids)
 
         feat_t = completed_feats["t"]
         feat_v = completed_feats["v"]
@@ -3946,11 +4378,6 @@ class MILK_model(torch.nn.Module):
 
     def _compute_observed_rec_loss(self, projected, masks, stage, item_ids=None):
         pattern_keys = torch.stack([masks[modality] for modality in self.modalities], dim=1)
-        prior_mean_all, prior_precision_all, prior_has_all = self._smore_beta_prior_params(
-            item_ids,
-            masks,
-            stage=stage,
-        )
         rec_terms = []
         rec_weights = []
         for pattern in torch.unique(pattern_keys, dim=0):
@@ -3962,68 +4389,38 @@ class MILK_model(torch.nn.Module):
             if not observed_modalities:
                 continue
 
-            pattern_selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
-            if pattern_selector.sum() == 0:
+            selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
+            if selector.sum() == 0:
                 continue
 
-            if prior_has_all is None:
-                subgroup_specs = [(pattern_selector, False)]
-            else:
-                subgroup_specs = [
-                    (pattern_selector & prior_has_all, True),
-                    (pattern_selector & ~prior_has_all, False),
-                ]
-
-            for selector, use_prior in subgroup_specs:
-                if selector.sum() == 0:
-                    continue
-                batch_data = {
-                    modality: projected[modality][selector]
-                    for modality in observed_modalities
-                }
-                if use_prior:
-                    posterior_mean, posterior_cov = self._posterior_mean_from_observed(
-                        batch_data,
-                        observed_modalities,
-                        beta_prior=prior_mean_all[selector],
-                        prior_precision=prior_precision_all[selector],
-                        return_cov=True,
-                    )
-                    nll_posterior = posterior_mean
-                else:
-                    posterior_mean, posterior_cov = self._posterior_mean_from_observed(
-                        batch_data,
-                        observed_modalities,
-                        beta_prior=None,
-                        prior_precision=1.0,
-                        return_cov=True,
-                    )
-                    nll_posterior = posterior_mean.detach()
-
-                if self._imputer_updates_enabled and stage in (
-                    "imputer_param",
-                    "imputer_backprop",
-                    "imputer_init",
-                    "imputer_align",
-                    "imputer_promrl_main",
-                    "joint",
-                ):
-                    self.queue_em_update(batch_data, posterior_mean, posterior_cov)
-                pattern_rec_loss, _ = compute_nll_loss(
-                    batch_data,
-                    nll_posterior,
-                    {modality: self.W[modality] for modality in self.modalities},
-                    {modality: self.mu[modality] for modality in self.modalities},
-                    {modality: self.log_sigma[modality].squeeze() for modality in self.modalities},
-                    observed_modalities,
-                )
-                pattern_rec_loss = pattern_rec_loss + self._beta_completion_decoder_rec_loss(
-                    posterior_mean,
-                    batch_data,
-                    observed_modalities,
-                )
-                rec_terms.append(pattern_rec_loss)
-                rec_weights.append(selector.sum().float())
+            batch_data = {
+                modality: projected[modality][selector]
+                for modality in observed_modalities
+            }
+            posterior_mean, posterior_cov = update_posterior(
+                batch_data,
+                {modality: self.W[modality] for modality in self.modalities},
+                {modality: self.mu[modality] for modality in self.modalities},
+                {modality: self.log_sigma[modality].squeeze() for modality in self.modalities},
+                observed_modalities,
+                self.d_beta,
+            )
+            if self._imputer_updates_enabled and stage in (
+                "imputer_param",
+                "projection_pretrain",
+                "joint",
+            ):
+                self.queue_em_update(batch_data, posterior_mean, posterior_cov)
+            pattern_rec_loss, _ = compute_nll_loss(
+                batch_data,
+                posterior_mean.detach(),
+                {modality: self.W[modality] for modality in self.modalities},
+                {modality: self.mu[modality] for modality in self.modalities},
+                {modality: self.log_sigma[modality].squeeze() for modality in self.modalities},
+                observed_modalities,
+            )
+            rec_terms.append(pattern_rec_loss)
+            rec_weights.append(selector.sum().float())
 
         if not rec_terms:
             return torch.zeros((), device=self.env.device)
@@ -4038,7 +4435,7 @@ class MILK_model(torch.nn.Module):
         if ratio is None:
             ratio = 0.3
 
-        split_offset = {"train": 0, "val": 1, "test": 2}.get(split, 3)
+        split_offset = {"train": 0, "val": 1, "test": 2, "imputation_val": 3}.get(split, 4)
         generator = torch.Generator(device=self.env.device)
         generator.manual_seed(int(getattr(self.env.args, "seed", 0)) + 7919 * (split_offset + 1))
 
@@ -4055,12 +4452,7 @@ class MILK_model(torch.nn.Module):
             return results
 
         projected = self.project_features(raw_features=raw_features)
-        pseudo_completed = self._build_completed_features(
-            projected,
-            pseudo_masks,
-            smore_split=split,
-            stage=self.env.args.train_stage,
-        )
+        pseudo_completed = self._build_completed_features(projected, pseudo_masks)
 
         results = {}
         total_count = 0
@@ -4130,8 +4522,6 @@ class MILK_model(torch.nn.Module):
         masks,
         detach_imputed=True,
         item_ids=None,
-        smore_split=None,
-        stage=None,
     ):
         """Build completed features for ALL items (like ProMRL).
         Observed features keep grad_fn.
@@ -4147,8 +4537,6 @@ class MILK_model(torch.nn.Module):
                 projected,
                 masks,
                 item_ids=item_ids,
-                smore_split=smore_split,
-                stage=stage,
             )
 
         N = projected[self.modalities[0]].size(0)
@@ -4161,12 +4549,6 @@ class MILK_model(torch.nn.Module):
         }
 
         pattern_keys = torch.stack([masks[m] for m in self.modalities], dim=1)
-        prior_mean_all, prior_precision_all, prior_has_all = self._smore_beta_prior_params(
-            item_ids,
-            masks,
-            split=smore_split,
-            stage=stage,
-        )
 
         with torch.no_grad():
             for pattern in torch.unique(pattern_keys, dim=0):
@@ -4174,42 +4556,28 @@ class MILK_model(torch.nn.Module):
                 if not missing:
                     continue
 
-                pattern_selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
-                if pattern_selector.sum() == 0:
+                selector = (pattern_keys == pattern.unsqueeze(0)).all(dim=1)
+                if selector.sum() == 0:
                     continue
 
                 observed = [self.modalities[i] for i in range(len(self.modalities)) if bool(pattern[i])]
-                if prior_has_all is None:
-                    subgroup_specs = [(pattern_selector, False)]
+                obs_feats = {m: projected[m][selector].detach() for m in observed}
+                W_dict = {m: self.W[m] for m in self.modalities}
+                mu_dict = {m: self.mu[m] for m in self.modalities}
+                log_sigma_dict = {m: self.log_sigma[m].squeeze() for m in self.modalities}
+
+                if observed:
+                    m, _ = update_posterior(
+                        obs_feats, W_dict, mu_dict, log_sigma_dict, observed, self.d_beta,
+                    )
                 else:
-                    subgroup_specs = [
-                        (pattern_selector & prior_has_all, True),
-                        (pattern_selector & ~prior_has_all, False),
-                    ]
+                    m = torch.zeros(selector.sum(), self.d_beta, device=device)
 
-                for selector, use_prior in subgroup_specs:
-                    if selector.sum() == 0:
-                        continue
-                    obs_feats = {m: projected[m][selector].detach() for m in observed}
-                    if use_prior:
-                        m = self._posterior_mean_from_observed(
-                            obs_feats,
-                            observed,
-                            beta_prior=prior_mean_all[selector],
-                            prior_precision=prior_precision_all[selector],
-                        )
-                    elif observed:
-                        m = self._posterior_mean_from_observed(
-                            obs_feats,
-                            observed,
-                            beta_prior=None,
-                            prior_precision=1.0,
-                        )
-                    else:
-                        m = torch.zeros(selector.sum(), self.d_beta, device=device)
-
-                    for modality in missing:
-                        imputed[modality][selector] = self._beta_to_completed_shared(m, modality)
+                for modality in missing:
+                    recon = F.normalize(
+                        m @ self.W[modality].T + self.mu[modality].unsqueeze(0), dim=-1,
+                    )
+                    imputed[modality][selector] = recon
 
         # Blend: observed (with grad_fn) where mask=True, imputed (no grad) where mask=False
         completed = {}
@@ -4238,15 +4606,16 @@ class MILK_model(torch.nn.Module):
             need_itm = float(getattr(self.env.args, "beta_itm", 0.0)) != 0.0
             need_decode = (
                 float(getattr(self.env.args, "beta_decode", 0.0)) != 0.0
-                or float(getattr(self.env.args, "beta_decode_kl", 0.0)) != 0.0
             )
         else:
-            need_rec = True
-            need_contrastive = True
-            need_itm = True
+            need_rec = float(getattr(self.env.args, "alpha_rec", 0.0)) != 0.0
+            need_contrastive = (
+                float(getattr(self.env.args, "alpha_intra", 0.0)) != 0.0
+                or float(getattr(self.env.args, "alpha_inter", 0.0)) != 0.0
+            )
+            need_itm = float(getattr(self.env.args, "alpha_itm", 0.0)) != 0.0
             need_decode = (
                 float(getattr(self.env.args, "alpha_decode", 0.0)) != 0.0
-                or float(getattr(self.env.args, "alpha_decode_kl", 0.0)) != 0.0
             )
 
         # Step 2-3: Posterior inference + rec_loss for each observed-modality pattern.
@@ -4262,15 +4631,10 @@ class MILK_model(torch.nn.Module):
         loss_decode = zero
         loss_decode_kl = zero
 
-        if stage not in ("imputer_param", "imputer_init"):
+        if stage != "imputer_param":
             # Step 4-5: Build completed features + contrastive loss (like ProMRL)
             need_completed = need_contrastive or need_itm or need_decode
-            completed = self._build_completed_features(
-                projected,
-                masks,
-                item_ids=item_ids,
-                stage=stage,
-            ) if need_completed else None
+            completed = self._build_completed_features(projected, masks, item_ids=item_ids) if need_completed else None
             if need_contrastive:
                 loss_intra, loss_inter = self.compute_contrastive_loss(completed)
             if need_itm:
@@ -4279,47 +4643,49 @@ class MILK_model(torch.nn.Module):
                 decode_completed = completed
                 decode_selected = masks
                 decode_targets = raw_batch
-                if (
-                    decode_completed is not None
-                    and getattr(self.env.args, "decode_loss_grad_mode", "coupled") == "detached"
-                ):
-                    decode_completed = {
-                        modality: feat.detach()
-                        for modality, feat in decode_completed.items()
-                    }
+
+                if getattr(self.env.args, "decoder_loss_mode", "observed_projection") == "pseudo_missing":
+                    pseudo_masks, pseudo_selected = self._sample_pseudo_missing_masks(
+                        masks,
+                        ratio=float(getattr(self.env.args, "decoder_pseudo_missing_ratio", 1.0)),
+                    )
+                    if pseudo_masks is None or pseudo_selected is None:
+                        decode_completed = None
+                    else:
+                        # The completion module is normally frozen in this mode.  Detaching
+                        # here also makes the decoder-only contract explicit and avoids
+                        # retaining a graph through posterior inference.
+                        decode_completed = self._build_completed_features(
+                            projected,
+                            pseudo_masks,
+                            detach_imputed=True,
+                            item_ids=item_ids,
+                        )
+                        decode_selected = pseudo_selected
 
                 decode_losses = []
-                decode_kl_losses = []
                 if decode_completed is not None:
                     decoded_raw = self.decode_completed_to_raw(decode_completed)
                     for modality in self.modalities:
                         observed_mask = decode_selected[modality]
                         if need_decode and observed_mask.any():
                             decoded_obs = decoded_raw[modality][observed_mask]
-                            raw_obs = decode_targets[modality][observed_mask]
-                            cosine = F.cosine_similarity(decoded_obs, raw_obs, dim=-1)
-                            decode_losses.append(1.0 - cosine.mean())
-                            if observed_mask.sum() > 1:
-                                temp = max(float(getattr(self.env.args, "decode_kl_temp", 0.2)), 1e-6)
-                                decoded_norm = F.normalize(
-                                    torch.nan_to_num(decoded_obs, nan=0.0, posinf=0.0, neginf=0.0),
-                                    dim=-1,
+                            normalized_target = decode_targets[modality][observed_mask]
+                            selected_item_ids = item_ids[observed_mask]
+                            raw_target = self._decoder_target(
+                                modality,
+                                normalized_target,
+                                item_ids=selected_item_ids,
+                            )
+                            decode_losses.append(
+                                self._decoder_reconstruction_loss(
+                                    modality,
+                                    decoded_obs,
+                                    raw_target,
                                 )
-                                raw_norm = F.normalize(
-                                    torch.nan_to_num(raw_obs, nan=0.0, posinf=0.0, neginf=0.0),
-                                    dim=-1,
-                                )
-                                teacher_logits = torch.matmul(raw_norm, raw_norm.transpose(0, 1)) / temp
-                                student_logits = torch.matmul(decoded_norm, raw_norm.transpose(0, 1)) / temp
-                                teacher = F.softmax(teacher_logits.detach(), dim=1)
-                                student_log_prob = F.log_softmax(student_logits, dim=1)
-                                decode_kl_losses.append(
-                                    F.kl_div(student_log_prob, teacher, reduction="batchmean")
-                                )
+                            )
                     if decode_losses:
                         loss_decode = torch.stack(decode_losses).mean()
-                    if decode_kl_losses:
-                        loss_decode_kl = torch.stack(decode_kl_losses).mean()
 
         total_contrastive = loss_intra + loss_inter
         self.latest_promrl_losses = {
@@ -4344,39 +4710,24 @@ class MILK_model(torch.nn.Module):
         reliability_gates = self._completion_reliability_gates(raw_features=raw_features)
         observed_masks = self._missing_masks(raw_features=raw_features)
 
-        v_user_emb, v_item_emb = self.v_gcn(
-            modal_features["v"], user_id_emb, skip_mlp=False
-        )
-        t_user_emb, t_item_emb = self.t_gcn(
-            modal_features["t"], user_id_emb, skip_mlp=False
-        )
-        v_item_emb = self._apply_item_graph_modal_residual(v_item_emb, observed_masks["v"], modality="v")
-        t_item_emb = self._apply_item_graph_modal_residual(t_item_emb, observed_masks["t"], modality="t")
-        ungated_item_outputs = {"v": v_item_emb, "t": t_item_emb}
-        if not self.use_rum_fusion:
-            if not self.use_reliability_weighted_fusion:
-                v_item_emb = v_item_emb * reliability_gates["v"]
-                t_item_emb = t_item_emb * reliability_gates["t"]
-
         outputs = {
             "user_id": user_id_emb,
-            "v": (v_user_emb, v_item_emb),
-            "t": (t_user_emb, t_item_emb),
             "modal_inputs": modal_features,
             "reliability_gates": reliability_gates,
             "observed_masks": observed_masks,
-            "ungated_item_outputs": ungated_item_outputs,
+            "ungated_item_outputs": {},
         }
-        if "a" in self.modalities:
-            a_user_emb, a_item_emb = self.a_gcn(
-                modal_features["a"], user_id_emb, skip_mlp=False
+        for modality in self.modalities:
+            modal_user_emb, modal_item_emb = getattr(self, f"{modality}_gcn")(
+                modal_features[modality], user_id_emb, skip_mlp=self._gcn_skip_mlp()
             )
-            a_item_emb = self._apply_item_graph_modal_residual(a_item_emb, observed_masks["a"], modality="a")
-            ungated_item_outputs["a"] = a_item_emb
+            modal_item_emb = self._apply_item_graph_modal_residual(
+                modal_item_emb, observed_masks[modality], modality=modality
+            )
+            outputs["ungated_item_outputs"][modality] = modal_item_emb
             if not self.use_rum_fusion:
-                if not self.use_reliability_weighted_fusion:
-                    a_item_emb = a_item_emb * reliability_gates["a"]
-            outputs["a"] = (a_user_emb, a_item_emb)
+                modal_item_emb = modal_item_emb * reliability_gates[modality]
+            outputs[modality] = (modal_user_emb, modal_item_emb)
 
         self._gcn_cache = outputs
         return outputs
@@ -4387,9 +4738,10 @@ class MILK_model(torch.nn.Module):
     def forward(self, random=False):
         outputs = self._run_modal_gcn()
         user_id_emb = outputs["user_id"]
-        v_user_emb, v_item_emb = outputs["v"]
-        t_user_emb, t_item_emb = outputs["t"]
-        user_outputs = {"v": v_user_emb, "t": t_user_emb}
+        user_outputs = {
+            modality: outputs[modality][0]
+            for modality in self.modalities
+        }
         if self.use_rank_residual_completion_gate and not self.use_rum_fusion:
             reliability_gates = outputs["reliability_gates"]
             ungated_item_outputs = {
@@ -4402,13 +4754,10 @@ class MILK_model(torch.nn.Module):
             }
         else:
             ungated_item_outputs = None
-            item_outputs = {"v": v_item_emb.detach(), "t": t_item_emb.detach()}
-
-        if "a" in self.modalities:
-            a_user_emb, a_item_emb = outputs["a"]
-            user_outputs["a"] = a_user_emb
-            if not (self.use_rank_residual_completion_gate and not self.use_rum_fusion):
-                item_outputs["a"] = a_item_emb.detach()
+            item_outputs = {
+                modality: outputs[modality][1].detach()
+                for modality in self.modalities
+            }
 
         user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
         if self.use_rank_residual_completion_gate and not self.use_rum_fusion:
@@ -4438,7 +4787,6 @@ class MILK_model(torch.nn.Module):
                 item_outputs,
                 modal_features=outputs["modal_inputs"],
                 observed_masks=outputs["observed_masks"],
-                reliability_gates=outputs["reliability_gates"],
             )
             self.latest_completion_gate_ungated_item_emb = None
             self.latest_completion_gate_gated_item_emb = None
@@ -4768,40 +5116,24 @@ class MILK_model(torch.nn.Module):
     def get_env_emb(self, mix_ration, env):
         outputs = self._run_modal_gcn()
         user_id_emb = outputs["user_id"]
-        v_user_emb, v_item_emb = outputs["v"]
-        t_user_emb, t_item_emb = outputs["t"]
-
-        v_mm_emb = mix_ration[env][0] * v_item_emb
-        t_mm_emb = mix_ration[env][1] * t_item_emb
-
-        if "a" in self.modalities:
-            a_user_emb, a_item_emb = outputs["a"]
-            a_mm_emb = mix_ration[env][2] * a_item_emb
-            item_emb = torch.cat([v_mm_emb, t_mm_emb, a_mm_emb], dim=1)
-            user_emb = torch.cat(
-                [
-                    user_id_emb + v_user_emb,
-                    user_id_emb + t_user_emb,
-                    user_id_emb + a_user_emb,
-                ],
-                dim=1,
-            )
-        else:
-            item_emb = torch.cat([v_mm_emb, t_mm_emb], dim=1)
-            user_emb = torch.cat(
-                [user_id_emb + v_user_emb, user_id_emb + t_user_emb],
-                dim=1,
-            )
+        item_parts = []
+        user_parts = []
+        for modality_idx, modality in enumerate(self.modalities):
+            modal_user_emb, modal_item_emb = outputs[modality]
+            item_parts.append(mix_ration[env][modality_idx] * modal_item_emb)
+            user_parts.append(user_id_emb + modal_user_emb)
+        item_emb = torch.cat(item_parts, dim=1)
+        user_emb = torch.cat(user_parts, dim=1)
 
         assert torch.isnan(user_emb).sum() == 0
         assert torch.isnan(item_emb).sum() == 0
         return user_emb, item_emb
 
     def modality_bpr_loss(self, batch_users, batch_pos_items, batch_neg_items):
-        if "a" in self.modalities:
-            mix_ration = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-        else:
-            mix_ration = [[1, 0], [0, 1]]
+        mix_ration = [
+            [1 if idx == env else 0 for idx in range(len(self.modalities))]
+            for env in range(len(self.modalities))
+        ]
 
         losses = []
         for env in range(len(mix_ration)):

@@ -12,13 +12,9 @@ import evaluation
 # from metric import evaluation
 
 STAGE1_IMPUTER_STAGES = (
-    'imputer',
     'imputer_param',
     'imputer_backprop',
-    'imputer_init',
-    'imputer_align',
-    'imputer_promrl_main',
-    'imputer_adapter',
+    'projection_pretrain',
 )
 
 
@@ -54,6 +50,7 @@ class MILK_session(object):
         self.best_imputation_cosine = float('-inf')
         self.best_stage1_selection = None
         self.best_model_state = None
+        self.last_test_modality_subsets = {}
 
     def _resolve_recommendation_selection(self, hr, recall, ndcg):
         topk = self.env.args.recommendation_selection_topk
@@ -98,37 +95,64 @@ class MILK_session(object):
         if decoder_params:
             param_groups.append({'params': decoder_params, 'lr': lr_decoder})
 
-        item_graph_confidence_params = self.model.get_item_graph_confidence_parameters()
-        item_graph_confidence_param_ids = {id(param) for param in item_graph_confidence_params}
-        completion_gate_params = self.model.get_completion_gate_parameters()
-        completion_gate_param_ids = {id(param) for param in completion_gate_params}
-
         recommender_params = self.model.get_recommender_parameters()
-        excluded_rec_param_ids = item_graph_confidence_param_ids | completion_gate_param_ids
-        if excluded_rec_param_ids:
-            recommender_params = [
-                param for param in recommender_params
-                if id(param) not in excluded_rec_param_ids
-            ]
         if recommender_params:
             param_groups.append({'params': recommender_params, 'lr': lr_rec})
-
-        if completion_gate_params:
-            lr_gate = getattr(self.env.args, 'completion_gate_lr', None)
-            if lr_gate is None:
-                lr_gate = lr_rec
-            param_groups.append({'params': completion_gate_params, 'lr': lr_gate})
-
-        if item_graph_confidence_params:
-            lr_confidence = getattr(self.env.args, 'item_graph_confidence_lr', None)
-            if lr_confidence is None:
-                lr_confidence = lr_rec
-            param_groups.append({'params': item_graph_confidence_params, 'lr': lr_confidence})
 
         if not param_groups:
             return None
 
         return torch.optim.Adam(param_groups, lr=lr_rec)
+
+    @staticmethod
+    def _parameter_grad_norm(parameters):
+        squared_norm = 0.0
+        count = 0
+        for parameter in parameters:
+            if parameter.grad is None:
+                continue
+            squared_norm += float(parameter.grad.detach().float().norm().cpu()) ** 2
+            count += 1
+        return squared_norm ** 0.5, count
+
+    def _audit_joint_gradients(self):
+        imputer_norm, imputer_count = self._parameter_grad_norm(
+            self.model.get_imputer_parameters()
+        )
+        recommender_norm, recommender_count = self._parameter_grad_norm(
+            self.model.get_recommender_parameters()
+        )
+        print(
+            "joint gradient audit: "
+            f"imputer_norm={imputer_norm:.8e} imputer_tensors={imputer_count} "
+            f"recommender_norm={recommender_norm:.8e} recommender_tensors={recommender_count}"
+        )
+        if imputer_count == 0 or imputer_norm <= 0.0:
+            raise RuntimeError(
+                "joint gradient audit failed: recommendation/completion objectives "
+                "did not reach the trainable imputer parameters"
+            )
+        if recommender_count == 0 or recommender_norm <= 0.0:
+            raise RuntimeError(
+                "joint gradient audit failed: no trainable recommender gradient"
+            )
+
+    def _uses_joint_item_graph_refresh(self):
+        return (
+            self.env.args.train_stage == 'joint'
+            and int(getattr(self.env.args, 'joint_item_graph_refresh_interval', 0) or 0) > 0
+            and bool(getattr(self.model, 'use_completed_item_graph', False))
+        )
+
+    def _refresh_joint_item_graph(self, current_epoch, force=False):
+        if not self._uses_joint_item_graph_refresh():
+            return
+        interval = int(self.env.args.joint_item_graph_refresh_interval)
+        if not force and (current_epoch <= 0 or current_epoch % interval != 0):
+            return
+        print(f"refreshing joint completed-feature item graph at epoch={current_epoch}")
+        self.model.build_completed_item_graph()
+        self.model.clear_gcn_cache()
 
     def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=None):
         self.env.args.train_stage = train_stage
@@ -229,6 +253,7 @@ class MILK_session(object):
         was_training = self.model.training
         try:
             self._restore_model_state(self.best_model_state)
+            self._refresh_joint_item_graph(self.best_epoch, force=True)
             thr, trecall, tndcg, test_time = self.test(mode='test', top_list=eval(self.env.args.topk))
             for key in thr.keys():
                 tool.cprint(
@@ -238,8 +263,10 @@ class MILK_session(object):
                 self.test_hr[key] = thr[key]
                 self.test_recall[key] = trecall[key]
                 self.test_ndcg[key] = tndcg[key]
+            self.log_test_modality_subsets(prefix='final strict test')
         finally:
             self._restore_model_state(current_state)
+            self._refresh_joint_item_graph(self.total_epoch - 1, force=True)
             if was_training:
                 self.model.train()
 
@@ -255,7 +282,7 @@ class MILK_session(object):
         try:
             self._restore_model_state(self.best_model_state)
             metric_splits = ['test']
-            if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default'):
+            if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default', 'decoder_default'):
                 metric_splits.append('val')
             metrics = self._compute_imputation_metrics(splits=tuple(metric_splits))
             overall = metrics.get('test', {}).get('_overall', {})
@@ -271,12 +298,19 @@ class MILK_session(object):
                     f"random_cosine = {overall.get('random_cosine', 0.0):.6f}"
                 )
             if 'val' in metrics:
-                heldout_metrics = self._compute_stage1_heldout_metrics(split='val')
+                heldout_split = (
+                    'val'
+                    if self._resolve_stage1_selection_policy() == 'decoder_default'
+                    else 'imputation_val'
+                )
+                heldout_metrics = self._compute_stage1_heldout_metrics(split=heldout_split)
                 self.last_train_metrics['imputation_val_mse'] = float(metrics['val']['_overall'].get('mse', 0.0))
                 self.last_train_metrics['imputation_val_cosine'] = float(metrics['val']['_overall'].get('cosine', 0.0))
                 self.last_train_metrics['val_pseudo_shared_mse'] = float(heldout_metrics.get('pseudo_shared_mse', 0.0))
                 self.last_train_metrics['val_pseudo_shared_cosine'] = float(heldout_metrics.get('pseudo_shared_cosine', 0.0))
                 self.last_train_metrics['val_pseudo_shared_cosine_gap'] = float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0))
+                self.last_train_metrics['val_missing_decode_mse'] = float(heldout_metrics.get('missing_decode_mse', 0.0))
+                self.last_train_metrics['val_missing_decode_cosine'] = float(heldout_metrics.get('missing_decode_cosine', 0.0))
         finally:
             self._restore_model_state(current_state)
             if was_training:
@@ -390,6 +424,12 @@ class MILK_session(object):
             float(heldout_metrics.get('shared_cosine_gap', float('-inf'))),
         )
 
+    def _decoder_selection_tuple(self, heldout_metrics):
+        return (
+            float(heldout_metrics.get('pseudo_decode_cosine', float('-inf'))),
+            -float(heldout_metrics.get('pseudo_decode_mse', float('inf'))),
+        )
+
     def _recommender_probe_selection_tuple(self, selection_data):
         return (
             float(selection_data.get('recall', float('-inf'))),
@@ -414,6 +454,11 @@ class MILK_session(object):
             if self.best_stage1_selection is None:
                 return True
             return current_tuple > self._adapter_selection_tuple(self.best_stage1_selection)
+        if policy == 'decoder_default':
+            current_tuple = self._decoder_selection_tuple(selection_data)
+            if self.best_stage1_selection is None:
+                return True
+            return current_tuple > self._decoder_selection_tuple(self.best_stage1_selection)
         if policy == 'recommender_probe':
             current_tuple = self._recommender_probe_selection_tuple(selection_data)
             if self.best_stage1_selection is None:
@@ -424,6 +469,8 @@ class MILK_session(object):
     def _update_best_stage1_selection(self, selection_data):
         policy = self._resolve_stage1_selection_policy()
         if policy in ('stage1_default', 'promrl_shared', 'adapter_default', 'recommender_probe'):
+            self.best_stage1_selection = dict(selection_data)
+        elif policy == 'decoder_default':
             self.best_stage1_selection = dict(selection_data)
         else:
             self._update_best_imputation_metric(float(selection_data['value']))
@@ -451,6 +498,12 @@ class MILK_session(object):
                 f"val_missing_decode_mse = {selection_data.get('missing_decode_mse', 0.0):.6f}, "
                 f"val_shared_cosine_gap = {selection_data.get('shared_cosine_gap', 0.0):.6f}"
             )
+        if policy == 'decoder_default':
+            return (
+                'best raw decoder pseudo-missing metrics: '
+                f"val_pseudo_decode_cosine = {selection_data.get('pseudo_decode_cosine', 0.0):.6f}, "
+                f"val_pseudo_decode_mse = {selection_data.get('pseudo_decode_mse', 0.0):.6f}"
+            )
         if policy == 'recommender_probe':
             return (
                 'best recommender probe metrics: '
@@ -476,24 +529,20 @@ class MILK_session(object):
         promrl_decode_loss = promrl_losses.get('loss_decode', zero)
         promrl_decode_kl_loss = promrl_losses.get('loss_decode_kl', zero)
 
-        if stage == 'imputer':
-            stage = 'imputer_backprop'
-
-        if stage in ('imputer_param', 'imputer_init'):
+        if stage == 'imputer_param':
             stage_promrl_loss = self.env.args.alpha_rec * promrl_rec_loss
             promrl_intra_loss = zero
             promrl_inter_loss = zero
             promrl_itm_loss = zero
             promrl_decode_loss = zero
             promrl_decode_kl_loss = zero
-        elif stage in ('imputer_backprop', 'imputer_align', 'imputer_promrl_main', 'imputer_adapter'):
+        elif stage in ('projection_pretrain', 'imputer_backprop'):
             stage_promrl_loss = (
                 self.env.args.alpha_intra * promrl_intra_loss
                 + self.env.args.alpha_inter * promrl_inter_loss
                 + self.env.args.alpha_itm * promrl_itm_loss
                 + self.env.args.alpha_rec * promrl_rec_loss
                 + self.env.args.alpha_decode * promrl_decode_loss
-                + self.env.args.alpha_decode_kl * promrl_decode_kl_loss
             )
         elif stage == 'joint':
             stage_promrl_loss = (
@@ -502,7 +551,6 @@ class MILK_session(object):
                 + self.env.args.beta_itm * promrl_itm_loss
                 + self.env.args.beta_rec * promrl_rec_loss
                 + self.env.args.beta_decode * promrl_decode_loss
-                + self.env.args.beta_decode_kl * promrl_decode_kl_loss
             )
         else:
             stage_promrl_loss = zero
@@ -527,10 +575,7 @@ class MILK_session(object):
         if effective_stage not in (
             'imputer_param',
             'imputer_backprop',
-            'imputer_init',
-            'imputer_align',
-            'imputer_promrl_main',
-            'imputer_adapter',
+            'projection_pretrain',
             'joint',
         ):
             return False
@@ -542,7 +587,6 @@ class MILK_session(object):
                 self.env.args.beta_itm,
                 self.env.args.beta_rec,
                 self.env.args.beta_decode,
-                getattr(self.env.args, 'beta_decode_kl', 0.0),
             )
         else:
             weights = (
@@ -551,7 +595,6 @@ class MILK_session(object):
                 self.env.args.alpha_itm,
                 self.env.args.alpha_rec,
                 self.env.args.alpha_decode,
-                getattr(self.env.args, 'alpha_decode_kl', 0.0),
             )
 
         return any(float(weight) != 0.0 for weight in weights)
@@ -562,6 +605,7 @@ class MILK_session(object):
         self.total_epoch += 1
         current_epoch = self.total_epoch - 1
         self.model.current_epoch = current_epoch
+        self._refresh_joint_item_graph(current_epoch)
         rec_neighbor_cl_weight_eff = self._effective_rec_neighbor_cl_weight(current_epoch)
         stage = self.env.args.train_stage
         imputer_only_stage = stage in STAGE1_IMPUTER_STAGES
@@ -574,25 +618,6 @@ class MILK_session(object):
             item_ids = tool.shuffle(item_ids)
             total_batch = len(item_ids) // self.env.args.batch_size + 1
             users = posItems = negItems = None
-            rec_guidance_batches = None
-            rec_guidance_enabled = (
-                stage == 'imputer_backprop'
-                and float(getattr(self.env.args, 'alpha_stage1_rec_guidance', 0.0)) > 0.0
-            )
-            if rec_guidance_enabled:
-                pair_samples = dataset_loader.PairSample(self.dataset)
-                users = torch.as_tensor(pair_samples[:, 0], dtype=torch.long, device=self.env.device)
-                posItems = torch.as_tensor(pair_samples[:, 1], dtype=torch.long, device=self.env.device)
-                negItems = torch.as_tensor(pair_samples[:, 2], dtype=torch.long, device=self.env.device)
-                users, posItems, negItems = tool.shuffle(users, posItems, negItems)
-                rec_guidance_batches = list(
-                    dataset_loader.minibatch(
-                        users,
-                        posItems,
-                        negItems,
-                        batch_size=self.env.args.batch_size,
-                    )
-                )
         else:
             S = dataset_loader.PairSample(self.dataset)
             users = torch.Tensor(S[:, 0]).long()
@@ -603,6 +628,26 @@ class MILK_session(object):
             negItems = negItems.to(self.env.device)
             users, posItems, negItems = tool.shuffle(users, posItems, negItems)
             total_batch = len(users) // self.env.args.batch_size + 1
+        joint_completion_batches = None
+        joint_completion_batch_size = int(
+            getattr(self.env.args, 'joint_completion_batch_size', 0) or 0
+        )
+        if stage == 'joint' and joint_completion_batch_size > 0:
+            joint_item_ids = torch.as_tensor(
+                dataset_loader.ItemSample(self.dataset),
+                dtype=torch.long,
+                device=self.env.device,
+            )
+
+            def uniform_joint_completion_batches():
+                while True:
+                    shuffled_item_ids = tool.shuffle(joint_item_ids)
+                    yield from dataset_loader.minibatch(
+                        shuffled_item_ids,
+                        batch_size=joint_completion_batch_size,
+                    )
+
+            joint_completion_batches = uniform_joint_completion_batches()
         all_loss, all_main_bpr_loss, all_maximize_loss = 0., 0., 0.
         all_modality_bpr_loss, all_grad_loss, all_penalty_loss = 0., 0., 0.
         all_promrl_intra_loss, all_promrl_inter_loss = 0., 0.
@@ -628,13 +673,15 @@ class MILK_session(object):
                 batch_size=self.env.args.batch_size,
             )
 
-        for user, pos_item, neg_item in batch_iterator:
+        for batch_index, (user, pos_item, neg_item) in enumerate(batch_iterator):
             zero = self._zero_scalar()
             promrl_losses = None
-            effective_stage = 'imputer_backprop' if stage == 'imputer' else stage
+            effective_stage = self.model._canonical_stage(stage)
             if self._should_compute_promrl_losses(effective_stage):
                 if imputer_only_stage:
                     promrl_item_ids = pos_item
+                elif joint_completion_batches is not None:
+                    promrl_item_ids = next(joint_completion_batches)
                 else:
                     promrl_item_ids = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                 promrl_losses = self.model.compute_promrl_losses(promrl_item_ids, stage=effective_stage)
@@ -660,23 +707,6 @@ class MILK_session(object):
             align_loss = zero
             distill_loss = zero
             rec_neighbor_cl_loss = zero
-
-            if (
-                imputer_only_stage
-                and effective_stage == 'imputer_backprop'
-                and float(getattr(self.env.args, 'alpha_stage1_rec_guidance', 0.0)) > 0.0
-                and rec_guidance_batches
-            ):
-                rec_user, rec_pos_item, rec_neg_item = rec_guidance_batches[0]
-                rec_guidance_batches = rec_guidance_batches[1:] + [rec_guidance_batches[0]]
-                main_bpr_loss, base_reg_loss = self.model.basic_recommendation_loss(
-                    rec_user,
-                    rec_pos_item,
-                    rec_neg_item,
-                    allow_modal_grad=True,
-                )
-                main_bpr_loss = self.env.args.alpha_stage1_rec_guidance * main_bpr_loss
-                reg_loss = self.env.args.reg_coeff * base_reg_loss
 
             if effective_stage in ('recommender', 'joint'):
                 use_task_aware_refinement = (
@@ -714,23 +744,6 @@ class MILK_session(object):
                         self.env.args.completion_gate_reg_coeff
                         * self.model.completion_gate_regularization_loss()
                     )
-                completion_gate_supervision_coeff = float(
-                    getattr(self.env.args, "completion_gate_supervision_coeff", 0.0) or 0.0
-                )
-                if completion_gate_supervision_coeff > 0:
-                    penalty_loss = penalty_loss + (
-                        completion_gate_supervision_coeff
-                        * self.model.completion_gate_supervision_loss()
-                    )
-                completion_gate_counterfactual_coeff = float(
-                    getattr(self.env.args, "completion_gate_counterfactual_coeff", 0.0) or 0.0
-                )
-                if completion_gate_counterfactual_coeff > 0:
-                    counterfactual_items = torch.cat([pos_item, neg_item], dim=0)
-                    penalty_loss = penalty_loss + (
-                        completion_gate_counterfactual_coeff
-                        * self.model.completion_gate_counterfactual_loss(counterfactual_items)
-                    )
                 if getattr(self.env.args, "completion_gate_advantage_coeff", 0.0) > 0:
                     penalty_loss = penalty_loss + (
                         self.env.args.completion_gate_advantage_coeff
@@ -754,8 +767,16 @@ class MILK_session(object):
                     rec_neighbor_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
                     rec_neighbor_cl_loss = self.model.compute_true_missing_gcn_infonce_loss(
                         rec_neighbor_items,
+                        user_ids=user,
                         temperature=float(getattr(self.env.args, 'rec_neighbor_cl_temp', 0.2)),
                         bank_size=int(getattr(self.env.args, 'rec_neighbor_cl_bank_size', 256)),
+                        user_bank_size=int(getattr(self.env.args, 'rec_neighbor_cl_user_bank_size', 256)),
+                    )
+                if float(getattr(self.env.args, 'gamma_align', 0.0)) > 0.0:
+                    align_items = torch.unique(torch.cat([pos_item, neg_item], dim=0))
+                    align_loss = self.model.compute_adapter_alignment_loss(
+                        align_items,
+                        pseudo_ratio=float(getattr(self.env.args, 'adapter_align_pseudo_ratio', 1.0)),
                     )
                 self.model.clear_gcn_cache()
                 reg_loss = self.env.args.reg_coeff * base_reg_loss
@@ -786,7 +807,22 @@ class MILK_session(object):
                 self.representation_optimizer.zero_grad()
                 if loss.requires_grad:
                     loss.backward()
+                if (
+                    effective_stage == 'joint'
+                    and bool(getattr(self.env.args, 'joint_grad_audit', 0))
+                    and current_epoch == 0
+                    and batch_index == 0
+                ):
+                    self._audit_joint_gradients()
                 self.representation_optimizer.step()
+                if effective_stage == 'joint':
+                    log_sigma_min = float(
+                        getattr(self.env.args, 'joint_log_sigma_min', -100.0)
+                    )
+                    if log_sigma_min > -100.0:
+                        with torch.no_grad():
+                            for parameter in self.model.log_sigma.values():
+                                parameter.clamp_(min=log_sigma_min)
             if self.model.has_pending_em_updates():
                 self.model.apply_pending_em_updates()
 
@@ -859,6 +895,7 @@ class MILK_session(object):
             start_epoch = self.env.args.ckpt_start_epoch
         for epoch in range(start_epoch, epochs):
             self.model.train()
+            self.model.set_inductive_item_graph_split('train')
             (
                 loss,
                 main_bpr_loss,
@@ -939,7 +976,7 @@ class MILK_session(object):
             if self.env.args.train_stage in STAGE1_IMPUTER_STAGES:
                 if self.env.args.train_stage != 'imputer_param':
                     metric_splits = ['train']
-                    if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default'):
+                    if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default', 'decoder_default'):
                         metric_splits.append('val')
                     if self.env.args.evaluation_protocol == 'legacy' or record_strict_test_probe:
                         metric_splits.append('test')
@@ -957,13 +994,22 @@ class MILK_session(object):
                             )
                     heldout_metrics = {}
                     if 'val' in imputation_metrics:
-                        heldout_metrics = self._compute_stage1_heldout_metrics(split='val')
+                        heldout_split = (
+                            'val'
+                            if self._resolve_stage1_selection_policy() == 'decoder_default'
+                            else 'imputation_val'
+                        )
+                        heldout_metrics = self._compute_stage1_heldout_metrics(split=heldout_split)
                         self._log_stage1_heldout_metrics(heldout_metrics)
                         print(
                             'STAGE1_HELDOUT:val '
                             f"pseudo_shared_mse = {heldout_metrics.get('pseudo_shared_mse', 0.0):.6f}, "
                             f"pseudo_shared_cosine = {heldout_metrics.get('pseudo_shared_cosine', 0.0):.6f}, "
-                            f"pseudo_shared_cosine_gap = {heldout_metrics.get('pseudo_shared_cosine_gap', 0.0):.6f}"
+                            f"pseudo_shared_cosine_gap = {heldout_metrics.get('pseudo_shared_cosine_gap', 0.0):.6f}, "
+                            f"pseudo_decode_mse = {heldout_metrics.get('pseudo_decode_mse', 0.0):.6f}, "
+                            f"pseudo_decode_cosine = {heldout_metrics.get('pseudo_decode_cosine', 0.0):.6f}, "
+                            f"missing_decode_mse = {heldout_metrics.get('missing_decode_mse', 0.0):.6f}, "
+                            f"missing_decode_cosine = {heldout_metrics.get('missing_decode_cosine', 0.0):.6f}"
                         )
 
                     policy = self._resolve_stage1_selection_policy()
@@ -996,6 +1042,15 @@ class MILK_session(object):
                         self.last_train_metrics['val_shared_cosine_gap'] = selection_data['shared_cosine_gap']
                         self.last_train_metrics['val_missing_decode_mse'] = selection_data['missing_decode_mse']
                         self.last_train_metrics['val_missing_decode_cosine'] = selection_data['missing_decode_cosine']
+                    elif policy == 'decoder_default':
+                        selection_data = {
+                            'pseudo_decode_cosine': float(heldout_metrics.get('pseudo_decode_cosine', 0.0)),
+                            'pseudo_decode_mse': float(heldout_metrics.get('pseudo_decode_mse', 0.0)),
+                        }
+                        self.last_train_metrics['val_pseudo_decode_mse'] = selection_data['pseudo_decode_mse']
+                        self.last_train_metrics['val_pseudo_decode_cosine'] = selection_data['pseudo_decode_cosine']
+                        self.last_train_metrics['val_missing_decode_mse'] = float(heldout_metrics.get('missing_decode_mse', 0.0))
+                        self.last_train_metrics['val_missing_decode_cosine'] = float(heldout_metrics.get('missing_decode_cosine', 0.0))
                     elif policy == 'recommender_probe':
                         should_probe_recommender = (epoch % self.env.args.eva_interval == 0)
                         if should_probe_recommender:
@@ -1193,73 +1248,10 @@ class MILK_session(object):
             else:
                 self._finalize_strict_test_metrics()
 
-    def train_alternating_stage12_stage2(self, cycles):
-        if cycles is None or cycles < 0:
-            cycles = self.env.args.epoch
-        cycles = int(cycles)
-        stage2_batch_size = (
-            int(getattr(self.env.args, 'alternating_stage2_batch_size', -1))
-            if int(getattr(self.env.args, 'alternating_stage2_batch_size', -1)) > 0
-            else self.env.args.batch_size
-        )
-        stage2_lr = self.env.args.lr
-        stage2_lr_rec = self.env.args.lr_rec
-        stage2_lr_imp = self.env.args.lr_imp
-        stage2_lr_decoder = self.env.args.lr_decoder
-        stage2_freeze_decoder = int(getattr(self.env.args, 'alternating_stage2_freeze_decoder', 1))
-
-        for cycle in range(cycles):
-            print(f'ALTERNATING: cycle = {cycle}, stage = stage1.2')
-            rec_state = self._recommendation_best_state()
-            self.env.args.batch_size = int(getattr(self.env.args, 'alternating_stage1_batch_size', 256))
-            self.env.args.lr_imp = float(getattr(self.env.args, 'alternating_stage1_lr_imp', 0.0005))
-            self.env.args.lr_decoder = float(getattr(self.env.args, 'alternating_stage1_lr_decoder', 0.0002))
-            self.env.args.alpha_intra = float(getattr(self.env.args, 'alternating_stage1_alpha_intra', 1.0))
-            self.env.args.alpha_inter = float(getattr(self.env.args, 'alternating_stage1_alpha_inter', 1.0))
-            self.env.args.alpha_itm = float(getattr(self.env.args, 'alternating_stage1_alpha_itm', 1.0))
-            self.env.args.alpha_rec = float(getattr(self.env.args, 'alternating_stage1_alpha_rec', 1.0))
-            self.env.args.alpha_decode = float(getattr(self.env.args, 'alternating_stage1_alpha_decode', 1.0))
-            self.env.args.stage1_profile = 'v2'
-            self.env.args.stage1_v2_loss_preset = 'balanced'
-            self.env.args.generative_update_mode = 'fixed'
-            self.switch_training_stage(
-                'imputer_backprop',
-                freeze_imputer=-1,
-                freeze_recommender=-1,
-                freeze_decoder=int(getattr(self.env.args, 'alternating_stage1_freeze_decoder', 0)),
-            )
-            self.train(self.total_epoch + 1, finalize=False, start_epoch=self.total_epoch)
-            self._restore_recommendation_best_state(rec_state)
-
-            print(f'ALTERNATING: cycle = {cycle}, stage = stage2')
-            self.env.args.batch_size = stage2_batch_size
-            self.env.args.lr = stage2_lr
-            self.env.args.lr_rec = stage2_lr_rec
-            self.env.args.lr_imp = stage2_lr_imp
-            self.env.args.lr_decoder = stage2_lr_decoder
-            self.switch_training_stage(
-                'recommender',
-                freeze_imputer=-1,
-                freeze_recommender=-1,
-                freeze_decoder=stage2_freeze_decoder,
-            )
-            self.train(self.total_epoch + 1, finalize=False, start_epoch=self.total_epoch)
-            if self.early_stop > self.env.args.early_stop // 1:
-                break
-
-        if self.env.args.evaluation_protocol == 'strict':
-            self.switch_training_stage(
-                'recommender',
-                freeze_imputer=-1,
-                freeze_recommender=-1,
-                freeze_decoder=stage2_freeze_decoder,
-            )
-            self._finalize_strict_test_metrics()
-
-
     def test(self, mode='val', top_list=[50]):
         self.model.eval()
         self.model.set_missing_modality_via_env(eval_split=mode)
+        self.model.set_inductive_item_graph_split(mode)
         t = time.time()
         # user_emb = self.model.user_emb.weight
         # image_feat = self.model.image_feat
@@ -1267,9 +1259,13 @@ class MILK_session(object):
         # item_emb = (self.model.image_linear(image_feat) + self.model.text_linear(text_feat))/2
 
         if getattr(self.model, 'use_rum_fusion', False):
+            if mode == 'test' and bool(getattr(self.env.args, 'report_test_modality_subsets', 0)):
+                raise ValueError('test modality-subset reporting is not implemented for RUM score fusion')
             hr, recall, ndcg = self._test_rum(mode=mode, top_list=top_list)
             return hr, recall, ndcg, time.time() - t
         if getattr(self.model, 'use_score_residual_completion_gate', False):
+            if mode == 'test' and bool(getattr(self.env.args, 'report_test_modality_subsets', 0)):
+                raise ValueError('test modality-subset reporting is not implemented for residual score fusion')
             hr, recall, ndcg = self._test_score_residual(mode=mode, top_list=top_list)
             return hr, recall, ndcg, time.time() - t
 
@@ -1277,24 +1273,81 @@ class MILK_session(object):
 
         user_emb = user_emb.cpu().detach().numpy()
         item_emb = item_emb.cpu().detach().numpy()
+        candidate_only = getattr(self.dataset, 'cold_start_protocol', 'none') == 'milk'
         if mode == 'val':
+            candidate_items = self.dataset.get_eval_candidate_items('val') if candidate_only else self.dataset.cold_item_index
             hr, recall, ndcg = evaluation.num_faiss_evaluate(self.dataset.val_data,
                                                         list(
                                                             self.dataset.val_data.keys()),
-                                                        list(
-                                                            self.dataset.cold_item_index),
+                                                        list(candidate_items),
                                                         self.dataset.train_data,
-                                                        top_list, user_emb, item_emb)
+                                                        top_list, user_emb, item_emb,
+                                                        candidate_only=candidate_only)
         else:
+            candidate_items = self.dataset.get_eval_candidate_items('test') if candidate_only else self.dataset.cold_item_index
             hr, recall, ndcg = evaluation.num_faiss_evaluate(self.dataset.test_data,
                                                              list(
                                                                      self.dataset.test_data.keys()),
-                                                            list(
-                                                                self.dataset.cold_item_index),
+                                                            list(candidate_items),
                                                              self.dataset.train_data,
-                                                             top_list, user_emb, item_emb)
+                                                             top_list, user_emb, item_emb,
+                                                             candidate_only=candidate_only)
+            if bool(getattr(self.env.args, 'report_test_modality_subsets', 0)):
+                missing_items = self.dataset.test_missing_modality_items['items']
+                missing_ratings, full_ratings = evaluation.split_ratings_by_item_membership(
+                    self.dataset.test_data, missing_items
+                )
+                self.last_test_modality_subsets = {}
+                for subset_name, subset_ratings in (
+                    ('full_modal', full_ratings),
+                    ('missing_modal', missing_ratings),
+                ):
+                    counts = evaluation.rating_counts(subset_ratings)
+                    if not subset_ratings:
+                        raise ValueError(
+                            f'test modality subset {subset_name} has no positive interactions'
+                        )
+                    subset_hr, subset_recall, subset_ndcg = evaluation.num_faiss_evaluate(
+                        subset_ratings,
+                        list(subset_ratings.keys()),
+                        list(candidate_items),
+                        self.dataset.train_data,
+                        top_list,
+                        user_emb,
+                        item_emb,
+                        candidate_only=candidate_only,
+                    )
+                    self.last_test_modality_subsets[subset_name] = {
+                        'counts': counts,
+                        'hr': subset_hr,
+                        'recall': subset_recall,
+                        'ndcg': subset_ndcg,
+                    }
 
         return hr, recall, ndcg, time.time() - t
+
+    def log_test_modality_subsets(self, prefix='test'):
+        for subset_name in ('full_modal', 'missing_modal'):
+            result = self.last_test_modality_subsets.get(subset_name)
+            if not result:
+                continue
+            counts = result['counts']
+            count_message = (
+                f'{prefix} subset={subset_name} users={counts["users"]} '
+                f'interactions={counts["interactions"]}'
+            )
+            tool.cprint(count_message)
+            if self.env.args.log:
+                self.env.test_logger.info(count_message)
+            for topk in result['hr']:
+                metric_message = (
+                    f'{prefix} subset={subset_name} hr@{topk} = {result["hr"][topk]:.5f}, '
+                    f'recall@{topk} = {result["recall"][topk]:.5f}, '
+                    f'ndcg@{topk} = {result["ndcg"][topk]:.5f}'
+                )
+                tool.cprint(metric_message)
+                if self.env.args.log:
+                    self.env.test_logger.info(metric_message)
 
     @torch.no_grad()
     def _test_score_residual(self, mode='val', top_list=[50]):
@@ -1308,7 +1361,9 @@ class MILK_session(object):
 
         self.model.clear_gcn_cache()
         outputs = self.model._run_modal_gcn()
-        all_items = torch.arange(self.dataset.m_item, dtype=torch.long, device=self.env.device)
+        candidate_only = getattr(self.dataset, 'cold_start_protocol', 'none') == 'milk'
+        candidate_items = self.dataset.get_eval_candidate_items(mode) if candidate_only else np.arange(self.dataset.m_item)
+        all_items = torch.as_tensor(candidate_items, dtype=torch.long, device=self.env.device)
         ranked_items = {}
 
         for start in range(0, len(eval_users), user_batch_size):
@@ -1317,20 +1372,21 @@ class MILK_session(object):
             running_scores = None
             running_items = None
 
-            for item_start in range(0, self.dataset.m_item, item_chunk_size):
+            for item_start in range(0, all_items.numel(), item_chunk_size):
                 item_ids = all_items[item_start:item_start + item_chunk_size]
                 scores = self.model.score_residual_score_matrix(batch_users, item_ids, outputs=outputs)
-                for row_idx, user_id in enumerate(batch_user_ids):
-                    train_items = self.dataset.train_data.get(user_id, [])
-                    if not train_items:
-                        continue
-                    local_items = [
-                        item - item_start
-                        for item in train_items
-                        if item_start <= item < item_start + item_ids.numel()
-                    ]
-                    if local_items:
-                        scores[row_idx, torch.as_tensor(local_items, dtype=torch.long, device=self.env.device)] = -float('inf')
+                if not candidate_only:
+                    for row_idx, user_id in enumerate(batch_user_ids):
+                        train_items = self.dataset.train_data.get(user_id, [])
+                        if not train_items:
+                            continue
+                        local_items = [
+                            item - item_start
+                            for item in train_items
+                            if item_start <= item < item_start + item_ids.numel()
+                        ]
+                        if local_items:
+                            scores[row_idx, torch.as_tensor(local_items, dtype=torch.long, device=self.env.device)] = -float('inf')
 
                 chunk_topk = min(max_topk, item_ids.numel())
                 chunk_scores, chunk_indices = torch.topk(scores, k=chunk_topk, dim=1)
@@ -1387,7 +1443,9 @@ class MILK_session(object):
 
         self.model.clear_gcn_cache()
         outputs = self.model._run_modal_gcn()
-        all_items = torch.arange(self.dataset.m_item, dtype=torch.long, device=self.env.device)
+        candidate_only = getattr(self.dataset, 'cold_start_protocol', 'none') == 'milk'
+        candidate_items = self.dataset.get_eval_candidate_items(mode) if candidate_only else np.arange(self.dataset.m_item)
+        all_items = torch.as_tensor(candidate_items, dtype=torch.long, device=self.env.device)
         ranked_items = {}
 
         for start in range(0, len(eval_users), user_batch_size):
@@ -1396,20 +1454,21 @@ class MILK_session(object):
             running_scores = None
             running_items = None
 
-            for item_start in range(0, self.dataset.m_item, item_chunk_size):
+            for item_start in range(0, all_items.numel(), item_chunk_size):
                 item_ids = all_items[item_start:item_start + item_chunk_size]
                 scores = self.model.rum_score_matrix(batch_users, item_ids, outputs=outputs)
-                for row_idx, user_id in enumerate(batch_user_ids):
-                    train_items = self.dataset.train_data.get(user_id, [])
-                    if not train_items:
-                        continue
-                    local_items = [
-                        item - item_start
-                        for item in train_items
-                        if item_start <= item < item_start + item_ids.numel()
-                    ]
-                    if local_items:
-                        scores[row_idx, torch.as_tensor(local_items, dtype=torch.long, device=self.env.device)] = -float('inf')
+                if not candidate_only:
+                    for row_idx, user_id in enumerate(batch_user_ids):
+                        train_items = self.dataset.train_data.get(user_id, [])
+                        if not train_items:
+                            continue
+                        local_items = [
+                            item - item_start
+                            for item in train_items
+                            if item_start <= item < item_start + item_ids.numel()
+                        ]
+                        if local_items:
+                            scores[row_idx, torch.as_tensor(local_items, dtype=torch.long, device=self.env.device)] = -float('inf')
 
                 chunk_topk = min(max_topk, item_ids.numel())
                 chunk_scores, chunk_indices = torch.topk(scores, k=chunk_topk, dim=1)
