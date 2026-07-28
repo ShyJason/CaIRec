@@ -146,12 +146,8 @@ class Loader4MM(torch.utils.data.Dataset):
         # build user-itme matrix for interaction graph data
         self.UserItemNet = csr_matrix((np.ones(len(trainUser)), (trainUser, trainItem)), shape=(self.n_user, self.m_item))
 
-        self.image_feat, self.text_feat, self.audio_feat, self.video_feat = self.load_mutimedia_feature()
+        self.image_feat, self.text_feat = self.load_mutimedia_feature()
         self.feature = np.concatenate([self.image_feat, self.text_feat], axis=1)
-        if self.audio_feat is not None:
-            self.feature = np.concatenate([self.feature, self.audio_feat], axis=1)
-        if self.video_feat is not None:
-            self.feature = np.concatenate([self.feature, self.video_feat], axis=1)
 
     def _empty_missing_metadata(self):
         return {
@@ -164,7 +160,7 @@ class Loader4MM(torch.utils.data.Dataset):
         return [int(np.count_nonzero(indicators == index)) for index in range(n_modality)]
 
     def _log_missing_protocol(self, n_modality, rate):
-        names = ['image', 'text', 'audio', 'video'][:n_modality]
+        names = ['image', 'text'][:n_modality]
         split_metadata = (
             ('train', self.train_missing_modality_items),
             ('stage1_val', self.val_missing_modality_items),
@@ -480,24 +476,10 @@ class Loader4MM(torch.utils.data.Dataset):
     def load_mutimedia_feature(self):
         image_file = os.path.join(self.env.DATA_PATH, 'image_feat.npy')
         text_file = os.path.join(self.env.DATA_PATH, 'text_feat.npy')
-        audio_file = os.path.join(self.env.DATA_PATH, 'audio_feat.npy')
-        video_file = os.path.join(self.env.DATA_PATH, 'video_feat.npy')
         image_feat = np.load(image_file)
         text_feat = np.load(text_file)
-        fea = [image_feat, text_feat]
-
-        audio_feat = None
-        if os.path.exists(audio_file):
-            audio_feat = np.load(audio_file)
-            fea.append(audio_feat)
-
-        video_feat = None
-        if os.path.exists(video_file):
-            video_feat = np.load(video_file)
-            fea.append(video_feat)
-
-        self.load_missing_payload(fea, rate=self.env.args.missing_rate)
-        return image_feat, text_feat, audio_feat, video_feat
+        self.load_missing_payload([image_feat, text_feat], rate=self.env.args.missing_rate)
+        return image_feat, text_feat
 
     def getUserAllItems(self):
         posItems = defaultdict(list)

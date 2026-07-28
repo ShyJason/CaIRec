@@ -192,18 +192,6 @@ def _build_parser():
     parser.add_argument('--item_graph_cf_weight', type=float, default=0.5)
     parser.add_argument('--item_graph_image_weight', type=float, default=0.25)
     parser.add_argument('--item_graph_text_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--item_graph_audio_weight',
-        type=float,
-        default=0.0,
-        help='Audio graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
-    )
-    parser.add_argument(
-        '--item_graph_video_weight',
-        type=float,
-        default=0.0,
-        help='Video graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
-    )
     parser.add_argument('--item_graph_feature_chunk_size', type=int, default=1024)
     parser.add_argument(
         '--item_graph_modal_alpha',

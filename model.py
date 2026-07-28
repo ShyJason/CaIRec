@@ -95,13 +95,7 @@ class MILK_model(torch.nn.Module):
         self.ItemItemGraphs = {}
         self.ItemItemRawGraph = None
         self.free_emb_dimension = self.env.args.free_emb_dimension
-        self.has_audio_modality = dataset.audio_feat is not None
-        self.has_video_modality = getattr(dataset, "video_feat", None) is not None
         self.modalities = ["v", "t"]
-        if self.has_audio_modality:
-            self.modalities.append("a")
-        if self.has_video_modality:
-            self.modalities.append("d")
 
         self.train_missing_modality_items = dataset.train_missing_modality_items
         self.val_missing_modality_items = getattr(dataset, "val_missing_modality_items", {"items": [], "indicator": []})
@@ -112,11 +106,6 @@ class MILK_model(torch.nn.Module):
         )
         self.test_missing_modality_items = dataset.test_missing_modality_items
 
-        self.audio_feat = None
-        self.ori_audio_feat = None
-        self.video_feat = None
-        self.ori_video_feat = None
-
         native_image_feat = torch.tensor(dataset.image_feat, dtype=torch.float32).to(self.env.device)
         native_text_feat = torch.tensor(dataset.text_feat, dtype=torch.float32).to(self.env.device)
         self.ori_image_feat = F.normalize(native_image_feat)
@@ -124,15 +113,6 @@ class MILK_model(torch.nn.Module):
 
         self.eval_ori_image_feat = self.ori_image_feat
         self.eval_ori_text_feat = self.ori_text_feat
-
-        if self.has_audio_modality:
-            native_audio_feat = torch.tensor(dataset.audio_feat, dtype=torch.float32).to(self.env.device)
-            self.ori_audio_feat = F.normalize(native_audio_feat)
-            self.eval_ori_audio_feat = self.ori_audio_feat
-        if self.has_video_modality:
-            native_video_feat = torch.tensor(dataset.video_feat, dtype=torch.float32).to(self.env.device)
-            self.ori_video_feat = F.normalize(native_video_feat)
-            self.eval_ori_video_feat = self.ori_video_feat
 
         self.contra_dim = self.env.args.contra_dim
         self.d_beta = self.env.args.d_beta
@@ -162,10 +142,6 @@ class MILK_model(torch.nn.Module):
         if not self.use_latent_completion_bridge:
             self.contra_head_v = Contra_head(self.ori_image_feat.size(1), self.contra_dim)
             self.contra_head_t = Contra_head(self.ori_text_feat.size(1), self.contra_dim)
-            if "a" in self.modalities:
-                self.contra_head_a = Contra_head(self.ori_audio_feat.size(1), self.contra_dim)
-            if "d" in self.modalities:
-                self.contra_head_d = Contra_head(self.ori_video_feat.size(1), self.contra_dim)
         self.itm_cross_attn = nn.MultiheadAttention(
             self.promrl_dim,
             num_heads=self.env.args.itm_num_heads,
@@ -189,15 +165,9 @@ class MILK_model(torch.nn.Module):
         if self.use_decode_head:
             self.decoder_v = self._build_modal_decoder("v", self.ori_image_feat.size(1))
             self.decoder_t = self._build_modal_decoder("t", self.ori_text_feat.size(1))
-            if "a" in self.modalities:
-                self.decoder_a = self._build_modal_decoder("a", self.ori_audio_feat.size(1))
-            if "d" in self.modalities:
-                self.decoder_d = self._build_modal_decoder("d", self.ori_video_feat.size(1))
 
         v_input_dim = self.ori_image_feat.size(1)
         t_input_dim = self.ori_text_feat.size(1)
-        a_input_dim = self.ori_audio_feat.size(1) if "a" in self.modalities else None
-        d_input_dim = self.ori_video_feat.size(1) if "d" in self.modalities else None
 
         self.v_gcn = MGCN(
             self.Graph,
@@ -213,34 +183,11 @@ class MILK_model(torch.nn.Module):
             t_input_dim,
             self.free_emb_dimension,
         )
-        if "a" in self.modalities:
-            self.a_gcn = MGCN(
-                self.Graph,
-                self.n_user,
-                self.m_item,
-                a_input_dim,
-                self.free_emb_dimension,
-            )
-        if "d" in self.modalities:
-            self.d_gcn = MGCN(
-                self.Graph,
-                self.n_user,
-                self.m_item,
-                d_input_dim,
-                self.free_emb_dimension,
-            )
-
         if self.use_decoupled_latent_bridge:
             self.comp_proj_v = self._build_latent_projection_head(v_input_dim)
             self.comp_proj_t = self._build_latent_projection_head(t_input_dim)
             self.comp_to_rec_v = self._build_completion_adapter()
             self.comp_to_rec_t = self._build_completion_adapter()
-            if "a" in self.modalities:
-                self.comp_proj_a = self._build_latent_projection_head(a_input_dim)
-                self.comp_to_rec_a = self._build_completion_adapter()
-            if "d" in self.modalities:
-                self.comp_proj_d = self._build_latent_projection_head(d_input_dim)
-                self.comp_to_rec_d = self._build_completion_adapter()
 
         self.user_emb = torch.nn.Embedding(
             num_embeddings=self.n_user, embedding_dim=self.free_emb_dimension
@@ -530,60 +477,42 @@ class MILK_model(torch.nn.Module):
         (
             self.miss_train_image_feature,
             self.miss_train_text_feature,
-            self.miss_train_audio_feature,
-            self.miss_train_video_feature,
         ) = self._build_missing_feature_view(self.train_missing_modality_items)
         (
             self.miss_val_image_feature,
             self.miss_val_text_feature,
-            self.miss_val_audio_feature,
-            self.miss_val_video_feature,
         ) = self._build_missing_feature_view(self.val_missing_modality_items)
         (
             self.miss_eval_val_image_feature,
             self.miss_eval_val_text_feature,
-            self.miss_eval_val_audio_feature,
-            self.miss_eval_val_video_feature,
         ) = self._build_missing_feature_view(
             self.eval_val_missing_modality_items,
             image_base=self.eval_ori_image_feat,
             text_base=self.eval_ori_text_feat,
-            audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
-            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
         (
             self.miss_test_image_feature,
             self.miss_test_text_feature,
-            self.miss_test_audio_feature,
-            self.miss_test_video_feature,
         ) = self._build_missing_feature_view(
             self.test_missing_modality_items,
             image_base=self.eval_ori_image_feat,
             text_base=self.eval_ori_text_feat,
-            audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
-            video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
     def _build_missing_feature_view(
         self,
         missing_metadata,
         image_base=None,
         text_base=None,
-        audio_base=None,
-        video_base=None,
     ):
         image_base = self.ori_image_feat if image_base is None else image_base
         text_base = self.ori_text_feat if text_base is None else text_base
-        audio_base = self.ori_audio_feat if audio_base is None and "a" in self.modalities else audio_base
-        video_base = self.ori_video_feat if video_base is None and "d" in self.modalities else video_base
         miss_image_feature = copy.deepcopy(image_base)
         miss_text_feature = copy.deepcopy(text_base)
-        miss_audio_feature = copy.deepcopy(audio_base) if "a" in self.modalities else None
-        miss_video_feature = copy.deepcopy(video_base) if "d" in self.modalities else None
 
         selected_missing_items = np.array(missing_metadata["items"], dtype=np.int64)
         selected_missing_modality_indicator = np.array(missing_metadata["indicator"], dtype=np.int64)
         if selected_missing_items.size == 0:
-            return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
+            return miss_image_feature, miss_text_feature
 
         image_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 0]
         if image_missing_indicator.size > 0:
@@ -593,16 +522,7 @@ class MILK_model(torch.nn.Module):
         if text_missing_indicator.size > 0:
             miss_text_feature[text_missing_indicator] = 0
 
-        if "a" in self.modalities:
-            audio_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 2]
-            if audio_missing_indicator.size > 0:
-                miss_audio_feature[audio_missing_indicator] = 0
-        if "d" in self.modalities:
-            video_missing_indicator = selected_missing_items[selected_missing_modality_indicator == 3]
-            if video_missing_indicator.size > 0:
-                miss_video_feature[video_missing_indicator] = 0
-
-        return miss_image_feature, miss_text_feature, miss_audio_feature, miss_video_feature
+        return miss_image_feature, miss_text_feature
 
     def set_missing_modality_via_env(self, eval_split=None):
         mode = self.env.args.exp_mode
@@ -615,104 +535,47 @@ class MILK_model(torch.nn.Module):
             if use_missing_train:
                 self.image_feat = self.miss_train_image_feature
                 self.text_feat = self.miss_train_text_feature
-                if "a" in self.modalities:
-                    self.audio_feat = self.miss_train_audio_feature
-                if "d" in self.modalities:
-                    self.video_feat = self.miss_train_video_feature
                 print("set missing modality successfully for train setp")
             else:
                 self.image_feat = self.ori_image_feat
                 self.text_feat = self.ori_text_feat
-                if "a" in self.modalities:
-                    self.audio_feat = self.ori_audio_feat
-                if "d" in self.modalities:
-                    self.video_feat = self.ori_video_feat
                 print("set complete modality successfully for train step")
         else:
             if use_missing_test:
                 if eval_split == "val":
                     self.image_feat = self.miss_eval_val_image_feature
                     self.text_feat = self.miss_eval_val_text_feature
-                    if "a" in self.modalities:
-                        self.audio_feat = self.miss_eval_val_audio_feature
-                    if "d" in self.modalities:
-                        self.video_feat = self.miss_eval_val_video_feature
                     print("set missing modality successfully for val setp")
                     return
 
                 self.image_feat = self.miss_test_image_feature
                 self.text_feat = self.miss_test_text_feature
-                if "a" in self.modalities:
-                    self.audio_feat = self.miss_test_audio_feature
-                if "d" in self.modalities:
-                    self.video_feat = self.miss_test_video_feature
                 print("set missing modality successfully for test setp")
             else:
                 self.image_feat = self.eval_ori_image_feat
                 self.text_feat = self.eval_ori_text_feat
-                if "a" in self.modalities:
-                    self.audio_feat = self.eval_ori_audio_feat
-                if "d" in self.modalities:
-                    self.video_feat = self.eval_ori_video_feat
                 print("set complete modality successfully for test step")
 
     def _current_raw_modal_features(self, full=False):
         if full:
-            features = {"v": self.ori_image_feat, "t": self.ori_text_feat}
-        else:
-            features = {"v": self.image_feat, "t": self.text_feat}
-        if "a" in self.modalities:
-            if full:
-                features["a"] = self.ori_audio_feat
-            else:
-                features["a"] = self.audio_feat
-        if "d" in self.modalities:
-            if full:
-                features["d"] = self.ori_video_feat
-            else:
-                features["d"] = self.video_feat
-        return features
+            return {"v": self.ori_image_feat, "t": self.ori_text_feat}
+        return {"v": self.image_feat, "t": self.text_feat}
 
     def get_split_raw_modal_features(self, split="test", full=False):
         if full:
-            features = {
+            return {
                 "v": self.ori_image_feat,
                 "t": self.ori_text_feat,
             }
-            if "a" in self.modalities:
-                features["a"] = self.ori_audio_feat
-            if "d" in self.modalities:
-                features["d"] = self.ori_video_feat
-            return features
 
         if split == "train":
-            features = {"v": self.miss_train_image_feature, "t": self.miss_train_text_feature}
-            if "a" in self.modalities:
-                features["a"] = self.miss_train_audio_feature
-            if "d" in self.modalities:
-                features["d"] = self.miss_train_video_feature
-            return features
+            return {"v": self.miss_train_image_feature, "t": self.miss_train_text_feature}
         if split == "val":
-            features = {"v": self.miss_eval_val_image_feature, "t": self.miss_eval_val_text_feature}
-            if "a" in self.modalities:
-                features["a"] = self.miss_eval_val_audio_feature
-            if "d" in self.modalities:
-                features["d"] = self.miss_eval_val_video_feature
-            return features
+            return {"v": self.miss_eval_val_image_feature, "t": self.miss_eval_val_text_feature}
         if split == "imputation_val":
-            features = {"v": self.miss_val_image_feature, "t": self.miss_val_text_feature}
-            if "a" in self.modalities:
-                features["a"] = self.miss_val_audio_feature
-            if "d" in self.modalities:
-                features["d"] = self.miss_val_video_feature
-            return features
+            return {"v": self.miss_val_image_feature, "t": self.miss_val_text_feature}
         if split == "test":
-            features = {"v": self.miss_test_image_feature, "t": self.miss_test_text_feature}
-            if "a" in self.modalities:
-                features["a"] = self.miss_test_audio_feature
-            if "d" in self.modalities:
-                features["d"] = self.miss_test_video_feature
-            return features
+            return {"v": self.miss_test_image_feature, "t": self.miss_test_text_feature}
         raise ValueError(f"Unsupported split: {split}")
 
     def get_missing_item_metadata(self, split="test"):
@@ -752,10 +615,6 @@ class MILK_model(torch.nn.Module):
             "v": self.ori_image_feat.clone(),
             "t": self.ori_text_feat.clone(),
         }
-        if "a" in self.modalities:
-            features["a"] = self.ori_audio_feat.clone()
-        if "d" in self.modalities:
-            features["d"] = self.ori_video_feat.clone()
 
         for metadata in self._completed_item_graph_missing_metadata():
             if metadata is None:
@@ -806,8 +665,6 @@ class MILK_model(torch.nn.Module):
             "cf": float(getattr(self.env.args, "item_graph_cf_weight", 0.5)),
             "image": float(getattr(self.env.args, "item_graph_image_weight", 0.25)),
             "text": float(getattr(self.env.args, "item_graph_text_weight", 0.25)),
-            "audio": float(getattr(self.env.args, "item_graph_audio_weight", 0.0)),
-            "video": float(getattr(self.env.args, "item_graph_video_weight", 0.0)),
         }
         graphs = {"cf": self.dataset._build_cf_item_graph(topk)}
 
@@ -818,10 +675,6 @@ class MILK_model(torch.nn.Module):
             graphs["image"] = build_semantic_graph(graph_feature_np["v"])
         if weights["text"] > 0.0:
             graphs["text"] = build_semantic_graph(graph_feature_np["t"])
-        if "a" in self.modalities and weights["audio"] > 0.0:
-            graphs["audio"] = build_semantic_graph(graph_feature_np["a"])
-        if "d" in self.modalities and weights["video"] > 0.0:
-            graphs["video"] = build_semantic_graph(graph_feature_np["d"])
 
         def modality_graph_parts(feature_graph_name):
             graph_parts = {"cf": graphs["cf"]}
@@ -836,10 +689,6 @@ class MILK_model(torch.nn.Module):
             "v": modality_graph_parts("image"),
             "t": modality_graph_parts("text"),
         }
-        if "a" in self.modalities and "audio" in graphs:
-            modality_graph_specs["a"] = modality_graph_parts("audio")
-        if "d" in self.modalities and "video" in graphs:
-            modality_graph_specs["d"] = modality_graph_parts("video")
 
         self.ItemItemGraphs = {}
         for key, (graph_parts, graph_weights) in modality_graph_specs.items():
@@ -859,8 +708,7 @@ class MILK_model(torch.nn.Module):
             f"built completed item-item graph kind={self.item_graph_kind}, topk={topk}, "
             f"norm={norm_type}, graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
             f"feature_space=shared, "
-            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},"
-            f"audio:{weights['audio']},video:{weights['video']}"
+            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']}"
         )
 
     def _build_single_item_item_graph(self, graph, topk, norm_type):

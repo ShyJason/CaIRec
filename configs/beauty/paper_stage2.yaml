@@ -35,8 +35,6 @@ item_graph_norm: rw
 item_graph_cf_weight: 0.4
 item_graph_image_weight: 0.6
 item_graph_text_weight: 0.6
-item_graph_audio_weight: 0.0
-item_graph_video_weight: 0.0
 item_graph_modal_alpha: 0.25
 item_graph_modal_layers: 1
 
