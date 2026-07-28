@@ -166,18 +166,6 @@ def _build_parser():
     )
     parser.add_argument('--item_graph_topk', type=int, default=20)
     parser.add_argument(
-        '--item_graph_fuse_before_topk',
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            'Experimental completed-item graph construction order. When enabled for '
-            'modality_completed, compute weighted CF+semantic scores over all items first '
-            'and apply top-k only once; the default keeps the legacy per-source top-k '
-            'followed by fusion and a final top-k.'
-        ),
-    )
-    parser.add_argument(
         '--item_graph_missing_scope',
         type=str,
         default='train',
@@ -192,17 +180,8 @@ def _build_parser():
         '--item_graph_kind',
         type=str,
         default='none',
-        choices=[
-            'none',
-            'modality_masked',
-            'modality_completed',
-        ],
-        help=(
-            'Item-item graph adapter kind. modality_masked builds per-modality CF plus semantic '
-            'graphs directly from masked raw features for strict Stage2-only no-completion ablations; '
-            'modality_completed propagates each modality '
-            'embedding with its own CF plus completed-feature modality graph.'
-        ),
+        choices=['none', 'modality_completed'],
+        help='Enable the paper completed-feature item graph during Stage 2.',
     )
     parser.add_argument(
         '--item_graph_norm',
@@ -211,42 +190,8 @@ def _build_parser():
         choices=['rw', 'sym', 'none'],
     )
     parser.add_argument('--item_graph_cf_weight', type=float, default=0.5)
-    parser.add_argument(
-        '--item_graph_cf_scale',
-        type=str,
-        default='raw',
-        choices=['raw', 'sqrt', 'power', 'clip', 'cosine', 'log1p', 'rowmax', 'log1p_rowmax'],
-        help=(
-            'Scale for the CF item-item graph before fusing with semantic graphs. '
-            'raw keeps co-occurrence counts; sqrt/power/log1p compress count tails; '
-            'clip caps counts; cosine normalizes by item popularity; rowmax scales each row to at most 1.'
-        ),
-    )
-    parser.add_argument(
-        '--item_graph_cf_power',
-        type=float,
-        default=0.5,
-        help='Power exponent used when item_graph_cf_scale=power.',
-    )
-    parser.add_argument(
-        '--item_graph_cf_clip',
-        type=float,
-        default=3.0,
-        help='Maximum co-occurrence count used when item_graph_cf_scale=clip.',
-    )
     parser.add_argument('--item_graph_image_weight', type=float, default=0.25)
     parser.add_argument('--item_graph_text_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--item_graph_feature_space',
-        type=str,
-        default='shared',
-        choices=['shared', 'raw_decoder'],
-        help=(
-            'Feature space used to build completed modality item graphs. '
-            'shared uses observed projected completion latents plus imputed completion latents; '
-            'raw_decoder uses observed raw features plus decoded imputed raw features.'
-        ),
-    )
     parser.add_argument(
         '--item_graph_audio_weight',
         type=float,
@@ -271,13 +216,6 @@ def _build_parser():
         type=int,
         default=1,
         help='Number of post-GCN, pre-fusion modality item-item residual propagation layers.',
-    )
-    parser.add_argument(
-        '--item_graph_modal_target',
-        type=str,
-        default='all',
-        choices=['all', 'missing'],
-        help='Apply post-GCN, pre-fusion modality item-item residual to all items or only items missing that modality.',
     )
     parser.add_argument('--alpha_intra', type=float, default=1.0)
     parser.add_argument('--alpha_inter', type=float, default=1.0)
@@ -391,10 +329,7 @@ if args.projection_ckpt is not None:
 if args.imputer_ckpt is not None:
     matched_keys = my_model.load_imputer_checkpoint(args.imputer_ckpt)
     tool.cprint(f'Loaded imputer checkpoint from {args.imputer_ckpt} ({len(matched_keys)} tensors)')
-if getattr(args, 'item_graph_kind', None) in (
-    'modality_masked',
-    'modality_completed',
-):
+if getattr(args, 'item_graph_kind', None) == 'modality_completed':
     my_model.build_completed_item_graph()
 tool.cprint('Init Model')
 

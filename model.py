@@ -153,21 +153,8 @@ class MILK_model(torch.nn.Module):
             1.0,
         )
         self.item_graph_modal_layers = max(int(getattr(self.env.args, "item_graph_modal_layers", 1)), 0)
-        self.item_graph_modal_target = getattr(self.env.args, "item_graph_modal_target", "all")
         self.item_graph_kind = getattr(self.env.args, "item_graph_kind", "none")
-        if self.item_graph_kind == "modality_masked":
-            if not self.disable_imputation:
-                raise ValueError("item_graph_kind=modality_masked requires disable_imputation=1")
-            if getattr(self.env.args, "imputer_ckpt", None):
-                raise ValueError("item_graph_kind=modality_masked forbids imputer_ckpt")
-            if getattr(self.env.args, "ckpt", None):
-                raise ValueError("item_graph_kind=modality_masked forbids pretrained ckpt")
-            if getattr(self.env.args, "train_stage", None) != "recommender":
-                raise ValueError("item_graph_kind=modality_masked is only valid for train_stage=recommender")
-        self.use_completed_item_graph = self.item_graph_kind in (
-            "modality_masked",
-            "modality_completed",
-        )
+        self.use_completed_item_graph = self.item_graph_kind == "modality_completed"
         self.use_item_graph_modal_residual = (
             self.item_graph_modal_alpha > 0.0
             and self.item_graph_modal_layers > 0
@@ -788,51 +775,26 @@ class MILK_model(torch.nn.Module):
         if not self.use_completed_item_graph:
             return
 
-        kind = getattr(self.env.args, "item_graph_kind", "cf")
-        if kind not in (
-            "modality_masked",
-            "modality_completed",
-        ):
-            raise ValueError(f"Unsupported completed item graph kind: {kind}")
+        if self.item_graph_kind != "modality_completed":
+            raise ValueError(f"Unsupported completed item graph kind: {self.item_graph_kind}")
 
         topk = int(getattr(self.env.args, "item_graph_topk", 20))
         norm_type = getattr(self.env.args, "item_graph_norm", "rw")
         chunk_size = int(getattr(self.env.args, "item_graph_feature_chunk_size", 1024))
         missing_scope = getattr(self.env.args, "item_graph_missing_scope", "train")
-        graph_label = "masked" if kind == "modality_masked" else "completed"
-        print(f"building {graph_label} item graph with missing_scope={missing_scope}")
+        print(f"building completed item graph with missing_scope={missing_scope}")
 
         was_training = self.training
         self.eval()
         with torch.no_grad():
             raw_features = self._combined_missing_raw_modal_features()
             masks = self._missing_masks(raw_features=raw_features)
-            graph_feature_space = getattr(self.env.args, "item_graph_feature_space", "shared")
-            if kind == "modality_masked":
-                graph_feature_space = "raw_masked"
-                graph_features = raw_features
-            elif graph_feature_space in ("shared", "raw_decoder"):
-                projected = self.project_features(raw_features=raw_features)
-                graph_features = self._build_completed_features(
-                    projected,
-                    masks,
-                    detach_imputed=True,
-                )
-                if graph_feature_space == "raw_decoder":
-                    if self.use_latent_completion_bridge:
-                        graph_feature_space = "shared"
-                    else:
-                        decoded_raw = self.bridge_completed_to_recommendation_raw(graph_features)
-                        graph_features = {
-                            modality: torch.where(
-                                masks[modality].unsqueeze(1),
-                                raw_features[modality],
-                                decoded_raw[modality],
-                            )
-                            for modality in self.modalities
-                        }
-            else:
-                raise ValueError(f"Unsupported item graph feature space: {graph_feature_space}")
+            projected = self.project_features(raw_features=raw_features)
+            graph_features = self._build_completed_features(
+                projected,
+                masks,
+                detach_imputed=True,
+            )
             graph_feature_np = {
                 modality: graph_features[modality].detach().cpu().numpy().astype(np.float32)
                 for modality in self.modalities
@@ -847,145 +809,59 @@ class MILK_model(torch.nn.Module):
             "audio": float(getattr(self.env.args, "item_graph_audio_weight", 0.0)),
             "video": float(getattr(self.env.args, "item_graph_video_weight", 0.0)),
         }
-        cf_scale = getattr(self.env.args, "item_graph_cf_scale", "raw")
-        cf_power = float(getattr(self.env.args, "item_graph_cf_power", 0.5))
-        cf_clip = float(getattr(self.env.args, "item_graph_cf_clip", 3.0))
-        fuse_before_topk = bool(int(getattr(self.env.args, "item_graph_fuse_before_topk", 0)))
-        if fuse_before_topk and kind != "modality_completed":
-            raise ValueError(
-                "item_graph_fuse_before_topk=1 currently requires item_graph_kind=modality_completed"
-            )
-        full_cf_graph = None
-        if fuse_before_topk:
-            full_cf_graph = self.dataset._build_cf_item_similarity(
-                scale=cf_scale,
-                power=cf_power,
-                clip=cf_clip,
-            )
-            cf_graph = self.dataset._topk_sparse_rows(full_cf_graph, topk)
-        else:
-            cf_graph = self.dataset._build_cf_item_graph(
-                topk,
-                scale=cf_scale,
-                power=cf_power,
-                clip=cf_clip,
-            )
-        graphs = {"cf": cf_graph}
+        graphs = {"cf": self.dataset._build_cf_item_graph(topk)}
+
         def build_semantic_graph(feature):
             return self.dataset._build_feature_item_graph(feature, topk, chunk_size)
 
-        if weights["image"] > 0.0 and not fuse_before_topk:
+        if weights["image"] > 0.0:
             graphs["image"] = build_semantic_graph(graph_feature_np["v"])
-        if weights["text"] > 0.0 and not fuse_before_topk:
+        if weights["text"] > 0.0:
             graphs["text"] = build_semantic_graph(graph_feature_np["t"])
-        if "a" in self.modalities and weights["audio"] > 0.0 and not fuse_before_topk:
+        if "a" in self.modalities and weights["audio"] > 0.0:
             graphs["audio"] = build_semantic_graph(graph_feature_np["a"])
-        if "d" in self.modalities and weights["video"] > 0.0 and not fuse_before_topk:
+        if "d" in self.modalities and weights["video"] > 0.0:
             graphs["video"] = build_semantic_graph(graph_feature_np["d"])
-        if kind == "modality_masked":
-            masked_graph_specs = (("image", "v"), ("text", "t"), ("audio", "a"), ("video", "d"))
-            for graph_name, modality in masked_graph_specs:
-                if graph_name not in graphs or modality not in masks:
-                    continue
-                missing = (~masks[modality]).detach().cpu().numpy()
-                if graphs[graph_name][missing].nnz or graphs[graph_name][:, missing].nnz:
-                    raise RuntimeError(
-                        f"modality_masked graph contains semantic edges involving missing {modality} items"
-                    )
-                print(
-                    f"strict masked graph modality={modality} missing_items={int(missing.sum())} "
-                    f"semantic_edges={graphs[graph_name].nnz} missing_semantic_edges=0"
-                )
-        if kind in ("modality_masked", "modality_completed"):
-            self.ItemItemGraphs = {}
-            if fuse_before_topk:
-                modality_specs = {
-                    "v": ("v", weights["image"]),
-                    "t": ("t", weights["text"]),
-                }
-                if "a" in self.modalities:
-                    modality_specs["a"] = ("a", weights["audio"])
-                if "d" in self.modalities:
-                    modality_specs["d"] = ("d", weights["video"])
 
-                cf_only = self._build_weighted_item_item_graph(
-                    {"cf": graphs["cf"]},
-                    {"cf": weights["cf"]},
-                    topk,
-                    norm_type,
-                    required_names=["cf"],
-                    context=f"{graph_label} cf item graph",
-                )
-                self.ItemItemGraphs["cf"] = (
-                    self.dataset._convert_sp_mat_to_sp_tensor(cf_only).coalesce().to(self.env.device)
-                )
-                for key, (modality, feature_weight) in modality_specs.items():
-                    if feature_weight <= 0.0:
-                        continue
-                    graph = self.dataset._build_fused_cf_feature_item_graph(
-                        graph_feature_np[modality],
-                        full_cf_graph,
-                        topk,
-                        chunk_size,
-                        weights["cf"],
-                        feature_weight,
-                    )
-                    graph = self.dataset._normalize_item_graph(graph, norm_type)
-                    self.ItemItemGraphs[key] = (
-                        self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-                    )
-                self.ItemItemGraph = None
-                print(
-                    f"built {graph_label} item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                    f"graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
-                    f"feature_space={graph_feature_space}, fusion_order=fuse_then_topk, "
-                    f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                    f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},"
-                    f"audio:{weights['audio']},video:{weights['video']}"
-                )
-                return
-            def modality_graph_parts(feature_graph_name):
-                graph_parts = {"cf": graphs["cf"]}
-                graph_weights = {"cf": weights["cf"]}
-                if feature_graph_name in graphs and weights[feature_graph_name] > 0.0:
-                    graph_parts[feature_graph_name] = graphs[feature_graph_name]
-                    graph_weights[feature_graph_name] = weights[feature_graph_name]
-                return graph_parts, graph_weights
+        def modality_graph_parts(feature_graph_name):
+            graph_parts = {"cf": graphs["cf"]}
+            graph_weights = {"cf": weights["cf"]}
+            if feature_graph_name in graphs and weights[feature_graph_name] > 0.0:
+                graph_parts[feature_graph_name] = graphs[feature_graph_name]
+                graph_weights[feature_graph_name] = weights[feature_graph_name]
+            return graph_parts, graph_weights
 
-            modality_graph_specs = {
-                "cf": ({"cf": graphs["cf"]}, {"cf": weights["cf"]}),
-                "v": modality_graph_parts("image"),
-                "t": modality_graph_parts("text"),
-            }
-            if "a" in self.modalities and "audio" in graphs:
-                modality_graph_specs["a"] = (
-                    {"cf": graphs["cf"], "audio": graphs["audio"]},
-                    {"cf": weights["cf"], "audio": weights["audio"]},
-                )
-            if "d" in self.modalities and "video" in graphs:
-                modality_graph_specs["d"] = (
-                    {"cf": graphs["cf"], "video": graphs["video"]},
-                    {"cf": weights["cf"], "video": weights["video"]},
-                )
-            for key, (graph_parts, graph_weights) in modality_graph_specs.items():
-                graph = self._build_weighted_item_item_graph(
-                    graph_parts,
-                    graph_weights,
-                    topk,
-                    norm_type,
-                    required_names=list(graph_parts.keys()),
-                    context=f"{graph_label} {key} item graph",
-                )
-                self.ItemItemGraphs[key] = self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
-            self.ItemItemGraph = None
-            print(
-                f"built {graph_label} item-item graph kind={kind}, topk={topk}, norm={norm_type}, "
-                f"graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
-                f"feature_space={graph_feature_space}, "
-                f"cf_scale={cf_scale},cf_power={cf_power},cf_clip={cf_clip}, "
-                f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},audio:{weights['audio']},video:{weights['video']}"
+        modality_graph_specs = {
+            "cf": ({"cf": graphs["cf"]}, {"cf": weights["cf"]}),
+            "v": modality_graph_parts("image"),
+            "t": modality_graph_parts("text"),
+        }
+        if "a" in self.modalities and "audio" in graphs:
+            modality_graph_specs["a"] = modality_graph_parts("audio")
+        if "d" in self.modalities and "video" in graphs:
+            modality_graph_specs["d"] = modality_graph_parts("video")
+
+        self.ItemItemGraphs = {}
+        for key, (graph_parts, graph_weights) in modality_graph_specs.items():
+            graph = self._build_weighted_item_item_graph(
+                graph_parts,
+                graph_weights,
+                topk,
+                norm_type,
+                required_names=list(graph_parts.keys()),
+                context=f"completed {key} item graph",
             )
-            return
+            self.ItemItemGraphs[key] = (
+                self.dataset._convert_sp_mat_to_sp_tensor(graph).coalesce().to(self.env.device)
+            )
+        self.ItemItemGraph = None
+        print(
+            f"built completed item-item graph kind={self.item_graph_kind}, topk={topk}, "
+            f"norm={norm_type}, graphs={','.join(sorted(self.ItemItemGraphs.keys()))}, "
+            f"feature_space=shared, "
+            f"weights=cf:{weights['cf']},image:{weights['image']},text:{weights['text']},"
+            f"audio:{weights['audio']},video:{weights['video']}"
+        )
 
     def _build_single_item_item_graph(self, graph, topk, norm_type):
         graph = self.dataset._topk_sparse_rows(graph.tocsr(), topk)
@@ -1327,10 +1203,7 @@ class MILK_model(torch.nn.Module):
         return item_emb
 
     def _item_graph_for_modality(self, modality=None):
-        if self.item_graph_kind in (
-            "modality_masked",
-            "modality_completed",
-        ):
+        if self.item_graph_kind == "modality_completed":
             if not self.ItemItemGraphs:
                 raise RuntimeError(
                     "modality graph item-item propagation requires modality item-item graphs"
@@ -1341,7 +1214,7 @@ class MILK_model(torch.nn.Module):
             return self.ItemItemGraphs[key]
         return self.ItemItemGraph
 
-    def _apply_item_graph_modal_residual(self, item_emb, observed_mask=None, modality=None):
+    def _apply_item_graph_modal_residual(self, item_emb, modality=None):
         if not self.use_item_graph_modal_residual:
             return item_emb
 
@@ -1353,9 +1226,6 @@ class MILK_model(torch.nn.Module):
                 raise RuntimeError("item_graph_modal_alpha > 0 requires an item-item graph")
             neigh = torch.sparse.mm(graph, out)
             out = (1.0 - alpha) * out + alpha * neigh
-        if self.item_graph_modal_target == "missing" and observed_mask is not None:
-            missing_mask = ~observed_mask
-            out = torch.where(missing_mask.unsqueeze(1), out, item_emb)
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _fuse_item_sources(self, item_outputs):
@@ -1368,7 +1238,6 @@ class MILK_model(torch.nn.Module):
             raw_features=raw_features,
             allow_imputer_grad=allow_modal_grad,
         )
-        observed_masks = self._missing_masks(raw_features=raw_features)
         user_outputs = {}
         item_outputs = {}
         for modality in self.modalities:
@@ -1378,7 +1247,7 @@ class MILK_model(torch.nn.Module):
                 skip_mlp=self._gcn_skip_mlp(),
             )
             modal_item_emb = self._apply_item_graph_modal_residual(
-                modal_item_emb, observed_masks[modality], modality=modality
+                modal_item_emb, modality=modality
             )
             user_outputs[modality] = modal_user_emb
             item_outputs[modality] = modal_item_emb
@@ -1494,7 +1363,6 @@ class MILK_model(torch.nn.Module):
         }
 
         item_outputs = {}
-        observed_masks = self._missing_masks(raw_features)
         for modality in self.modalities:
             _, item_emb = modal_gcns[modality](
                 modal_features[modality],
@@ -1504,7 +1372,6 @@ class MILK_model(torch.nn.Module):
             if apply_item_graph:
                 item_emb = self._apply_item_graph_modal_residual(
                     item_emb,
-                    observed_mask=observed_masks[modality],
                     modality=modality,
                 )
             item_outputs[modality] = F.normalize(
@@ -2314,9 +2181,7 @@ class MILK_model(torch.nn.Module):
             return self._gcn_cache
 
         user_id_emb = self.user_emb.weight
-        raw_features = self._current_raw_modal_features()
         modal_features = self.get_recommender_modal_features()
-        observed_masks = self._missing_masks(raw_features=raw_features)
 
         outputs = {"user_id": user_id_emb}
         for modality in self.modalities:
@@ -2324,7 +2189,7 @@ class MILK_model(torch.nn.Module):
                 modal_features[modality], user_id_emb, skip_mlp=self._gcn_skip_mlp()
             )
             modal_item_emb = self._apply_item_graph_modal_residual(
-                modal_item_emb, observed_masks[modality], modality=modality
+                modal_item_emb, modality=modality
             )
             outputs[modality] = (modal_user_emb, modal_item_emb)
 

@@ -382,59 +382,8 @@ class Loader4MM(torch.utils.data.Dataset):
             data.extend(row_data.tolist())
         return sp.csr_matrix((data, (rows, cols)), shape=matrix.shape, dtype=np.float32)
 
-    def _scale_cf_item_graph(self, graph, scale, power=0.5, clip=3.0):
-        scale = str(scale or 'raw')
-        graph = graph.tocsr().astype(np.float32)
-        if scale == 'raw':
-            return graph
-        if scale == 'sqrt':
-            graph = graph.copy()
-            graph.data = np.sqrt(graph.data).astype(np.float32)
-            return graph
-        if scale == 'power':
-            graph = graph.copy()
-            graph.data = np.power(graph.data, float(power)).astype(np.float32)
-            return graph
-        if scale == 'clip':
-            graph = graph.copy()
-            graph.data = np.minimum(graph.data, float(clip)).astype(np.float32)
-            return graph
-        if scale == 'cosine':
-            item_pop = np.asarray(self.UserItemNet.sum(axis=0)).flatten().astype(np.float32)
-            inv_sqrt = np.zeros_like(item_pop, dtype=np.float32)
-            nonzero = item_pop > 0
-            inv_sqrt[nonzero] = np.power(item_pop[nonzero], -0.5)
-            d_mat = sp.diags(inv_sqrt)
-            return d_mat.dot(graph).dot(d_mat).tocsr().astype(np.float32)
-        if scale == 'log1p':
-            graph = graph.copy()
-            graph.data = np.log1p(graph.data).astype(np.float32)
-            return graph
-        if scale in ('rowmax', 'log1p_rowmax'):
-            graph = graph.copy()
-            if scale == 'log1p_rowmax':
-                graph.data = np.log1p(graph.data).astype(np.float32)
-            rowsum_max = np.zeros(graph.shape[0], dtype=np.float32)
-            for row in range(graph.shape[0]):
-                start, end = graph.indptr[row], graph.indptr[row + 1]
-                if end > start:
-                    rowsum_max[row] = graph.data[start:end].max()
-            inv = np.zeros_like(rowsum_max, dtype=np.float32)
-            nonzero = rowsum_max > 0
-            inv[nonzero] = 1.0 / rowsum_max[nonzero]
-            return sp.diags(inv).dot(graph).tocsr().astype(np.float32)
-        raise ValueError(f'Unsupported CF item graph scale: {scale}')
-
-    def _build_cf_item_similarity(self, scale='raw', power=0.5, clip=3.0):
+    def _build_cf_item_graph(self, topk):
         graph = self.UserItemNet.T.dot(self.UserItemNet).tocsr().astype(np.float32)
-        return self._scale_cf_item_graph(graph, scale, power=power, clip=clip)
-
-    def _build_cf_item_graph(self, topk, scale='raw', power=0.5, clip=3.0):
-        graph = self._build_cf_item_similarity(
-            scale=scale,
-            power=power,
-            clip=clip,
-        )
         return self._topk_sparse_rows(graph, topk)
 
     def _build_feature_item_graph(self, feature, topk, chunk_size):
@@ -454,64 +403,6 @@ class Loader4MM(torch.utils.data.Dataset):
             sim[np.arange(end - start), local_rows] = -np.inf
             top_idx = np.argpartition(sim, -k, axis=1)[:, -k:]
             top_val = np.take_along_axis(sim, top_idx, axis=1)
-            order = np.argsort(top_val, axis=1)[:, ::-1]
-            top_idx = np.take_along_axis(top_idx, order, axis=1)
-            top_val = np.take_along_axis(top_val, order, axis=1)
-            for offset, row in enumerate(local_rows):
-                valid = np.isfinite(top_val[offset]) & (top_val[offset] > 0)
-                row_cols = top_idx[offset][valid][:topk]
-                row_data = top_val[offset][valid][:topk]
-                if row_data.size == 0:
-                    continue
-                rows.extend([int(row)] * row_data.size)
-                cols.extend(row_cols.astype(np.int64).tolist())
-                data.extend(row_data.astype(np.float32).tolist())
-        return sp.csr_matrix((data, (rows, cols)), shape=(n_item, n_item), dtype=np.float32)
-
-    def _build_fused_cf_feature_item_graph(
-        self,
-        feature,
-        cf_graph,
-        topk,
-        chunk_size,
-        cf_weight,
-        feature_weight,
-    ):
-        """Fuse full CF and semantic scores, then select one final row-wise top-k."""
-        feature = np.asarray(feature, dtype=np.float32)
-        norms = np.linalg.norm(feature, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        feature = feature / norms
-
-        n_item = feature.shape[0]
-        cf_graph = cf_graph.tocsr().astype(np.float32)
-        if cf_graph.shape != (n_item, n_item):
-            raise ValueError(
-                f'CF graph shape must match item features: {cf_graph.shape} != {(n_item, n_item)}'
-            )
-
-        cf_weight = max(float(cf_weight), 0.0)
-        feature_weight = max(float(feature_weight), 0.0)
-        total_weight = cf_weight + feature_weight
-        if total_weight <= 0.0:
-            raise ValueError('Fused CF-feature graph requires a positive source weight')
-
-        chunk_size = max(int(chunk_size), 1)
-        topk = min(max(int(topk), 1), max(n_item - 1, 1))
-        candidate_k = min(topk + 1, n_item)
-        rows, cols, data = [], [], []
-        for start in tqdm(range(0, n_item, chunk_size), desc='building fuse-before-topk item graph'):
-            end = min(start + chunk_size, n_item)
-            scores = np.matmul(feature[start:end], feature.T)
-            scores *= feature_weight
-            if cf_weight > 0.0:
-                scores += cf_weight * cf_graph[start:end].toarray()
-            scores *= 1.0 / total_weight
-
-            local_rows = np.arange(start, end)
-            scores[np.arange(end - start), local_rows] = -np.inf
-            top_idx = np.argpartition(scores, -candidate_k, axis=1)[:, -candidate_k:]
-            top_val = np.take_along_axis(scores, top_idx, axis=1)
             order = np.argsort(top_val, axis=1)[:, ::-1]
             top_idx = np.take_along_axis(top_idx, order, axis=1)
             top_val = np.take_along_axis(top_val, order, axis=1)
