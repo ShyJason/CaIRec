@@ -37,6 +37,7 @@ else
 fi
 CKPT="${CKPT:-}"
 CKPT_START_EPOCH="${CKPT_START_EPOCH:-}"
+PROJECTION_CKPT="${PROJECTION_CKPT:-}"
 IMPUTER_CKPT="${IMPUTER_CKPT:-}"
 FREEZE_IMPUTER="${FREEZE_IMPUTER:--1}"
 FREEZE_RECOMMENDER="${FREEZE_RECOMMENDER:--1}"
@@ -219,6 +220,10 @@ fi
 
 if [[ -n "${IMPUTER_CKPT}" ]]; then
   cmd+=(--imputer_ckpt "${IMPUTER_CKPT}")
+fi
+
+if [[ -n "${PROJECTION_CKPT}" ]]; then
+  cmd+=(--projection_ckpt "${PROJECTION_CKPT}")
 fi
 
 if [[ -n "${EVAL_MISSING_RATE}" ]]; then

@@ -30,9 +30,9 @@ neighbors with weights `0.4` and `0.6`; the graph residual strength is `0.25`.
 ├── dataset_loader.py, evaluation.py    # data protocol and evaluation
 ├── promrl_core/                        # completion runtime
 ├── configs/                            # retained paper configurations
+├── pretrained_projections/             # fixed Stage 1 projection initializers
 ├── reproduce_best/20260719/            # fixed Stage 2 reproduction commands
 ├── scripts/                            # data preparation and significance test
-├── tools/                              # projection pretraining
 └── tests/                              # focused regression tests
 ```
 
@@ -56,6 +56,21 @@ The fixed reproduction commands load:
 
 Datasets and checkpoints are not committed to Git. Their public download
 manifest must be supplied separately.
+
+## Train the mainline
+
+Stage 0 projection training is not part of this repository. Stage 1 starts by
+loading the matching pretrained modality projection from
+`pretrained_projections/<dataset>.pth`. The default launch is:
+
+```bash
+bash run_mmrec_mainline.sh
+```
+
+Set `DATASET=beauty` or `DATASET=sports` for the other retained datasets. An
+explicit `PROJECTION_CKPT=/path/to/projection.pth` can override the bundled
+initializer. The checkpoint is loaded through the projection-only loader, so
+unrelated imputer or recommender tensors are ignored.
 
 ## Reproduce the recorded Stage 2 runs
 

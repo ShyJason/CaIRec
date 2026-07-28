@@ -656,7 +656,7 @@ class MILK_model(torch.nn.Module):
 
     def _uses_stage1_holdout_metrics(self, train_stage=None):
         canonical_stage = self._canonical_stage(train_stage)
-        return canonical_stage in ("imputer_backprop", "projection_pretrain")
+        return canonical_stage == "imputer_backprop"
 
     def _training_observed_mask(self, modality, dataset):
         mask = torch.ones(self.m_item, dtype=torch.bool, device=self.env.device)
@@ -830,20 +830,16 @@ class MILK_model(torch.nn.Module):
     def configure_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=0):
         canonical_stage = self._canonical_stage(train_stage)
 
-        auto_freeze_imputer = canonical_stage in ("recommender", "projection_pretrain")
-        auto_freeze_recommender = canonical_stage in ("imputer_param", "imputer_backprop", "projection_pretrain")
-        auto_freeze_decoder = canonical_stage in ("imputer_param", "projection_pretrain")
+        auto_freeze_imputer = canonical_stage == "recommender"
+        auto_freeze_recommender = canonical_stage in ("imputer_param", "imputer_backprop")
+        auto_freeze_decoder = canonical_stage == "imputer_param"
 
         freeze_imputer = auto_freeze_imputer if freeze_imputer < 0 else bool(freeze_imputer)
         freeze_recommender = auto_freeze_recommender if freeze_recommender < 0 else bool(freeze_recommender)
         freeze_decoder = auto_freeze_decoder if freeze_decoder < 0 else bool(freeze_decoder)
 
         imputer_module_trainable = not freeze_imputer and canonical_stage != "imputer_param"
-        if canonical_stage == "projection_pretrain":
-            imputer_module_trainable = False
         self._set_modules_trainable(self._imputer_modules(), imputer_module_trainable)
-        if canonical_stage == "projection_pretrain":
-            self._set_modules_trainable(self._projection_modules(), True)
         self._set_modules_trainable(self._recommender_modules(), not freeze_recommender)
         if self.use_latent_completion_bridge and imputer_module_trainable and freeze_recommender:
             self._set_modules_trainable(self._projection_modules(), True)
@@ -869,7 +865,6 @@ class MILK_model(torch.nn.Module):
             getattr(self.env.args, "generative_update_mode", "em") == "em"
             and canonical_stage in (
                 "imputer_param",
-                "projection_pretrain",
                 "joint",
             )
         )
@@ -911,6 +906,54 @@ class MILK_model(torch.nn.Module):
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         self.load_state_dict(state_dict, strict=False)
         return len(state_dict)
+
+    def load_projection_checkpoint(self, ckpt_path):
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        projection_prefixes = []
+        if self.use_decoupled_latent_bridge:
+            projection_prefixes.extend(
+                f"comp_proj_{modality}" for modality in self.modalities
+            )
+        elif self.use_latent_direct_bridge:
+            projection_prefixes.extend(
+                f"{modality}_gcn.MLP" for modality in self.modalities
+            )
+        else:
+            projection_prefixes.extend(
+                f"contra_head_{modality}" for modality in self.modalities
+            )
+
+        current_state = self.state_dict()
+        matched_state = {
+            key: value
+            for key, value in state_dict.items()
+            if (
+                key in current_state
+                and value.shape == current_state[key].shape
+                and any(
+                    key == prefix or key.startswith(f"{prefix}.")
+                    for prefix in projection_prefixes
+                )
+            )
+        }
+        expected_keys = {
+            key
+            for key in current_state
+            if any(
+                key == prefix or key.startswith(f"{prefix}.")
+                for prefix in projection_prefixes
+            )
+        }
+        missing_keys = sorted(expected_keys - matched_state.keys())
+        if missing_keys:
+            raise ValueError(
+                "Projection checkpoint is incomplete or incompatible; "
+                f"missing tensors={missing_keys}: {ckpt_path}"
+            )
+        current_state.update(matched_state)
+        self.load_state_dict(current_state, strict=False)
+        return sorted(matched_state.keys())
 
     def load_imputer_checkpoint(self, ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location="cpu")
@@ -4407,7 +4450,6 @@ class MILK_model(torch.nn.Module):
             )
             if self._imputer_updates_enabled and stage in (
                 "imputer_param",
-                "projection_pretrain",
                 "joint",
             ):
                 self.queue_em_update(batch_data, posterior_mean, posterior_cov)

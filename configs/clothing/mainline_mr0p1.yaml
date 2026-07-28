@@ -59,8 +59,6 @@ item_graph_modal_target: all
 
 reg_coeff: 0.01
 penalty_coeff: 1.0
-max_info_coeff: 0.01
-min_info_coeff: 0.000001
 modality_bpr_coeff: 1.0
 
 contra_dim: 64

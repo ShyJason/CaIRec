@@ -14,7 +14,6 @@ import evaluation
 STAGE1_IMPUTER_STAGES = (
     'imputer_param',
     'imputer_backprop',
-    'projection_pretrain',
 )
 
 
@@ -536,7 +535,7 @@ class MILK_session(object):
             promrl_itm_loss = zero
             promrl_decode_loss = zero
             promrl_decode_kl_loss = zero
-        elif stage in ('projection_pretrain', 'imputer_backprop'):
+        elif stage == 'imputer_backprop':
             stage_promrl_loss = (
                 self.env.args.alpha_intra * promrl_intra_loss
                 + self.env.args.alpha_inter * promrl_inter_loss
@@ -575,7 +574,6 @@ class MILK_session(object):
         if effective_stage not in (
             'imputer_param',
             'imputer_backprop',
-            'projection_pretrain',
             'joint',
         ):
             return False

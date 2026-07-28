@@ -95,6 +95,12 @@ def _build_parser():
     )
     parser.add_argument('--ckpt', type=str, default=None)
     parser.add_argument('--eval_only', type=int, default=0)
+    parser.add_argument(
+        '--projection_ckpt',
+        type=str,
+        default=None,
+        help='Pretrained modality projection checkpoint loaded before Stage 1.',
+    )
     parser.add_argument('--imputer_ckpt', type=str, default=None)
     parser.add_argument('--ckpt_start_epoch', type=int, default=0)
 
@@ -106,7 +112,6 @@ def _build_parser():
     parser.add_argument('--lr_decoder', type=float, default=None)
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--eva_interval', type=int, default=10)
-    parser.add_argument('--neg_num', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=2048)
     parser.add_argument('--early_stop', type=int, default=20)
     parser.add_argument('--topk', type=str, default='[10, 20, 30, 40, 50]')
@@ -160,7 +165,6 @@ def _build_parser():
         help='Optional split directory. Relative paths are resolved below Data/<dataset>.',
     )
     parser.add_argument('--exp_mode', type=str, default='fm')
-    parser.add_argument('--model', type=str, default='MILK')
     parser.add_argument(
         '--train_stage',
         type=str,
@@ -168,7 +172,6 @@ def _build_parser():
         choices=[
             'imputer_param',
             'imputer_backprop',
-            'projection_pretrain',
             'recommender',
             'joint',
         ],
@@ -180,9 +183,6 @@ def _build_parser():
     # ----------------------- Regularizer coefficient
     parser.add_argument('--reg_coeff', type=float, default=1e-4)
     parser.add_argument('--penalty_coeff', type=float, default=50) # b 1000  c 50
-    parser.add_argument('--max_info_coeff', type=float, default=0.05) # b 0.1   c 0.05
-    parser.add_argument('--min_info_coeff', type=float, default=0.05) # b 0.1   c 0.05
-
     parser.add_argument('--missing_rate', type=float, default=0.3)
     parser.add_argument(
         '--eval_missing_rate',
@@ -191,7 +191,6 @@ def _build_parser():
         help='Validation/test missing-modality rate. Defaults to the historical fixed 0.5 protocol.',
     )
 
-    parser.add_argument('--alpha', type=float, default=0.1)
     parser.add_argument('--contra_dim', type=int, default=256)
     parser.add_argument('--d_beta', type=int, default=128)
     parser.add_argument('--tau1', type=float, default=0.1)
@@ -868,12 +867,6 @@ def _build_parser():
         help='First epoch to apply stage2 true-missing GCN InfoNCE. Earlier epochs use weight 0.',
     )
     parser.add_argument(
-        '--rec_neighbor_cl_end_epoch',
-        type=int,
-        default=-1,
-        help='Last epoch for stage2 true-missing GCN InfoNCE schedule. Negative keeps the base weight forever.',
-    )
-    parser.add_argument(
         '--rec_neighbor_cl_decay_start_epoch',
         type=int,
         default=-1,
@@ -883,7 +876,7 @@ def _build_parser():
         '--rec_neighbor_cl_final_weight',
         type=float,
         default=-1.0,
-        help='Final CL weight at rec_neighbor_cl_end_epoch. Negative keeps the base weight.',
+        help='Final CL weight at the end of training. Negative keeps the base weight.',
     )
     parser.add_argument('--imputation_val_rate', type=float, default=0.0)
     parser.add_argument(
@@ -983,6 +976,9 @@ my_model = MILK_model(my_env, my_loader)
 if args.ckpt is not None:
     loaded_count = my_model.load_full_checkpoint(args.ckpt)
     tool.cprint(f'Loaded full checkpoint from {args.ckpt} ({loaded_count} tensors)')
+if args.projection_ckpt is not None:
+    matched_keys = my_model.load_projection_checkpoint(args.projection_ckpt)
+    tool.cprint(f'Loaded pretrained projection from {args.projection_ckpt} ({len(matched_keys)} tensors)')
 if args.imputer_ckpt is not None:
     matched_keys = my_model.load_imputer_checkpoint(args.imputer_ckpt)
     tool.cprint(f'Loaded imputer checkpoint from {args.imputer_ckpt} ({len(matched_keys)} tensors)')
