@@ -5,30 +5,6 @@ code. It combines latent modality completion with modality-specific
 recommendation projections, modality GCNs, completed-feature item graphs, and
 BPR optimization.
 
-## Main setting
-
-The recorded paper setting uses the `unified_static` missing protocol with the
-same pre-generated 50% missing-item payload for training, validation, and test.
-The payload seed and model seed are both `2023`.
-
-| Dataset | Historical Recall@20 / NDCG@20 | Best epoch | Historical fusion |
-| --- | ---: | ---: | --- |
-| Clothing | 0.08141 / 0.03612 | 280 | fusion, scale 50 |
-| Beauty | 0.08418 / 0.03386 | 177 | disabled; mean fusion |
-| Sports | 0.10579 / 0.04735 | 239 | graph and fusion, scale 50 |
-
-Clothing and Sports values above are retained as historical references from
-the former posterior-reliability setting. The current canonical Stage 2
-configurations disable posterior reliability and use unweighted mean modality
-fusion for all three datasets. They also remove the Stage 2 Rec Neighbor
-contrastive objective. Fresh runs are required before replacing the reported
-values.
-
-The shared Stage 2 setting uses a frozen completion module, learning rate
-`0.005`, batch size `2048`, strict validation-based checkpoint selection, and
-one completed item graph per modality. The graph combines CF and semantic
-neighbors with weights `0.4` and `0.6`; the graph residual strength is `0.25`.
-
 ## Repository layout
 
 ```text
