@@ -931,7 +931,6 @@ class MILK_session(object):
                 'distill_loss': float(distill_loss),
                 'train_time': float(train_time),
             }
-            self.last_train_metrics.update(gate_metrics)
             self.last_train_metrics.update(rum_metrics)
 
             if self.env.args.tensorboard:
@@ -950,8 +949,6 @@ class MILK_session(object):
                 self.env.w.add_scalar('Train/rec_neighbor_cl_weight', float(rec_neighbor_cl_weight_eff), self.total_epoch)
                 self.env.w.add_scalar('Train/align_loss', float(align_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/distill_loss', float(distill_loss), self.total_epoch)
-                for key, value in sorted(gate_metrics.items()):
-                    self.env.w.add_scalar(f'Train/{key}', float(value), self.total_epoch)
                 for key, value in sorted(rum_metrics.items()):
                     self.env.w.add_scalar(f'Train/{key}', float(value), self.total_epoch)
                 for group_idx, group in enumerate(self.representation_optimizer.param_groups if self.representation_optimizer is not None else []):
