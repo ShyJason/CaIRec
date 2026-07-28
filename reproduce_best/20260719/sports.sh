@@ -25,7 +25,7 @@ verify_sha256() {
   }
 }
 
-verify_sha256 b782119d3ccba7e96f6898b85742716cc49ca616214b24dcea4a6fe21c2a4197 "${CONFIG}"
+verify_sha256 26dfa375e20c579d99b33584065adcf6126896e3187f27b75da9e0b0412af9fb "${CONFIG}"
 verify_sha256 95e388b214f75fd159de7b28c9902a60604eca2c804370324c8738d9d7db6086 "${IMPUTER_CKPT}"
 verify_sha256 421816fbeaa65cb6323f9f42e209a52f5688401525ba75bb6c902789580aaabe "${PAYLOAD}"
 test -f Data/sports/sports.inter
@@ -34,7 +34,7 @@ test -f Data/sports/text_feat.npy
 "${PYTHON_BIN}" main.py --config "${CONFIG}" --check_config
 
 echo "dataset=sports protocol=unified_static train_mr=0.5 eval_mr=0.5 seed=2023 payload_seed=2023"
-echo "reliability=both scale=50 fusion=posterior_reliability"
+echo "reliability=off fusion=mean"
 echo "checkpoint=${IMPUTER_CKPT}"
 if [[ "${CHECK_ONLY}" == "1" ]]; then
   echo "preflight passed; no training started"

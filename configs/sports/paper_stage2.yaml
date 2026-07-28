@@ -53,10 +53,7 @@ item_graph_modal_alpha: 0.25
 item_graph_modal_layers: 1
 item_graph_modal_target: all
 
-fusion_mode: posterior_reliability
-posterior_reliability_scope: both
-posterior_reliability_scale: 50
-posterior_reliability_floor: 0.0
+fusion_mode: mean
 reg_coeff: 0.01
 penalty_coeff: 1.0
 modality_bpr_coeff: 1.0

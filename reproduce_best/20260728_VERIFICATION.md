@@ -5,6 +5,11 @@ This verification used commit `3f40fa8`, Python 3.10, PyTorch
 `reproduce_best/20260719/*.sh` command, retained Stage 1.2 checkpoint, and
 strict validation-based checkpoint selection.
 
+These measurements predate the switch to mean fusion. Clothing and Sports used
+posterior reliability in this verification and therefore serve only as
+historical references; they are not results for the current canonical
+configurations.
+
 | Dataset | Recorded Recall@20 | Verified Recall@20 | Delta | Recorded NDCG@20 | Verified NDCG@20 | Delta | Recorded / verified best epoch |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Clothing | 0.08141 | 0.07947 | -0.00194 | 0.03612 | 0.03566 | -0.00046 | 280 / 303 |

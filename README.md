@@ -11,11 +11,17 @@ The recorded paper setting uses the `unified_static` missing protocol with the
 same pre-generated 50% missing-item payload for training, validation, and test.
 The payload seed and model seed are both `2023`.
 
-| Dataset | Recall@20 / NDCG@20 | Best epoch | Fusion reliability |
+| Dataset | Historical Recall@20 / NDCG@20 | Best epoch | Historical fusion |
 | --- | ---: | ---: | --- |
 | Clothing | 0.08141 / 0.03612 | 280 | fusion, scale 50 |
 | Beauty | 0.08418 / 0.03386 | 177 | disabled; mean fusion |
 | Sports | 0.10579 / 0.04735 | 239 | graph and fusion, scale 50 |
+
+Clothing and Sports values above are retained as historical references from
+the former posterior-reliability setting. The current canonical Stage 2
+configurations disable posterior reliability and use unweighted mean modality
+fusion for all three datasets. Fresh Clothing and Sports runs are required
+before replacing their reported values.
 
 The shared Stage 2 setting uses a frozen completion module, learning rate
 `0.005`, batch size `2048`, strict validation-based checkpoint selection, and
@@ -84,7 +90,7 @@ explicit `PROJECTION_CKPT=/path/to/projection.pth` can override the bundled
 initializer. The checkpoint is loaded through the projection-only loader, so
 unrelated imputer or recommender tensors are ignored.
 
-## Reproduce the recorded Stage 2 runs
+## Run the canonical Stage 2 configurations
 
 Run the read-only preflight checks first:
 
@@ -102,12 +108,12 @@ bash reproduce_best/20260719/beauty.sh 1
 bash reproduce_best/20260719/sports.sh 2
 ```
 
-These commands reproduce Stage 2 from the retained Stage 1.2 checkpoints; they
-do not retrain Stage 1. `SOURCE_SHA256SUMS` fingerprints the source and paper
-configuration files in this release. It verifies release integrity, but does
-not claim that the historical result-producing source—no longer available—was
-recovered. A fresh full run is therefore required before claiming bitwise
-reproduction of the recorded metrics.
+These commands run Stage 2 from the retained Stage 1.2 checkpoints; they do not
+retrain Stage 1. The directory name is retained for compatibility, but the
+Clothing and Sports commands now use mean fusion and therefore do not reproduce
+the older reliability-enabled values in the historical table.
+`SOURCE_SHA256SUMS` fingerprints the source and canonical configuration files
+in this release.
 
 ## Tests
 
