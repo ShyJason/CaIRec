@@ -21,6 +21,29 @@ def _load_tensor_checkpoint(path):
         return torch.load(path, map_location="cpu")
 
 
+def _consume_legacy_user_modality_preference_init(
+    num_users,
+    num_modalities,
+    *,
+    device=None,
+    dtype=None,
+):
+    """Preserve the published recommender initialization RNG stream.
+
+    The result-producing implementation constructed an unused
+    ``Embedding(num_users, num_modalities)`` for an experimental fusion branch
+    immediately before ``fusion_linear``.  Removing that branch changed the RNG
+    state used to initialize the active user and item embeddings.  Draw into a
+    temporary tensor instead of retaining the dead parameter.
+    """
+    scratch = torch.empty(
+        (num_users, num_modalities),
+        device=device,
+        dtype=dtype,
+    )
+    torch.nn.init.normal_(scratch)
+
+
 class MGCN(torch.nn.Module):
     def __init__(self, edge_index, num_user, num_item, dim_feat, dim_latent):
         super(MGCN, self).__init__()
@@ -257,6 +280,12 @@ class MILK_model(torch.nn.Module):
         )
         self.item_emb = torch.nn.Embedding(
             num_embeddings=self.m_item, embedding_dim=self.free_emb_dimension
+        )
+        _consume_legacy_user_modality_preference_init(
+            self.n_user,
+            len(self.modalities),
+            device=self.user_emb.weight.device,
+            dtype=self.user_emb.weight.dtype,
         )
         self.fusion_linear = nn.Sequential(
             nn.Linear(self.free_emb_dimension, self.free_emb_dimension, bias=False),
