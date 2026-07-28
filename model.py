@@ -5,11 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from promrl_core.layers import Contra_head, Match_head, _build_mlp
+from promrl_core.layers import Contra_head, Match_head
 from promrl_core.utils.impute import update_posterior, compute_nll_loss
 from promrl_core.utils.eigen import (
     eigenvalue_computation_pmcl,
-    shifted_relation_lifted_directions,
 )
 
 
@@ -23,7 +22,7 @@ def _load_tensor_checkpoint(path):
 
 
 class MGCN(torch.nn.Module):
-    def __init__(self, edge_index, num_user, num_item, dim_feat, dim_latent, frontend_mode="deep_mlp"):
+    def __init__(self, edge_index, num_user, num_item, dim_feat, dim_latent):
         super(MGCN, self).__init__()
         self.num_user = num_user
         self.num_item = num_item
@@ -31,21 +30,7 @@ class MGCN(torch.nn.Module):
         self.dim_latent = dim_latent
         self.edge_index = edge_index
         self.n_layers = 3
-        self.frontend_mode = frontend_mode
-
-        if self.frontend_mode == "identity":
-            if self.dim_feat != self.dim_latent:
-                raise ValueError(
-                    f"gcn_frontend_mode='identity' requires dim_feat == dim_latent, "
-                    f"got {self.dim_feat} and {self.dim_latent}"
-                )
-            self.MLP = nn.Identity()
-        elif self.frontend_mode == "original_linear":
-            self.MLP = nn.Linear(self.dim_feat, self.dim_latent)
-        elif self.frontend_mode == "deep_mlp":
-            self.MLP = _build_mlp(self.dim_feat, self.dim_latent * 2, self.dim_latent, dropout=0.1)
-        else:
-            raise ValueError(f"Unsupported gcn_frontend_mode: {self.frontend_mode}")
+        self.MLP = nn.Linear(self.dim_feat, self.dim_latent)
 
     def forward(
         self,
@@ -71,24 +56,6 @@ class MGCN(torch.nn.Module):
         users, items = torch.split(light_out, [self.num_user, self.num_item])
 
         return users, items
-
-
-class ResidualCompletionAdapter(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.skip = nn.Identity() if input_dim == output_dim else nn.Linear(input_dim, output_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
-        self.norm = nn.LayerNorm(output_dim)
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
-
-    def forward(self, x):
-        return self.norm(self.skip(x) + self.mlp(x))
 
 
 class MILK_model(torch.nn.Module):
@@ -157,8 +124,6 @@ class MILK_model(torch.nn.Module):
         self.use_decoupled_latent_bridge = self.feature_bridge_mode == "decoupled_latent"
         self.use_latent_completion_bridge = self.use_latent_direct_bridge or self.use_decoupled_latent_bridge
         self.use_decode_head = not self.use_latent_completion_bridge
-        self.gcn_frontend_mode = self.env.args.gcn_frontend_mode
-        self.promrl_projection_mode = getattr(self.env.args, "promrl_projection_mode", "learned")
         self.promrl_dim = self.free_emb_dimension if self.use_latent_completion_bridge else self.contra_dim
         self.item_graph_modal_alpha = min(
             max(float(getattr(self.env.args, "item_graph_modal_alpha", 0.0)), 0.0),
@@ -250,7 +215,6 @@ class MILK_model(torch.nn.Module):
             self.m_item,
             v_input_dim,
             self.free_emb_dimension,
-            frontend_mode=self.gcn_frontend_mode,
         )
         self.t_gcn = MGCN(
             self.Graph,
@@ -258,7 +222,6 @@ class MILK_model(torch.nn.Module):
             self.m_item,
             t_input_dim,
             self.free_emb_dimension,
-            frontend_mode=self.gcn_frontend_mode,
         )
         if "a" in self.modalities:
             self.a_gcn = MGCN(
@@ -267,7 +230,6 @@ class MILK_model(torch.nn.Module):
                 self.m_item,
                 a_input_dim,
                 self.free_emb_dimension,
-                frontend_mode=self.gcn_frontend_mode,
             )
         if "d" in self.modalities:
             self.d_gcn = MGCN(
@@ -276,7 +238,6 @@ class MILK_model(torch.nn.Module):
                 self.m_item,
                 d_input_dim,
                 self.free_emb_dimension,
-                frontend_mode=self.gcn_frontend_mode,
             )
 
         if self.use_decoupled_latent_bridge:
@@ -368,42 +329,13 @@ class MILK_model(torch.nn.Module):
         )
 
     def _build_latent_projection_head(self, raw_dim):
-        if self.promrl_projection_mode == "identity":
-            if raw_dim != self.promrl_dim:
-                raise ValueError(
-                    "promrl_projection_mode='identity' requires modal feature dim "
-                    f"to equal promrl_dim ({self.promrl_dim}); got {raw_dim}"
-                )
-            return nn.Identity()
-        if self.gcn_frontend_mode == "original_linear":
-            return nn.Linear(raw_dim, self.free_emb_dimension)
-        return _build_mlp(raw_dim, self.free_emb_dimension * 2, self.free_emb_dimension, dropout=0.1)
+        return nn.Linear(raw_dim, self.free_emb_dimension)
 
     def _build_completion_adapter(self):
-        mode = getattr(self.env.args, "completion_adapter_mode", "linear_ln")
-        if mode == "identity":
-            if self.promrl_dim != self.free_emb_dimension:
-                raise ValueError(
-                    "completion_adapter_mode=identity requires promrl_dim == free_emb_dimension"
-                )
-            return nn.Identity()
-        if mode == "linear_ln":
-            return nn.Sequential(
-                nn.Linear(self.promrl_dim, self.free_emb_dimension),
-                nn.LayerNorm(self.free_emb_dimension),
-            )
-        if mode == "residual_mlp":
-            hidden_dim = int(getattr(self.env.args, "completion_adapter_hidden_dim", 128))
-            if hidden_dim <= 0:
-                raise ValueError("completion_adapter_hidden_dim must be positive")
-            dropout = float(getattr(self.env.args, "completion_adapter_dropout", 0.0))
-            return ResidualCompletionAdapter(
-                self.promrl_dim,
-                self.free_emb_dimension,
-                hidden_dim=hidden_dim,
-                dropout=dropout,
-            )
-        raise ValueError(f"Unsupported completion_adapter_mode: {mode}")
+        return nn.Sequential(
+            nn.Linear(self.promrl_dim, self.free_emb_dimension),
+            nn.LayerNorm(self.free_emb_dimension),
+        )
 
     def _projection_modules(self):
         if self.use_decoupled_latent_bridge:
@@ -1230,22 +1162,6 @@ class MILK_model(torch.nn.Module):
 
     def project_features(self, item_ids=None, raw_features=None):
         raw_features = raw_features or self._current_raw_modal_features()
-        if self.promrl_projection_mode == "identity":
-            projected = {}
-            for modality in self.modalities:
-                source = raw_features[modality]
-                if item_ids is not None:
-                    source = source[item_ids]
-                if source.size(1) != self.promrl_dim:
-                    raise ValueError(
-                        "promrl_projection_mode='identity' requires modal feature dim "
-                        f"to equal promrl_dim ({self.promrl_dim}); modality {modality} has {source.size(1)}"
-                    )
-                projected[modality] = torch.nan_to_num(
-                    F.normalize(source, dim=-1), nan=0.0, posinf=0.0, neginf=0.0
-                )
-            return projected
-
         heads = self._current_projection_heads()
         projected = {}
         for modality in self.modalities:
@@ -2138,19 +2054,12 @@ class MILK_model(torch.nn.Module):
             return zero, zero
 
         all_features = [completed_feats[modality] for modality in self.modalities]
-        structure_loss_variant = getattr(
-            self.env.args, "structure_loss_variant", "original"
-        )
-        if structure_loss_variant == "shifted_lifted":
-            eigenvalues, item_directions = shifted_relation_lifted_directions(all_features)
-            sim = (item_directions @ item_directions.T).pow(2) / self.env.args.tau2
-        else:
-            eigenvectors, S_V = eigenvalue_computation_pmcl(all_features)
-            eigenvalues = S_V ** 2
-            principal_eigenvector = eigenvectors[:, :, 0]
-            sim = (
-                principal_eigenvector @ principal_eigenvector.T
-            ) / self.env.args.tau2
+        eigenvectors, S_V = eigenvalue_computation_pmcl(all_features)
+        eigenvalues = S_V ** 2
+        principal_eigenvector = eigenvectors[:, :, 0]
+        sim = (
+            principal_eigenvector @ principal_eigenvector.T
+        ) / self.env.args.tau2
 
         targets = torch.zeros(eigenvalues.size(0), dtype=torch.long, device=eigenvalues.device)
         loss_intra = F.cross_entropy(eigenvalues / self.env.args.tau1, targets)

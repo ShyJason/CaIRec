@@ -203,19 +203,6 @@ def _build_parser():
         default='raw_decoder',
         choices=['raw_decoder', 'latent_direct', 'decoupled_latent'],
     )
-    parser.add_argument(
-        '--gcn_frontend_mode',
-        type=str,
-        default='original_linear',
-        choices=['original_linear', 'deep_mlp', 'identity'],
-    )
-    parser.add_argument(
-        '--promrl_projection_mode',
-        type=str,
-        default='learned',
-        choices=['learned', 'identity'],
-        help='Projection before completion/imputation. identity uses normalized modal features directly and requires feature_dim == promrl_dim.',
-    )
     parser.add_argument('--item_graph_topk', type=int, default=20)
     parser.add_argument(
         '--item_graph_fuse_before_topk',
@@ -367,17 +354,6 @@ def _build_parser():
     parser.add_argument('--alpha_rec', type=float, default=0.1)
     parser.add_argument('--alpha_decode', type=float, default=0.0)
     parser.add_argument(
-        '--structure_loss_variant',
-        type=str,
-        default='original',
-        choices=['original', 'shifted_lifted'],
-        help=(
-            'Structure loss used by Stage 1 contrastive training. shifted_lifted '
-            'uses a shifted-cosine modality relation matrix and compares squared '
-            'lifted semantic principal-direction similarities.'
-        ),
-    )
-    parser.add_argument(
         '--generative_update_mode',
         type=str,
         default='em',
@@ -395,25 +371,6 @@ def _build_parser():
         type=float,
         default=1.0,
         help='Fraction of eligible observed modalities to pseudo-mask for decoupled adapter alignment.',
-    )
-    parser.add_argument(
-        '--completion_adapter_mode',
-        type=str,
-        default='linear_ln',
-        choices=['linear_ln', 'identity', 'residual_mlp'],
-        help='Adapter from completion latent space to recommendation space in decoupled_latent mode.',
-    )
-    parser.add_argument(
-        '--completion_adapter_hidden_dim',
-        type=int,
-        default=128,
-        help='Hidden dimension for residual_mlp completion adapter.',
-    )
-    parser.add_argument(
-        '--completion_adapter_dropout',
-        type=float,
-        default=0.0,
-        help='Dropout for residual_mlp completion adapter.',
     )
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
     parser.add_argument(

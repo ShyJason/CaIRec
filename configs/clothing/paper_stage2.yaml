@@ -2,8 +2,6 @@ dataset: clothing
 exp_mode: mm
 train_stage: recommender
 feature_bridge_mode: decoupled_latent
-gcn_frontend_mode: original_linear
-promrl_projection_mode: learned
 selection_mode: val
 recommendation_selection_metric: recall
 recommendation_selection_topk: 20

@@ -2,8 +2,6 @@ dataset: sports
 exp_mode: mm
 train_stage: imputer_param
 feature_bridge_mode: decoupled_latent
-gcn_frontend_mode: original_linear
-promrl_projection_mode: learned
 selection_mode: val
 
 device_id: 0
