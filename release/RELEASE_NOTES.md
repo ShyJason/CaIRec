@@ -11,7 +11,7 @@ datasets and extracted content features are intentionally not redistributed.
 | Asset | Installed path |
 | --- | --- |
 | `cair-missing-payloads-v1.tar.gz` | one fixed payload under each `Data/<dataset>/` |
-| `cair-projection-checkpoints-v1.tar.gz` | `projection_checkpoints/` |
+| `cair-projection-checkpoints-v1.tar.gz` | `ckpt/` |
 | `SHA256SUMS` | integrity manifest |
 
 The payload archive contains the unified 50% missing-item payloads generated

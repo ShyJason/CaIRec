@@ -13,7 +13,7 @@ BPR optimization.
 ├── dataset_loader.py, evaluation.py    # data protocol and evaluation
 ├── completion_core/                    # completion runtime
 ├── configs/                            # retained paper configurations
-├── projection_checkpoints/             # fixed Stage 1 projection initializers
+├── ckpt/                               # fixed Stage 1 projection initializers
 ├── run_mmrec_mainline.sh                # complete Stage 1.1 → 1.2 → 2 pipeline
 ├── scripts/                            # Beauty preparation, assets, significance
 ├── docs/DATASETS.md                    # dataset sources and exact provenance
@@ -71,7 +71,7 @@ python scripts/download_assets.py --payloads all
 ```
 
 The three small projection-only initializers are committed under
-`projection_checkpoints/` and mirrored in the
+`ckpt/` and mirrored in the
 [`v1.0-assets`](https://github.com/ShyJason/CaIRec/releases/tag/v1.0-assets)
 release. No pre-existing Stage 1.1, Stage 1.2, or Stage 2 checkpoint is
 required.
@@ -80,7 +80,7 @@ required.
 
 Stage 0 projection training is not part of this repository. Stage 1 starts by
 loading the matching pretrained modality projection from
-`projection_checkpoints/<dataset>.pth`, then the script runs Stage 1.1, Stage
+`ckpt/<dataset>.pth`, then the script runs Stage 1.1, Stage
 1.2, and Stage 2 in order.
 
 ```bash

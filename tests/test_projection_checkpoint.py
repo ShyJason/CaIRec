@@ -80,7 +80,7 @@ class ProjectionCheckpointTest(unittest.TestCase):
         for dataset in ("clothing", "beauty", "sports"):
             with self.subTest(dataset=dataset):
                 checkpoint = torch.load(
-                    ROOT / "projection_checkpoints" / f"{dataset}.pth",
+                    ROOT / "ckpt" / f"{dataset}.pth",
                     map_location="cpu",
                     weights_only=True,
                 )

@@ -82,7 +82,7 @@ STAGE2_GAMMA_ALIGN="${STAGE2_GAMMA_ALIGN:-${DEFAULT_STAGE2_GAMMA_ALIGN}}"
 STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
 TENSORBOARD="${TENSORBOARD:-0}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
-PROJECTION_CKPT="${PROJECTION_CKPT:-${ROOT_DIR}/projection_checkpoints/${DATASET}.pth}"
+PROJECTION_CKPT="${PROJECTION_CKPT:-${ROOT_DIR}/ckpt/${DATASET}.pth}"
 STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_1_param}"
 STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_2_completion}"
 STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage2_recommender}"
@@ -108,9 +108,9 @@ if [[ ! -f "${PROJECTION_CKPT}" ]]; then
   echo "[mainline] projection checkpoint not found: ${PROJECTION_CKPT}" >&2
   exit 1
 fi
-if [[ "${PROJECTION_CKPT}" == "${ROOT_DIR}/projection_checkpoints/${DATASET}.pth" ]]; then
+if [[ "${PROJECTION_CKPT}" == "${ROOT_DIR}/ckpt/${DATASET}.pth" ]]; then
   (
-    cd "${ROOT_DIR}/projection_checkpoints"
+    cd "${ROOT_DIR}/ckpt"
     sha256sum --check --status SHA256SUMS
   ) || {
     echo "[mainline] bundled projection checksum verification failed" >&2

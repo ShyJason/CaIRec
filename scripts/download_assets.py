@@ -33,7 +33,7 @@ PAYLOADS = Asset(
 )
 CHECKPOINTS = Asset(
     "cair-projection-checkpoints-v1.tar.gz",
-    "e5efd6d03e346a393857e7e09b9f1b46e779eaf59510a7cdc0eb0575584e6a17",
+    "ab8029835b33ad4ea9878e2e53df2726d6c60486f842c78c8cd5aebff8b23465",
 )
 
 
@@ -171,8 +171,8 @@ def install_payloads(
 def install_checkpoints(
     archive_path: Path, project_root: Path, overwrite: bool
 ) -> None:
-    prefix = PurePosixPath("projection_checkpoints")
-    target = project_root / "projection_checkpoints"
+    prefix = PurePosixPath("ckpt")
+    target = project_root / "ckpt"
     if target.exists() and not overwrite:
         print(f"already installed: {target}")
         return
@@ -196,9 +196,9 @@ def install_checkpoints(
                     raise RuntimeError(f"unsafe archive member: {member.name}")
                 members.append(member)
             archive.extractall(temporary_root, members=members)
-        extracted = temporary_root / "projection_checkpoints"
+        extracted = temporary_root / "ckpt"
         if not extracted.is_dir():
-            raise RuntimeError("checkpoint archive has no projection_checkpoints/")
+            raise RuntimeError("checkpoint archive has no ckpt/")
         if target.exists():
             shutil.rmtree(target)
         shutil.move(str(extracted), str(target))
