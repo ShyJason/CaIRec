@@ -15,6 +15,6 @@ missing-modality payload. Dataset-specific seed and early-stopping differences
 are written directly in their respective files. All retained Stage 2
 configurations use unweighted mean modality fusion.
 
-`run_mmrec_mainline.sh` is the authoritative entry point. It loads the matching
+`run_cairec.sh` is the authoritative entry point. It loads the matching
 bundled projection and runs these three configurations in order, passing each
 new checkpoint to the next stage.

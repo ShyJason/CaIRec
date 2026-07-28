@@ -60,13 +60,13 @@ loading the matching pretrained modality projection from
 1.2, and Stage 2 in order.
 
 ```bash
-CHECK_ONLY=1 DATASET=clothing bash run_mmrec_mainline.sh
-DATASET=clothing DEVICE_ID=0 bash run_mmrec_mainline.sh
+CHECK_ONLY=1 DATASET=clothing bash run_cairec.sh
+DATASET=clothing DEVICE_ID=0 bash run_cairec.sh
 ```
 
 ```bash
-DATASET=beauty DEVICE_ID=1 bash run_mmrec_mainline.sh
-DATASET=sports DEVICE_ID=2 bash run_mmrec_mainline.sh
+DATASET=beauty DEVICE_ID=1 bash run_cairec.sh
+DATASET=sports DEVICE_ID=2 bash run_cairec.sh
 ```
 
 Each stage saves its checkpoint under `exp_report/<dataset>/`; the next stage
@@ -74,11 +74,3 @@ automatically loads the final checkpoint produced by the preceding stage.
 `RUN_TAG` can be set to give all three stages a shared experiment identifier.
 An explicit `PROJECTION_CKPT=/path/to/projection.pth` can override the bundled
 initializer.
-
-## Tests
-
-With the project environment activated:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v
-```
