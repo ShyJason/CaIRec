@@ -80,39 +80,6 @@ def _build_parser():
     parser.add_argument('--use_gpu', type=int, default=1)
     parser.add_argument('--device_id', type=int, default=0)
     parser.add_argument('--seed', type=int, default=2023)
-    parser.add_argument('--dataset_seed', type=int, default=0)
-    parser.add_argument(
-        '--unified_payload_seed',
-        type=int,
-        default=-1,
-        help='Seed of the pre-generated unified_static missing payload; defaults to --seed.',
-    )
-    parser.add_argument(
-        '--unified_payload_file',
-        type=str,
-        default='',
-        help=(
-            'Optional unified_static payload filename. Relative paths are resolved '
-            'inside Data/<dataset>; when omitted, the seed-based default is used.'
-        ),
-    )
-    parser.add_argument(
-        '--missing_mask_protocol',
-        type=str,
-        default='i3',
-        choices=['i3', 'default_rng', 'unified_static'],
-        help='unified_static loads the pre-generated, phase-invariant missing-item payload',
-    )
-    parser.add_argument(
-        '--train_missing_modality',
-        type=str,
-        default='random',
-        choices=['random', 'image', 'text'],
-        help=(
-            'Training-only missing-modality policy. Validation/test keep the '
-            'random-modality protocol controlled by eval_missing_rate.'
-        ),
-    )
     parser.add_argument('--ckpt', type=str, default=None)
     parser.add_argument('--eval_only', type=int, default=0)
     parser.add_argument(
@@ -181,12 +148,6 @@ def _build_parser():
     parser.add_argument('--reg_coeff', type=float, default=1e-4)
     parser.add_argument('--penalty_coeff', type=float, default=50) # b 1000  c 50
     parser.add_argument('--missing_rate', type=float, default=0.3)
-    parser.add_argument(
-        '--eval_missing_rate',
-        type=float,
-        default=0.5,
-        help='Validation/test missing-modality rate. Defaults to the historical fixed 0.5 protocol.',
-    )
 
     parser.add_argument('--contra_dim', type=int, default=256)
     parser.add_argument('--d_beta', type=int, default=128)

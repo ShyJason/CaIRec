@@ -10,12 +10,7 @@ evaluation_protocol: strict
 device_id: 0
 use_gpu: 1
 seed: 2023
-dataset_seed: 0
-missing_mask_protocol: unified_static
-unified_payload_seed: 2023
 missing_rate: 0.5
-eval_missing_rate: 0.5
-train_missing_modality: random
 
 epoch: 400
 eva_interval: 1

@@ -159,38 +159,11 @@ class Loader4MM(torch.utils.data.Dataset):
             'indicator': np.array([], dtype=np.int64),
         }
 
-    def _dataset_seed(self):
-        return int(getattr(self.env.args, 'dataset_seed', 0))
-
-    def _train_missing_modality_index(self, n_modality):
-        policy = getattr(self.env.args, 'train_missing_modality', 'random')
-        if policy == 'random':
-            return None
-        modality_indices = {'image': 0, 'text': 1}
-        if policy not in modality_indices:
-            raise ValueError(
-                'train_missing_modality must be one of random, image, text; '
-                f'got {policy!r}'
-            )
-        index = modality_indices[policy]
-        if index >= n_modality:
-            raise ValueError(
-                f'train_missing_modality={policy} is unavailable for a dataset '
-                f'with {n_modality} modalities'
-            )
-        return index
-
-    def _training_protected_indices(self, random_indices, n_modality):
-        fixed_index = self._train_missing_modality_index(n_modality)
-        if fixed_index is None:
-            return random_indices.copy()
-        return np.full(random_indices.shape, fixed_index, dtype=np.int64)
-
     def _missing_indicator_counts(self, metadata, n_modality):
         indicators = np.asarray(metadata['indicator'], dtype=np.int64)
         return [int(np.count_nonzero(indicators == index)) for index in range(n_modality)]
 
-    def _log_missing_protocol(self, n_modality, train_rate, eval_rate):
+    def _log_missing_protocol(self, n_modality, rate):
         names = ['image', 'text', 'audio', 'video'][:n_modality]
         split_metadata = (
             ('train', self.train_missing_modality_items),
@@ -203,46 +176,10 @@ class Loader4MM(torch.utils.data.Dataset):
             counts = self._missing_indicator_counts(metadata, n_modality)
             modal_counts = ','.join(f'{name}:{count}' for name, count in zip(names, counts))
             split_counts.append(f'{split}={len(metadata["items"])}[{modal_counts}]')
-        policy = getattr(self.env.args, 'train_missing_modality', 'random')
-        eval_policy = (
-            'phase_invariant_payload'
-            if getattr(self.env.args, 'missing_mask_protocol', 'i3') == 'unified_static'
-            else 'random'
-        )
         print(
-            'missing modality protocol: '
-            f'train_policy={policy}, train_rate={train_rate}, eval_policy={eval_policy}, '
-            f'eval_rate={eval_rate}; ' + '; '.join(split_counts)
+            f'phase-invariant missing payload: rate={rate}; '
+            + '; '.join(split_counts)
         )
-
-    def _sample_missing_subset(self, candidates, protected_indices, sample_size, rng=None):
-        candidates = np.array(candidates, dtype=np.int64)
-        if candidates.size == 0 or sample_size <= 0:
-            return self._empty_missing_metadata()
-
-        rng = rng if rng is not None else np.random.default_rng(self._dataset_seed())
-        rng.shuffle(candidates)
-        selected = candidates[: min(sample_size, candidates.size)]
-        return {
-            'items': selected,
-            'indicator': protected_indices[selected],
-        }
-
-    def _sample_missing_subset_i3(self, candidates, protected_indices, sample_size, rng):
-        """Match the original I3 np.random.seed/shuffle missing-mask protocol."""
-        candidates = list(candidates)
-        if len(candidates) == 0 or sample_size <= 0:
-            return self._empty_missing_metadata()
-
-        rng.shuffle(candidates)
-        selected = np.array(candidates[: min(sample_size, len(candidates))], dtype=np.int64)
-        return {
-            'items': selected,
-            'indicator': protected_indices[selected],
-        }
-
-    def _should_create_stage1_holdout(self):
-        return float(getattr(self.env.args, 'imputation_val_rate', 0.0)) > 0
             
 
     def generate_data_file(self, data, data_file_name):
@@ -593,230 +530,60 @@ class Loader4MM(torch.utils.data.Dataset):
     def allPos(self):
         return self._allPos
 
-    def set_miss_mutimedia_feature_items(self, fea, seed=None, rate=0.3, exp_mode='fm', path=''):
-
-        self.train_missing_modality_items = {}
-        self.val_missing_modality_items = self._empty_missing_metadata()
-        self.test_missing_modality_items = {}
-
-        protocol = getattr(self.env.args, 'missing_mask_protocol', 'i3')
-        seed = self._dataset_seed() if seed is None else seed
-        if protocol == 'unified_static':
-            payload_seed = int(getattr(self.env.args, 'unified_payload_seed', -1))
-            if payload_seed < 0:
-                payload_seed = int(getattr(self.env.args, 'seed', 2023))
-            eval_rate = float(getattr(self.env.args, 'eval_missing_rate', rate))
-            if not np.isclose(float(rate), eval_rate):
-                raise ValueError(
-                    'unified_static requires identical train/eval missing rates, '
-                    f'got train={rate}, eval={eval_rate}'
-                )
-            rate_token = f'{float(rate):g}'
-            configured_payload = str(
-                getattr(self.env.args, 'unified_payload_file', '') or ''
-            ).strip()
-            if configured_payload:
-                payload_file = configured_payload
-                if not os.path.isabs(payload_file):
-                    payload_file = os.path.join(self.env.DATA_PATH, payload_file)
-            else:
-                payload_file = os.path.join(
-                    self.env.DATA_PATH,
-                    f'unified_missing_items_mr{rate_token}_seed{payload_seed}.npy',
-                )
-                if not os.path.isfile(payload_file):
-                    payload_file = os.path.join(
-                        os.path.dirname(os.path.abspath(__file__)),
-                        'configs',
-                        getattr(self.env.args, 'dataset', ''),
-                        f'unified_missing_items_mr{rate_token}_seed{payload_seed}.npy',
-                    )
-            if not os.path.isfile(payload_file):
-                raise FileNotFoundError(f'unified missing payload not found: {payload_file}')
-            payload = np.load(payload_file, allow_pickle=True).item()
-            if payload.get('protocol') != 'unified_single_modality':
-                raise ValueError(f'unsupported unified payload protocol in {payload_file}')
-            if payload.get('dataset') != getattr(self.env.args, 'dataset', None):
-                raise ValueError(f'unified payload dataset mismatch in {payload_file}')
-            if not np.isclose(float(payload.get('missing_rate')), float(rate)):
-                raise ValueError(f'unified payload rate mismatch in {payload_file}')
-            items = np.asarray(payload['items'], dtype=np.int64)
-            indicators = np.asarray(payload['indicator'], dtype=np.int64)
-            if items.ndim != 1 or indicators.shape != items.shape:
-                raise ValueError(f'invalid items/indicator arrays in {payload_file}')
-            if len(np.unique(items)) != len(items) or np.any(items < 0) or np.any(items >= fea[0].shape[0]):
-                raise ValueError(f'invalid or duplicate item ids in {payload_file}')
-            if np.any(indicators < 0) or np.any(indicators >= len(fea)):
-                raise ValueError(f'invalid modality indicator in {payload_file}')
-            metadata = {'items': items.copy(), 'indicator': indicators.copy()}
-            self.train_missing_modality_items = {
-                'items': metadata['items'].copy(), 'indicator': metadata['indicator'].copy()
-            }
-            self.eval_val_missing_modality_items = {
-                'items': metadata['items'].copy(), 'indicator': metadata['indicator'].copy()
-            }
-            self.test_missing_modality_items = {
-                'items': metadata['items'].copy(), 'indicator': metadata['indicator'].copy()
-            }
-            self.val_missing_modality_items = self._empty_missing_metadata()
-            self.stage1_train_items = np.array(list(set(self.trainItem)), dtype=np.int64)
-            self.protected_indices = np.zeros(fea[0].shape[0], dtype=np.int64)
-            self.protected_indices[items] = indicators
-            self.train_protected_indices = self.protected_indices.copy()
-            print(f'loaded phase-invariant unified missing payload: {payload_file}')
-            self._log_missing_protocol(len(fea), rate, eval_rate)
-            return
-
-        use_i3_missing_protocol = protocol == 'i3'
-        rng = np.random.RandomState(seed) if use_i3_missing_protocol else np.random.default_rng(seed)
-        n_modality = len(fea)
-        n_item = fea[0].shape[0]
-        if rate < 0.0 or rate > 1.0:
-            raise ValueError(f'missing_rate must be in [0, 1], got {rate}')
-        # random missing modality index
-        if use_i3_missing_protocol:
-            protected_indices = rng.randint(n_modality, size=n_item)
-        else:
-            protected_indices = rng.integers(n_modality, size=n_item)
-        self.protected_indices = protected_indices
-        self.train_protected_indices = self._training_protected_indices(
-            protected_indices,
-            n_modality,
-        )
-
-        # I3 samples test first and train second from the same legacy RNG stream.
-        # Keep that order so seed=0 produces the same train/test missing masks.
-        eval_missing_rate = float(getattr(self.env.args, 'eval_missing_rate', 0.5))
-        if eval_missing_rate < 0.0 or eval_missing_rate > 1.0:
-            raise ValueError(f'eval_missing_rate must be in [0, 1], got {eval_missing_rate}')
-
-        test_candidate_data = list(set(self.testItem))
-        test_num_missing_entries = int(len(test_candidate_data) * eval_missing_rate)
-        if use_i3_missing_protocol:
-            self.test_missing_modality_items = self._sample_missing_subset_i3(
-                test_candidate_data,
-                protected_indices,
-                test_num_missing_entries,
-                rng,
+    def load_missing_payload(self, features, rate):
+        dataset = self.env.args.dataset
+        filename = f'unified_missing_items_mr{float(rate):g}_seed2023.npy'
+        payload_file = os.path.join(self.env.DATA_PATH, filename)
+        if not os.path.isfile(payload_file):
+            payload_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'configs',
+                dataset,
+                filename,
             )
-        else:
-            self.test_missing_modality_items = self._sample_missing_subset(
-                test_candidate_data,
-                protected_indices,
-                test_num_missing_entries,
-                rng=rng,
-            )
+        if not os.path.isfile(payload_file):
+            raise FileNotFoundError(f'unified missing payload not found: {payload_file}')
 
-        val_candidate_data = list(set(self.valItem))
-        val_num_missing_entries = int(len(val_candidate_data) * eval_missing_rate)
-        val_rng = np.random.default_rng(seed + 1000003) if use_i3_missing_protocol else rng
-        self.eval_val_missing_modality_items = self._sample_missing_subset(
-            val_candidate_data,
-            protected_indices,
-            val_num_missing_entries,
-            rng=val_rng,
-        )
+        payload = np.load(payload_file, allow_pickle=True).item()
+        if payload.get('protocol') != 'unified_single_modality':
+            raise ValueError(f'unsupported unified payload protocol in {payload_file}')
+        if payload.get('dataset') != dataset:
+            raise ValueError(f'unified payload dataset mismatch in {payload_file}')
+        if not np.isclose(float(payload.get('missing_rate')), float(rate)):
+            raise ValueError(f'unified payload rate mismatch in {payload_file}')
 
-        train_candidate_data = list(set(self.trainItem))
-        if self._should_create_stage1_holdout():
-            val_rate = max(0.0, float(getattr(self.env.args, 'imputation_val_rate', 0.0)))
-            train_candidates = np.array(train_candidate_data, dtype=np.int64)
-            rng.shuffle(train_candidates)
+        items = np.asarray(payload['items'], dtype=np.int64)
+        indicators = np.asarray(payload['indicator'], dtype=np.int64)
+        n_items = features[0].shape[0]
+        n_modalities = len(features)
+        if items.ndim != 1 or indicators.shape != items.shape:
+            raise ValueError(f'invalid items/indicator arrays in {payload_file}')
+        if (
+            len(np.unique(items)) != len(items)
+            or np.any(items < 0)
+            or np.any(items >= n_items)
+        ):
+            raise ValueError(f'invalid or duplicate item ids in {payload_file}')
+        if np.any(indicators < 0) or np.any(indicators >= n_modalities):
+            raise ValueError(f'invalid modality indicator in {payload_file}')
 
-            val_num_missing_entries = 0
-            if val_rate > 0 and train_candidates.size > 0:
-                val_num_missing_entries = min(
-                    train_candidates.size,
-                    max(1, int(train_candidates.size * val_rate)),
-                )
-            val_candidates = train_candidates[:val_num_missing_entries]
-            remaining_train_candidates = train_candidates[val_num_missing_entries:]
-
-            self.val_missing_modality_items = self._sample_missing_subset(
-                val_candidates,
-                self.train_protected_indices,
-                len(val_candidates),
-                rng=rng,
-            )
-            train_num_missing_entries = int(len(remaining_train_candidates) * rate)
-            self.train_missing_modality_items = self._sample_missing_subset(
-                remaining_train_candidates,
-                self.train_protected_indices,
-                train_num_missing_entries,
-                rng=rng,
-            )
-            self.stage1_train_items = remaining_train_candidates.astype(np.int64)
-            print(
-                'sample items with missing modality successfuly, '
-                'seed = {0}, train dataset include {1} items, imputation val include {2} items, '
-                'test dataset include {3} items'.format(
-                    seed,
-                    len(self.train_missing_modality_items['items']),
-                    len(self.val_missing_modality_items['items']),
-                    len(self.test_missing_modality_items['items']),
-                )
-            )
-        else:
-            train_candidates = np.array(train_candidate_data, dtype=np.int64)
-            train_num_missing_entries = int(len(train_candidate_data) * rate)
-            if use_i3_missing_protocol:
-                self.train_missing_modality_items = self._sample_missing_subset_i3(
-                    train_candidate_data,
-                    self.train_protected_indices,
-                    train_num_missing_entries,
-                    rng,
-                )
-            else:
-                self.train_missing_modality_items = self._sample_missing_subset(
-                    train_candidate_data,
-                    self.train_protected_indices,
-                    train_num_missing_entries,
-                    rng=rng,
-                )
-            self.stage1_train_items = train_candidates.astype(np.int64)
-            print(
-                'sample items with missing modality successfuly, seed = {0}, train dataset include {1} items, test dataset include {2} items'.format(
-                    seed,
-                    len(self.train_missing_modality_items['items']),
-                    len(self.test_missing_modality_items['items']),
-                )
-            )
-        self._log_missing_protocol(n_modality, rate, eval_missing_rate)
-
-    def sample_stage1_dynamic_missing_metadata(self, seed=None, rate=None):
-        protected_indices = getattr(self, 'train_protected_indices', None)
-        if protected_indices is None:
-            raise RuntimeError('train_protected_indices are not initialized')
-
-        candidates = np.array(
-            self.stage1_train_items if self.stage1_train_items is not None else list(set(self.trainItem)),
-            dtype=np.int64,
-        )
-        if candidates.size == 0:
-            return self._empty_missing_metadata()
-
-        sample_rate = self.env.args.missing_rate if rate is None else rate
-        if sample_rate < 0.0 or sample_rate > 1.0:
-            raise ValueError(f'missing_rate must be in [0, 1], got {sample_rate}')
-        sample_size = int(candidates.size * sample_rate)
-        if sample_rate > 0 and candidates.size > 0:
-            sample_size = max(1, sample_size)
-
-        rng = np.random.default_rng(seed if seed is not None else self._dataset_seed())
-        shuffled = candidates.copy()
-        rng.shuffle(shuffled)
-        selected = shuffled[: min(sample_size, shuffled.size)]
-        if selected.size == 0:
-            return self._empty_missing_metadata()
-
-        return {
-            'items': selected.astype(np.int64),
-            'indicator': protected_indices[selected].astype(np.int64),
+        metadata = {'items': items.copy(), 'indicator': indicators.copy()}
+        self.train_missing_modality_items = {
+            key: value.copy() for key, value in metadata.items()
         }
-
-    def refresh_stage1_dynamic_train_missing_metadata(self, seed=None, rate=None):
-        self.train_missing_modality_items = self.sample_stage1_dynamic_missing_metadata(seed=seed, rate=rate)
-        return self.train_missing_modality_items
+        self.eval_val_missing_modality_items = {
+            key: value.copy() for key, value in metadata.items()
+        }
+        self.test_missing_modality_items = {
+            key: value.copy() for key, value in metadata.items()
+        }
+        self.val_missing_modality_items = self._empty_missing_metadata()
+        self.stage1_train_items = np.unique(np.asarray(self.trainItem, dtype=np.int64))
+        self.protected_indices = np.zeros(n_items, dtype=np.int64)
+        self.protected_indices[items] = indicators
+        self.train_protected_indices = self.protected_indices.copy()
+        print(f'loaded phase-invariant unified missing payload: {payload_file}')
+        self._log_missing_protocol(n_modalities, rate)
 
 
     def load_mutimedia_feature(self):
@@ -838,12 +605,7 @@ class Loader4MM(torch.utils.data.Dataset):
             video_feat = np.load(video_file)
             fea.append(video_feat)
 
-        self.set_miss_mutimedia_feature_items(
-            fea,
-            seed=self._dataset_seed(),
-            rate=self.env.args.missing_rate,
-            exp_mode=self.env.args.exp_mode,
-        )
+        self.load_missing_payload(fea, rate=self.env.args.missing_rate)
         return image_feat, text_feat, audio_feat, video_feat
 
     def getUserAllItems(self):

@@ -280,7 +280,6 @@ class MILK_model(torch.nn.Module):
         self._gcn_cache = None
         self._imputer_updates_enabled = True
         self._pending_em_updates = []
-        self._dynamic_stage1_refresh_counter = 0
         self._item_user_sets = self._build_item_user_sets(dataset)
         self._co_interact_positive_items = self._build_co_interact_positive_items(dataset)
 
@@ -577,13 +576,6 @@ class MILK_model(torch.nn.Module):
             audio_base=self.eval_ori_audio_feat if "a" in self.modalities else None,
             video_base=self.eval_ori_video_feat if "d" in self.modalities else None,
         )
-    def refresh_dynamic_stage1_missing_views(self):
-        self._dynamic_stage1_refresh_counter += 1
-        dataset_seed = int(getattr(self.env.args, "dataset_seed", 0))
-        dynamic_seed = dataset_seed + self._dynamic_stage1_refresh_counter
-        self.dataset.refresh_stage1_dynamic_train_missing_metadata(seed=dynamic_seed)
-        self.init_missing_modality_set()
-
     def _build_missing_feature_view(
         self,
         missing_metadata,

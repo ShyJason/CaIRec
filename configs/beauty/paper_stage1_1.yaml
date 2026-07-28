@@ -7,9 +7,6 @@ selection_mode: val
 device_id: 0
 use_gpu: 1
 seed: 2023
-dataset_seed: 2023
-missing_mask_protocol: unified_static
-unified_payload_seed: 2023
 
 epoch: 5
 eva_interval: 1
@@ -27,7 +24,6 @@ itm_num_heads: 4
 ema_eta: 0.01
 
 missing_rate: 0.5
-eval_missing_rate: 0.5
 tensorboard: 0
 hf_tensorboard_repo: ""
 hf_commit_every: 5

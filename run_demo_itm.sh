@@ -21,7 +21,6 @@ EXP_MODE="${EXP_MODE:-ff}"
 DEVICE_ID="${DEVICE_ID:-4}"
 USE_GPU="${USE_GPU:-1}"
 SEED="${SEED:-2023}"
-DATASET_SEED="${DATASET_SEED:-0}"
 EVA_INTERVAL="${EVA_INTERVAL:-1}"
 EARLY_STOP="${EARLY_STOP:-}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
@@ -72,9 +71,6 @@ ALPHA_MISSING_DECODE="${ALPHA_MISSING_DECODE:-}"
 BETA_MISSING_SHARED="${BETA_MISSING_SHARED:-0.0}"
 BETA_MISSING_DECODE="${BETA_MISSING_DECODE:-0.0}"
 MISSING_RATE="${MISSING_RATE:-0.3}"
-TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY:-random}"
-EVAL_MISSING_RATE="${EVAL_MISSING_RATE:-}"
-MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL:-i3}"
 IMPUTATION_VAL_RATE="${IMPUTATION_VAL_RATE:-0.0}"
 IMPUTATION_SELECTION_POLICY="${IMPUTATION_SELECTION_POLICY:-legacy}"
 IMPUTATION_SELECTION_SPLIT="${IMPUTATION_SELECTION_SPLIT:-train}"
@@ -101,8 +97,8 @@ fi
 
 echo "[demo] root=${ROOT_DIR}"
 echo "[demo] dataset=${DATASET} exp_mode=${EXP_MODE} device_id=${DEVICE_ID}"
-echo "[demo] seed=${SEED} dataset_seed=${DATASET_SEED}"
-echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} disable_imputation=${DISABLE_IMPUTATION} bridge=${FEATURE_BRIDGE_MODE} train_missing_modality=${TRAIN_MISSING_MODALITY} missing_rate=${MISSING_RATE} eval_missing_rate=${EVAL_MISSING_RATE:-config/default} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
+echo "[demo] seed=${SEED}"
+echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} disable_imputation=${DISABLE_IMPUTATION} bridge=${FEATURE_BRIDGE_MODE} missing_rate=${MISSING_RATE} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
 echo "[demo] log_file=${LOG_FILE}"
 echo "[demo] tensorboard=${TENSORBOARD} hf_tensorboard_repo=${HF_TENSORBOARD_REPO:-<none>}"
 echo "[demo] config=${CONFIG:-<none>}"
@@ -114,7 +110,6 @@ cmd=(
   --use_gpu "${USE_GPU}"
   --device_id "${DEVICE_ID}"
   --seed "${SEED}"
-  --dataset_seed "${DATASET_SEED}"
   --epoch "${EPOCHS}"
   --eva_interval "${EVA_INTERVAL}"
   --batch_size "${BATCH_SIZE}"
@@ -142,9 +137,7 @@ cmd=(
   --gamma_align "${GAMMA_ALIGN}"
   --adapter_align_pseudo_ratio "${ADAPTER_ALIGN_PSEUDO_RATIO}"
   --recommender_allow_modal_grad "${RECOMMENDER_ALLOW_MODAL_GRAD}"
-  --train_missing_modality "${TRAIN_MISSING_MODALITY}"
   --missing_rate "${MISSING_RATE}"
-  --missing_mask_protocol "${MISSING_MASK_PROTOCOL}"
   --imputation_val_rate "${IMPUTATION_VAL_RATE}"
   --imputation_selection_policy "${IMPUTATION_SELECTION_POLICY}"
   --imputation_selection_split "${IMPUTATION_SELECTION_SPLIT}"
@@ -192,10 +185,6 @@ fi
 
 if [[ -n "${PROJECTION_CKPT}" ]]; then
   cmd+=(--projection_ckpt "${PROJECTION_CKPT}")
-fi
-
-if [[ -n "${EVAL_MISSING_RATE}" ]]; then
-  cmd+=(--eval_missing_rate "${EVAL_MISSING_RATE}")
 fi
 
 if [[ -n "${HF_TENSORBOARD_REPO}" ]]; then

@@ -25,10 +25,7 @@ class PaperConfigTest(unittest.TestCase):
                 self.assertEqual(stage1_2["train_stage"], "imputer_backprop")
                 self.assertEqual(stage2["train_stage"], "recommender")
                 for config in (stage1_1, stage1_2, stage2):
-                    self.assertEqual(config["missing_mask_protocol"], "unified_static")
                     self.assertEqual(config["missing_rate"], 0.5)
-                    self.assertEqual(config["eval_missing_rate"], 0.5)
-                    self.assertEqual(config["unified_payload_seed"], 2023)
                     self.assertEqual(config["feature_bridge_mode"], "decoupled_latent")
 
     def test_bundled_missing_payloads_match_the_paper_protocol(self):
@@ -50,15 +47,13 @@ class PaperConfigTest(unittest.TestCase):
 
     def test_stage2_matches_canonical_dataset_specific_settings(self):
         expected = {
-            "clothing": (0, 50),
-            "beauty": (2023, 20),
-            "sports": (0, 30),
+            "clothing": 50,
+            "beauty": 20,
+            "sports": 30,
         }
-        for dataset, values in expected.items():
+        for dataset, patience in expected.items():
             with self.subTest(dataset=dataset):
                 config = self._load(dataset, "stage2")
-                dataset_seed, patience = values
-                self.assertEqual(config["dataset_seed"], dataset_seed)
                 self.assertEqual(config["early_stop"], patience)
                 self.assertNotIn("rec_neighbor_cl_weight", config)
                 self.assertNotIn("rec_neighbor_cl_temp", config)
