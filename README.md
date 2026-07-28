@@ -11,7 +11,7 @@ BPR optimization.
 .
 ├── main.py, model.py, session.py       # training and model implementation
 ├── dataset_loader.py, evaluation.py    # data protocol and evaluation
-├── promrl_core/                        # completion runtime
+├── completion_core/                    # completion runtime
 ├── configs/                            # retained paper configurations
 ├── projection_checkpoints/             # fixed Stage 1 projection initializers
 ├── run_mmrec_mainline.sh                # complete Stage 1.1 → 1.2 → 2 pipeline
@@ -20,7 +20,7 @@ BPR optimization.
 ```
 
 Large local assets are intentionally excluded: `Data/`, `exp_report/`,
-`.dataset_downloads/`, and `.venv/`.
+`.release_downloads/`, and `.venv/`.
 
 ## Environment
 
@@ -45,10 +45,28 @@ The complete pipeline loads:
 - dataset interactions and modality features under `Data/<dataset>/`;
 - `unified_missing_items_mr0.5_seed2023.npy` in each dataset directory.
 
-Datasets are not committed to Git. The three small projection-only initializers
-are committed under `projection_checkpoints/` and verified by its
-`SHA256SUMS`. No pre-existing Stage 1.1, Stage 1.2, or Stage 2 checkpoint is
-required.
+Datasets are distributed through the
+[`v1.0-assets`](https://github.com/ShyJason/CaIRec/releases/tag/v1.0-assets)
+GitHub Release rather than committed to Git. Download and verify all three
+retained datasets with:
+
+```bash
+python scripts/download_assets.py --datasets all
+```
+
+To download one dataset only:
+
+```bash
+python scripts/download_assets.py --datasets clothing
+```
+
+The downloader verifies each archive against the fixed SHA-256 digest before
+extracting it under `Data/<dataset>/`. Manual downloads can be checked with
+[`release/SHA256SUMS`](release/SHA256SUMS).
+
+The three small projection-only initializers are committed under
+`projection_checkpoints/` and are also mirrored in the asset release. No
+pre-existing Stage 1.1, Stage 1.2, or Stage 2 checkpoint is required.
 
 ## Reproduce the complete pipeline
 

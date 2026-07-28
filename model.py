@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from promrl_core.layers import Contra_head, Match_head
-from promrl_core.utils.impute import update_posterior, compute_nll_loss
-from promrl_core.utils.eigen import (
+from completion_core.layers import Contra_head, Match_head
+from completion_core.utils.impute import update_posterior, compute_nll_loss
+from completion_core.utils.eigen import (
     eigenvalue_computation_pmcl,
 )
 

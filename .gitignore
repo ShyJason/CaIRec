@@ -5,26 +5,8 @@ __pycache__/
 
 Data/
 .dataset_downloads/
+.release_downloads/
 exp_report/
-
-# ProMRL external assets / outputs. Code and configs under promrl_core are
-# vendored, but these entries are data, weights, or result links.
-promrl_core/MM_datasets
-promrl_core/MSRVTT
-promrl_core/SVD_MM
-promrl_core/audiocaps_train
-promrl_core/datasets
-promrl_core/didemo
-promrl_core/extract_results.py
-promrl_core/feature_inference_results
-promrl_core/imagenet_1k
-promrl_core/output
-promrl_core/outputs
-promrl_core/pami_features
-promrl_core/pretrain_vast
-promrl_core/pretrained_weights
-promrl_core/results
-promrl_core/triangle_pretraining
 
 nohup.out
 *.launcher.log
