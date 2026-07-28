@@ -234,66 +234,6 @@ class MILK_model(torch.nn.Module):
         self.gcn_frontend_mode = self.env.args.gcn_frontend_mode
         self.promrl_projection_mode = getattr(self.env.args, "promrl_projection_mode", "learned")
         self.promrl_dim = self.free_emb_dimension if self.use_latent_completion_bridge else self.contra_dim
-        self.completion_gate_mode = self.env.args.completion_gate_mode
-        self.use_completion_gate = self.completion_gate_mode != "off"
-        self.use_rank_residual_completion_gate = self.completion_gate_mode in (
-            "rank_residual",
-            "rank_residual_norm",
-            "rank_residual_allnorm",
-            "rank_residual_allgate",
-            "rank_residual_softmax",
-            "rank_residual_global",
-            "rank_residual_shrink",
-            "rank_residual_centered",
-            "rank_residual_delta",
-            "rank_residual_centered_allgate",
-        )
-        self.use_shrink_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_shrink"
-        )
-        self.use_global_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_global"
-        )
-        self.use_normalized_rank_residual_completion_gate = self.completion_gate_mode == "rank_residual_norm"
-        self.use_all_normalized_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_allnorm"
-        )
-        self.use_all_modal_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_allgate"
-        )
-        self.use_centered_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_centered"
-        )
-        self.use_delta_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_delta"
-        )
-        self.use_centered_all_modal_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_centered_allgate"
-        )
-        self.use_softmax_rank_residual_completion_gate = (
-            self.completion_gate_mode == "rank_residual_softmax"
-        )
-        self.use_learned_completion_gate_mix = (
-            bool(getattr(self.env.args, "completion_gate_learn_mix", 0))
-            and self.use_rank_residual_completion_gate
-        )
-        self.use_learned_completion_gate = self.completion_gate_mode in (
-            "reliability",
-            "rank_residual",
-            "rank_residual_norm",
-            "rank_residual_allnorm",
-            "rank_residual_allgate",
-            "rank_residual_softmax",
-            "rank_residual_shrink",
-            "rank_residual_centered",
-            "rank_residual_delta",
-            "rank_residual_centered_allgate",
-        )
-        self.completion_gate_detach_inputs = bool(self.env.args.completion_gate_detach_inputs)
-        self.completion_gate_use_item_context = bool(self.env.args.completion_gate_use_item_context)
-        self.completion_gate_item_context_source = self.env.args.completion_gate_item_context_source
-        if not self.completion_gate_use_item_context:
-            self.completion_gate_item_context_source = "off"
         self.item_graph_modal_alpha = min(
             max(float(getattr(self.env.args, "item_graph_modal_alpha", 0.0)), 0.0),
             1.0,
@@ -408,11 +348,6 @@ class MILK_model(torch.nn.Module):
             self.item_graph_modal_alpha > 0.0
             and self.item_graph_modal_layers > 0
         )
-        self.completion_gate_floor = self.env.args.completion_gate_floor
-        self.completion_gate_tail_quantile = min(
-            max(float(getattr(self.env.args, "completion_gate_tail_quantile", 1.0)), 0.0),
-            1.0,
-        )
         self.fusion_mode = getattr(self.env.args, "fusion_mode", "mean")
         if self.fusion_mode not in {"mean", "rum", "global_weighted_mean", "posterior_reliability"}:
             raise ValueError(f"Unsupported fusion mode: {self.fusion_mode}")
@@ -435,29 +370,6 @@ class MILK_model(torch.nn.Module):
             max(float(getattr(self.env.args, "posterior_reliability_floor", 0.0)), 0.0),
             1.0,
         )
-        self.completion_gate_score_residual_alpha = min(
-            max(float(getattr(self.env.args, "completion_gate_score_residual_alpha", 0.0)), 0.0),
-            1.0,
-        )
-        self.use_score_residual_completion_gate = (
-            self.completion_gate_score_residual_alpha > 0.0
-            and self.use_rank_residual_completion_gate
-            and not self.use_rum_fusion
-        )
-
-        train_items = np.asarray(getattr(dataset, "trainItem", []), dtype=np.int64)
-        item_degree = np.bincount(train_items, minlength=self.m_item)[: self.m_item]
-        item_degree_tensor = torch.tensor(item_degree, dtype=torch.float32, device=self.env.device)
-        self.register_buffer("item_train_degree", item_degree_tensor)
-        if self.completion_gate_tail_quantile < 1.0:
-            threshold = torch.quantile(item_degree_tensor, self.completion_gate_tail_quantile)
-            tail_mask = item_degree_tensor <= threshold
-        else:
-            threshold = item_degree_tensor.max() if item_degree_tensor.numel() else torch.tensor(0.0, device=self.env.device)
-            tail_mask = torch.ones(self.m_item, dtype=torch.bool, device=self.env.device)
-        self.completion_gate_tail_degree_threshold = float(threshold.detach().cpu())
-        self.register_buffer("completion_gate_tail_mask", tail_mask.unsqueeze(1).float())
-
         if not self.use_latent_completion_bridge:
             self.contra_head_v = Contra_head(self.ori_image_feat.size(1), self.contra_dim)
             self.contra_head_t = Contra_head(self.ori_text_feat.size(1), self.contra_dim)
@@ -566,34 +478,6 @@ class MILK_model(torch.nn.Module):
                 nn.Parameter(torch.zeros(len(self.modalities)))
             )
 
-        self.completion_gate_global_logits = nn.ParameterDict()
-        if self.use_global_rank_residual_completion_gate:
-            self.completion_gate_global_logits = nn.ParameterDict({
-                modality: nn.Parameter(torch.zeros(()))
-                for modality in self.modalities
-            })
-
-        if self.use_learned_completion_gate:
-            if self.completion_gate_item_context_source == "id_embedding":
-                item_context_dim = self.free_emb_dimension
-            elif self.completion_gate_item_context_source == "shared_mean":
-                item_context_dim = self.promrl_dim
-            else:
-                item_context_dim = 0
-            gate_input_dim = self.promrl_dim + item_context_dim + len(self.modalities)
-            self.completion_gates = nn.ModuleDict({
-                modality: self._build_completion_gate(gate_input_dim)
-                for modality in self.modalities
-            })
-
-        self.completion_gate_mix_params = nn.ParameterList()
-        if self.use_learned_completion_gate_mix:
-            mix_max = min(max(float(getattr(self.env.args, "completion_gate_mix_max", 1.0)), 1e-4), 1.0)
-            init_mix = min(max(float(self.env.args.completion_gate_mix_alpha), 1e-4), mix_max - 1e-4)
-            init_ratio = init_mix / mix_max
-            init_logit = torch.logit(torch.tensor(init_ratio, dtype=torch.float32))
-            self.completion_gate_mix_params.append(nn.Parameter(init_logit))
-
         self.fusion_linear = nn.Sequential(
             nn.Linear(self.free_emb_dimension, self.free_emb_dimension, bias=False),
             nn.Dropout(),
@@ -604,11 +488,7 @@ class MILK_model(torch.nn.Module):
         self.final_user = None
         self.activate = torch.nn.Sigmoid()
         self.latest_promrl_losses = {}
-        self.latest_completion_gate_metrics = {}
         self.latest_rum_fusion_metrics = {}
-        self.latest_completion_gate_regularizer = torch.zeros((), device=self.env.device)
-        self.latest_completion_gate_ungated_item_emb = None
-        self.latest_completion_gate_gated_item_emb = None
         self._gcn_cache = None
         self._imputer_updates_enabled = True
         self._pending_em_updates = []
@@ -760,24 +640,6 @@ class MILK_model(torch.nn.Module):
             )
         raise ValueError(f"Unsupported completion_adapter_mode: {mode}")
 
-    def _build_completion_gate(self, input_dim):
-        hidden_dim = self.env.args.completion_gate_hidden_dim
-        gate = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(self.env.args.completion_gate_dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-        nn.init.zeros_(gate[-1].weight)
-        if self.use_shrink_rank_residual_completion_gate:
-            init_logit = self.env.args.completion_gate_shrink_init_logit
-        elif self.use_rank_residual_completion_gate:
-            init_logit = 0.0
-        else:
-            init_logit = self.env.args.completion_gate_init_logit
-        nn.init.constant_(gate[-1].bias, init_logit)
-        return gate
-
     def _projection_modules(self):
         if self.use_decoupled_latent_bridge:
             return [getattr(self, f"comp_proj_{modality}") for modality in self.modalities]
@@ -812,12 +674,6 @@ class MILK_model(torch.nn.Module):
         modules.extend(getattr(self, f"{modality}_gcn") for modality in self.modalities)
         if self.use_decoupled_latent_bridge:
             modules.extend(getattr(self, f"comp_to_rec_{modality}") for modality in self.modalities)
-        if self.use_learned_completion_gate:
-            modules.append(self.completion_gates)
-        if self.use_global_rank_residual_completion_gate:
-            modules.append(self.completion_gate_global_logits)
-        if self.use_learned_completion_gate_mix:
-            modules.append(self.completion_gate_mix_params)
         if self.use_item_graph_edge_confidence:
             modules.append(self.item_graph_edge_confidence_params)
         return modules
@@ -849,18 +705,6 @@ class MILK_model(torch.nn.Module):
             and canonical_stage in ("imputer_backprop", "recommender", "joint")
         )
         self._set_modules_trainable(self._decoder_modules(), decoder_trainable)
-        if (
-            bool(getattr(self.env.args, "completion_gate_only_train", 0))
-            and self.use_rank_residual_completion_gate
-            and canonical_stage in ("recommender", "joint")
-        ):
-            self._set_modules_trainable(self._recommender_modules(), False)
-            if self.use_learned_completion_gate:
-                self._set_modules_trainable([self.completion_gates], True)
-            if self.use_global_rank_residual_completion_gate:
-                self._set_modules_trainable([self.completion_gate_global_logits], True)
-            if self.use_learned_completion_gate_mix:
-                self._set_modules_trainable([self.completion_gate_mix_params], True)
         self._imputer_updates_enabled = (
             getattr(self.env.args, "generative_update_mode", "em") == "em"
             and canonical_stage in (
@@ -3004,437 +2848,6 @@ class MILK_model(torch.nn.Module):
 
         return sum(item_outputs[modality] for modality in self.modalities) / len(self.modalities)
 
-    def _completion_gate_mix_alpha(self):
-        if self.use_learned_completion_gate_mix:
-            mix_max = min(max(float(getattr(self.env.args, "completion_gate_mix_max", 1.0)), 1e-4), 1.0)
-            return mix_max * torch.sigmoid(self.completion_gate_mix_params[0])
-        return min(max(float(self.env.args.completion_gate_mix_alpha), 0.0), 1.0)
-
-    def _completion_gate_residual_alpha(self):
-        if bool(getattr(self.env.args, "completion_gate_no_residual_alpha", 0)):
-            return 1.0
-        return max(float(self.env.args.completion_gate_residual_alpha), 0.0)
-
-    def _record_completion_gate_mix_alpha(self, mix_alpha):
-        if torch.is_tensor(mix_alpha):
-            value = float(mix_alpha.detach().cpu())
-        else:
-            value = float(mix_alpha)
-        self.latest_completion_gate_metrics["completion_gate_mix_alpha"] = value
-        self.latest_completion_gate_metrics["completion_gate_learn_mix"] = float(
-            self.use_learned_completion_gate_mix
-        )
-        self.latest_completion_gate_metrics["completion_gate_mix_max"] = float(
-            getattr(self.env.args, "completion_gate_mix_max", 1.0)
-        )
-
-    def get_recommender_modal_features(self, raw_features=None, allow_imputer_grad=False):
-        item_ids = None
-        if raw_features is None:
-            item_ids = torch.arange(self.m_item, device=self.env.device)
-        raw_features = raw_features or self._current_raw_modal_features()
-
-        if self.use_latent_direct_bridge:
-            projected = self.project_features(raw_features=raw_features)
-            if self.disable_imputation:
-                return projected
-
-            masks = self._missing_masks(raw_features)
-            if all(mask.all() for mask in masks.values()):
-                return projected
-
-            return self._build_completed_features(
-                projected,
-                masks,
-                detach_imputed=not allow_imputer_grad,
-                item_ids=item_ids,
-            )
-
-        if self.use_decoupled_latent_bridge:
-            recommendation_projected = self.project_recommendation_features(raw_features=raw_features)
-            if self.disable_imputation:
-                return recommendation_projected
-
-            masks = self._missing_masks(raw_features)
-            if all(mask.all() for mask in masks.values()):
-                return recommendation_projected
-
-            completion_projected = self.project_features(raw_features=raw_features)
-            completed_shared = self._build_completed_features(
-                completion_projected,
-                masks,
-                detach_imputed=not allow_imputer_grad,
-                item_ids=item_ids,
-            )
-            adapted_completed = self.adapt_completed_to_recommendation(completed_shared)
-
-            modal_features = {}
-            for modality in self.modalities:
-                mask = masks[modality].unsqueeze(1)
-                modal_features[modality] = torch.where(
-                    mask,
-                    recommendation_projected[modality],
-                    adapted_completed[modality],
-                )
-            return modal_features
-
-        modal_features = {modality: feature.clone() for modality, feature in raw_features.items()}
-        if self.disable_imputation:
-            return modal_features
-
-        masks = self._missing_masks(raw_features)
-        if all(mask.all() for mask in masks.values()):
-            return modal_features
-
-        projected = self.project_features(raw_features=raw_features)
-        completed_shared = self._build_completed_features(
-            projected,
-            masks,
-            detach_imputed=not allow_imputer_grad,
-            item_ids=item_ids,
-        )
-        bridged_raw = self.bridge_completed_to_recommendation_raw(completed_shared)
-
-        for modality in self.modalities:
-            mask = masks[modality].unsqueeze(1)
-            modal_features[modality] = torch.where(mask, raw_features[modality], bridged_raw[modality])
-
-        return modal_features
-
-    def _completion_reliability_gates(self, raw_features=None):
-        ones = {
-            modality: torch.ones(self.m_item, 1, device=self.env.device)
-            for modality in self.modalities
-        }
-        self.latest_completion_gate_metrics = {}
-        self.latest_completion_gate_regularizer = torch.zeros((), device=self.env.device)
-        if not self.use_completion_gate or self.disable_imputation:
-            return ones
-
-        raw_features = raw_features or self._current_raw_modal_features()
-        masks = self._missing_masks(raw_features)
-        if all(mask.all() for mask in masks.values()):
-            return ones
-
-        projected = self.project_features(raw_features=raw_features)
-        item_ids = None
-        if raw_features is None:
-            item_ids = torch.arange(self.m_item, device=self.env.device)
-        completed_shared = self._build_completed_features(projected, masks, item_ids=item_ids)
-        pattern = torch.stack([masks[modality].float() for modality in self.modalities], dim=1)
-        if self.completion_gate_item_context_source == "id_embedding":
-            item_ids = torch.arange(self.m_item, device=self.env.device)
-            item_context = self.item_emb(item_ids)
-        elif self.completion_gate_item_context_source == "shared_mean":
-            item_context = torch.stack(
-                [
-                    torch.where(masks[modality].unsqueeze(1), projected[modality], completed_shared[modality])
-                    for modality in self.modalities
-                ],
-                dim=0,
-            ).mean(dim=0)
-        else:
-            item_context = None
-
-        gates = {}
-        metrics = {}
-        regularizers = []
-        identity_regularizers = []
-        missing_gate_means = []
-        learned_gates = {}
-        gate_logits = {}
-        missing_masks = {}
-        for modality in self.modalities:
-            if self.completion_gate_mode == "alignment":
-                observed_modalities = [m for m in self.modalities if m != modality]
-                observed_stack = torch.stack(
-                    [
-                        torch.where(masks[m].unsqueeze(1), projected[m], completed_shared[m])
-                        for m in observed_modalities
-                    ],
-                    dim=0,
-                )
-                reference = F.normalize(observed_stack.mean(dim=0), dim=-1)
-                consistency = F.cosine_similarity(completed_shared[modality], reference, dim=-1, eps=1e-8).unsqueeze(1)
-                centered = consistency - self.env.args.completion_gate_alignment_center
-                temp = max(self.env.args.completion_gate_alignment_temp, 1e-6)
-                learned_gate = torch.sigmoid(centered / temp)
-                learned_gate = self.completion_gate_floor + (1.0 - self.completion_gate_floor) * learned_gate
-            elif self.use_global_rank_residual_completion_gate:
-                alpha = self._completion_gate_residual_alpha()
-                global_logit = self.completion_gate_global_logits[modality]
-                learned_gate = 1.0 + alpha * torch.tanh(global_logit)
-                learned_gate = learned_gate.expand(self.m_item, 1)
-                metrics[f"completion_gate_{modality}_global_logit"] = float(
-                    global_logit.detach().cpu()
-                )
-            else:
-                if (
-                    self.use_all_modal_rank_residual_completion_gate
-                    or self.use_centered_all_modal_rank_residual_completion_gate
-                ):
-                    modal_gate_source = torch.where(
-                        masks[modality].unsqueeze(1),
-                        projected[modality],
-                        completed_shared[modality],
-                    )
-                else:
-                    modal_gate_source = completed_shared[modality]
-                if self.completion_gate_detach_inputs:
-                    gate_modal_input = modal_gate_source.detach()
-                    gate_pattern = pattern.detach()
-                else:
-                    gate_modal_input = modal_gate_source
-                    gate_pattern = pattern
-                gate_inputs = [gate_modal_input]
-                if item_context is not None:
-                    gate_item_context = item_context.detach() if self.completion_gate_detach_inputs else item_context
-                    gate_inputs.append(gate_item_context)
-                gate_inputs.append(gate_pattern)
-                gate_input = torch.cat(gate_inputs, dim=1)
-                gate_logit = self.completion_gates[modality](gate_input)
-                gate_logits[modality] = gate_logit
-                if (
-                    self.use_softmax_rank_residual_completion_gate
-                    or self.use_centered_rank_residual_completion_gate
-                    or self.use_delta_rank_residual_completion_gate
-                    or self.use_centered_all_modal_rank_residual_completion_gate
-                ):
-                    learned_gate = torch.ones_like(gate_logit)
-                elif self.use_shrink_rank_residual_completion_gate:
-                    alpha = self._completion_gate_residual_alpha()
-                    learned_gate = 1.0 - alpha * torch.sigmoid(gate_logit)
-                elif self.use_rank_residual_completion_gate:
-                    alpha = self._completion_gate_residual_alpha()
-                    learned_gate = 1.0 + alpha * torch.tanh(gate_logit)
-                else:
-                    learned_gate = torch.sigmoid(gate_logit)
-                    learned_gate = self.completion_gate_floor + (1.0 - self.completion_gate_floor) * learned_gate
-            learned_gates[modality] = learned_gate
-            missing_masks[modality] = ~masks[modality]
-
-        if self.use_softmax_rank_residual_completion_gate:
-            temp = max(float(getattr(self.env.args, "completion_gate_softmax_temp", 1.0)), 1e-6)
-            alpha = self._completion_gate_residual_alpha()
-            logits = torch.stack([gate_logits[modality] for modality in self.modalities], dim=0)
-            competitive = F.softmax(logits / temp, dim=0) * len(self.modalities)
-            for idx, modality in enumerate(self.modalities):
-                learned_gates[modality] = 1.0 + alpha * (competitive[idx] - 1.0)
-            metrics["completion_gate_softmax_temp"] = temp
-            metrics["completion_gate_softmax_mean_normalized"] = 1.0
-        elif self.use_centered_rank_residual_completion_gate:
-            alpha = self._completion_gate_residual_alpha()
-            for modality in self.modalities:
-                missing_mask = missing_masks[modality]
-                gate_logit = gate_logits[modality]
-                if missing_mask.any():
-                    center = gate_logit[missing_mask].mean()
-                else:
-                    center = gate_logit.mean()
-                learned_gates[modality] = 1.0 + alpha * torch.tanh(gate_logit - center)
-            metrics["completion_gate_missing_logit_centered"] = 1.0
-        elif self.use_delta_rank_residual_completion_gate:
-            alpha = self._completion_gate_residual_alpha()
-            for modality in self.modalities:
-                missing_mask = missing_masks[modality]
-                residual = torch.tanh(gate_logits[modality])
-                if missing_mask.any():
-                    center = residual[missing_mask].mean()
-                else:
-                    center = residual.mean()
-                learned_gates[modality] = 1.0 + alpha * (residual - center)
-            metrics["completion_gate_missing_residual_centered"] = 1.0
-        elif self.use_centered_all_modal_rank_residual_completion_gate:
-            alpha = self._completion_gate_residual_alpha()
-            logits = torch.stack([gate_logits[modality] for modality in self.modalities], dim=0)
-            centered_logits = logits - logits.mean(dim=0, keepdim=True)
-            centered_gates = 1.0 + alpha * torch.tanh(centered_logits)
-            centered_gates = centered_gates / centered_gates.mean(dim=0, keepdim=True).clamp_min(1e-6)
-            for idx, modality in enumerate(self.modalities):
-                learned_gates[modality] = centered_gates[idx]
-            metrics["completion_gate_centered_all_modal_mean_normalized"] = 1.0
-        elif self.use_normalized_rank_residual_completion_gate:
-            missing_count = torch.stack(
-                [missing_masks[modality].float() for modality in self.modalities],
-                dim=0,
-            ).sum(dim=0).clamp_min(1.0).unsqueeze(1)
-            missing_gate_sum = torch.stack(
-                [
-                    torch.where(
-                        missing_masks[modality].unsqueeze(1),
-                        learned_gates[modality],
-                        torch.zeros_like(learned_gates[modality]),
-                    )
-                    for modality in self.modalities
-                ],
-                dim=0,
-            ).sum(dim=0)
-            missing_gate_mean = missing_gate_sum / missing_count
-            missing_gate_mean = missing_gate_mean.clamp_min(1e-6)
-            for modality in self.modalities:
-                learned_gates[modality] = torch.where(
-                    missing_masks[modality].unsqueeze(1),
-                    learned_gates[modality] / missing_gate_mean,
-                    learned_gates[modality],
-                )
-            metrics["completion_gate_missing_mean_normalized"] = 1.0
-        elif self.use_all_normalized_rank_residual_completion_gate:
-            all_gate_mean = torch.stack(
-                [
-                    torch.where(
-                        missing_masks[modality].unsqueeze(1),
-                        learned_gates[modality],
-                        torch.ones_like(learned_gates[modality]),
-                    )
-                    for modality in self.modalities
-                ],
-                dim=0,
-            ).mean(dim=0).clamp_min(1e-6)
-            for modality in self.modalities:
-                learned_gates[modality] = torch.where(
-                    missing_masks[modality].unsqueeze(1),
-                    learned_gates[modality] / all_gate_mean,
-                    learned_gates[modality],
-                )
-            metrics["completion_gate_all_mean_normalized"] = 1.0
-        elif self.use_all_modal_rank_residual_completion_gate:
-            all_gate_mean = torch.stack(
-                [learned_gates[modality] for modality in self.modalities],
-                dim=0,
-            ).mean(dim=0).clamp_min(1e-6)
-            for modality in self.modalities:
-                learned_gates[modality] = learned_gates[modality] / all_gate_mean
-            metrics["completion_gate_all_modal_mean_normalized"] = 1.0
-
-        for modality in self.modalities:
-            learned_gate = learned_gates[modality]
-            observed_gate = torch.ones_like(learned_gate)
-            missing_mask = missing_masks[modality]
-            if (
-                self.use_all_modal_rank_residual_completion_gate
-                or self.use_softmax_rank_residual_completion_gate
-                or self.use_centered_all_modal_rank_residual_completion_gate
-            ):
-                gate = learned_gate
-            else:
-                gate = torch.where(missing_mask.unsqueeze(1), learned_gate, observed_gate)
-            if self.use_rank_residual_completion_gate and self.completion_gate_tail_quantile < 1.0:
-                gate = 1.0 + self.completion_gate_tail_mask.to(gate.dtype) * (gate - 1.0)
-            gates[modality] = gate
-            if (
-                self.use_all_modal_rank_residual_completion_gate
-                or self.use_softmax_rank_residual_completion_gate
-                or self.use_centered_all_modal_rank_residual_completion_gate
-            ):
-                identity_regularizers.append(torch.mean((gate - 1.0) ** 2))
-                missing_gate_means.append(gate.mean())
-                metrics[f"completion_gate_{modality}_all_mean"] = float(
-                    gate.detach().mean().cpu()
-                )
-                metrics[f"completion_gate_{modality}_all_min"] = float(
-                    gate.detach().min().cpu()
-                )
-                metrics[f"completion_gate_{modality}_all_max"] = float(
-                    gate.detach().max().cpu()
-                )
-                observed_mask = masks[modality]
-                if observed_mask.any():
-                    observed_gate_values = gate[observed_mask]
-                    metrics[f"completion_gate_{modality}_observed_mean"] = float(
-                        observed_gate_values.detach().mean().cpu()
-                    )
-                    metrics[f"completion_gate_{modality}_observed_min"] = float(
-                        observed_gate_values.detach().min().cpu()
-                    )
-                    metrics[f"completion_gate_{modality}_observed_max"] = float(
-                        observed_gate_values.detach().max().cpu()
-                    )
-                else:
-                    metrics[f"completion_gate_{modality}_observed_mean"] = 1.0
-                    metrics[f"completion_gate_{modality}_observed_min"] = 1.0
-                    metrics[f"completion_gate_{modality}_observed_max"] = 1.0
-            if missing_mask.any():
-                missing_gate = gate[missing_mask]
-                if (
-                    self.use_rank_residual_completion_gate
-                    and not self.use_all_modal_rank_residual_completion_gate
-                    and not self.use_softmax_rank_residual_completion_gate
-                    and not self.use_centered_all_modal_rank_residual_completion_gate
-                ):
-                    identity_regularizers.append(torch.mean((missing_gate - 1.0) ** 2))
-                    missing_gate_means.append(missing_gate.mean())
-                elif not self.use_rank_residual_completion_gate:
-                    target = torch.as_tensor(
-                        self.env.args.completion_gate_target_mean,
-                        dtype=missing_gate.dtype,
-                        device=missing_gate.device,
-                    )
-                    regularizers.append(torch.mean((missing_gate - target) ** 2))
-                metrics[f"completion_gate_{modality}_missing_mean"] = float(
-                    missing_gate.detach().mean().cpu()
-                )
-                metrics[f"completion_gate_{modality}_missing_min"] = float(
-                    missing_gate.detach().min().cpu()
-                )
-                metrics[f"completion_gate_{modality}_missing_max"] = float(
-                    missing_gate.detach().max().cpu()
-                )
-            else:
-                metrics[f"completion_gate_{modality}_missing_mean"] = 1.0
-                metrics[f"completion_gate_{modality}_missing_min"] = 1.0
-                metrics[f"completion_gate_{modality}_missing_max"] = 1.0
-
-        if self.use_rank_residual_completion_gate:
-            metrics["completion_gate_no_residual_alpha"] = float(
-                bool(getattr(self.env.args, "completion_gate_no_residual_alpha", 0))
-            )
-            metrics["completion_gate_effective_residual_alpha"] = float(
-                self._completion_gate_residual_alpha()
-            )
-            metrics["completion_gate_tail_quantile"] = self.completion_gate_tail_quantile
-            metrics["completion_gate_tail_active_fraction"] = float(
-                self.completion_gate_tail_mask.detach().mean().cpu()
-            )
-            metrics["completion_gate_tail_degree_threshold"] = self.completion_gate_tail_degree_threshold
-            weighted_regularizers = []
-            if identity_regularizers:
-                identity_regularizer = torch.stack(identity_regularizers).mean()
-                weighted_regularizers.append(
-                    self.env.args.completion_gate_identity_coeff * identity_regularizer
-                )
-                metrics["completion_gate_identity_regularizer"] = float(
-                    identity_regularizer.detach().cpu()
-                )
-            if len(missing_gate_means) > 1:
-                stacked_means = torch.stack(missing_gate_means)
-                balance_regularizer = torch.var(stacked_means, unbiased=False)
-                weighted_regularizers.append(
-                    self.env.args.completion_gate_balance_coeff * balance_regularizer
-                )
-                metrics["completion_gate_balance_regularizer"] = float(
-                    balance_regularizer.detach().cpu()
-                )
-                metrics["completion_gate_modality_mean_gap"] = float(
-                    (stacked_means.max() - stacked_means.min()).detach().cpu()
-                )
-            if weighted_regularizers:
-                self.latest_completion_gate_regularizer = torch.stack(weighted_regularizers).sum()
-                metrics["completion_gate_regularizer"] = float(
-                    self.latest_completion_gate_regularizer.detach().cpu()
-                )
-        elif regularizers:
-            self.latest_completion_gate_regularizer = torch.stack(regularizers).mean()
-            metrics["completion_gate_regularizer"] = float(
-                self.latest_completion_gate_regularizer.detach().cpu()
-            )
-        self.latest_completion_gate_metrics = metrics
-        return gates
-
-    def completion_gate_regularization_loss(self):
-        if not self.use_completion_gate:
-            return torch.zeros((), device=self.env.device)
-        return self.latest_completion_gate_regularizer
-
     def compute_recommendation_embeddings(self, raw_features=None, allow_modal_grad=False, deterministic=False):
         raw_features = raw_features or self._current_raw_modal_features()
         user_id_emb = self.user_emb.weight
@@ -3442,11 +2855,9 @@ class MILK_model(torch.nn.Module):
             raw_features=raw_features,
             allow_imputer_grad=allow_modal_grad,
         )
-        reliability_gates = self._completion_reliability_gates(raw_features=raw_features)
         observed_masks = self._missing_masks(raw_features=raw_features)
         user_outputs = {}
         item_outputs = {}
-        ungated_item_outputs = {}
         for modality in self.modalities:
             modal_user_emb, modal_item_emb = getattr(self, f"{modality}_gcn")(
                 modal_features[modality],
@@ -3456,45 +2867,17 @@ class MILK_model(torch.nn.Module):
             modal_item_emb = self._apply_item_graph_modal_residual(
                 modal_item_emb, observed_masks[modality], modality=modality
             )
-            ungated_item_outputs[modality] = modal_item_emb
-            if not self.use_rum_fusion:
-                modal_item_emb = modal_item_emb * reliability_gates[modality]
             user_outputs[modality] = modal_user_emb
             item_outputs[modality] = modal_item_emb
 
-        if self.use_rank_residual_completion_gate and not self.use_rum_fusion and not allow_modal_grad:
-            ungated_item_outputs = {
-                modality: item_emb.detach()
-                for modality, item_emb in ungated_item_outputs.items()
-            }
-            item_outputs = {
-                modality: item_emb * reliability_gates[modality]
-                for modality, item_emb in ungated_item_outputs.items()
-            }
-
         user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
-        if self.use_rank_residual_completion_gate and not self.use_rum_fusion:
-            ungated_item_source = self._fuse_item_sources(
-                ungated_item_outputs,
-                modal_features=modal_features,
-                raw_features=raw_features,
-            )
-            gated_item_source = self._fuse_item_sources(
-                item_outputs,
-                modal_features=modal_features,
-                raw_features=raw_features,
-            )
-            mix_alpha = self._completion_gate_mix_alpha()
-            item_source = (1.0 - mix_alpha) * ungated_item_source + mix_alpha * gated_item_source
-            self._record_completion_gate_mix_alpha(mix_alpha)
-        else:
-            item_source = self._fuse_item_sources(
-                item_outputs,
-                modal_features=modal_features,
-                raw_features=raw_features,
-            )
+        item_source = self._fuse_item_sources(
+            item_outputs,
+            modal_features=modal_features,
+            raw_features=raw_features,
+        )
 
-        if not allow_modal_grad and not (self.use_rank_residual_completion_gate and not self.use_rum_fusion):
+        if not allow_modal_grad:
             item_source = item_source.detach()
 
         item_emb = self._apply_fusion(item_source, deterministic=deterministic)
@@ -4749,15 +4132,12 @@ class MILK_model(torch.nn.Module):
         user_id_emb = self.user_emb.weight
         raw_features = self._current_raw_modal_features()
         modal_features = self.get_recommender_modal_features()
-        reliability_gates = self._completion_reliability_gates(raw_features=raw_features)
         observed_masks = self._missing_masks(raw_features=raw_features)
 
         outputs = {
             "user_id": user_id_emb,
             "modal_inputs": modal_features,
-            "reliability_gates": reliability_gates,
             "observed_masks": observed_masks,
-            "ungated_item_outputs": {},
         }
         for modality in self.modalities:
             modal_user_emb, modal_item_emb = getattr(self, f"{modality}_gcn")(
@@ -4766,9 +4146,6 @@ class MILK_model(torch.nn.Module):
             modal_item_emb = self._apply_item_graph_modal_residual(
                 modal_item_emb, observed_masks[modality], modality=modality
             )
-            outputs["ungated_item_outputs"][modality] = modal_item_emb
-            if not self.use_rum_fusion:
-                modal_item_emb = modal_item_emb * reliability_gates[modality]
             outputs[modality] = (modal_user_emb, modal_item_emb)
 
         self._gcn_cache = outputs
@@ -4784,54 +4161,17 @@ class MILK_model(torch.nn.Module):
             modality: outputs[modality][0]
             for modality in self.modalities
         }
-        if self.use_rank_residual_completion_gate and not self.use_rum_fusion:
-            reliability_gates = outputs["reliability_gates"]
-            ungated_item_outputs = {
-                modality: item_emb.detach()
-                for modality, item_emb in outputs["ungated_item_outputs"].items()
-            }
-            item_outputs = {
-                modality: item_emb * reliability_gates[modality]
-                for modality, item_emb in ungated_item_outputs.items()
-            }
-        else:
-            ungated_item_outputs = None
-            item_outputs = {
-                modality: outputs[modality][1].detach()
-                for modality in self.modalities
-            }
+        item_outputs = {
+            modality: outputs[modality][1].detach()
+            for modality in self.modalities
+        }
 
         user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
-        if self.use_rank_residual_completion_gate and not self.use_rum_fusion:
-            ungated_item_source = self._fuse_item_sources(
-                ungated_item_outputs,
-                modal_features=outputs["modal_inputs"],
-                observed_masks=outputs["observed_masks"],
-            )
-            gated_item_source = self._fuse_item_sources(
-                item_outputs,
-                modal_features=outputs["modal_inputs"],
-                observed_masks=outputs["observed_masks"],
-            )
-            mix_alpha = self._completion_gate_mix_alpha()
-            item_source = (1.0 - mix_alpha) * ungated_item_source + mix_alpha * gated_item_source
-            self._record_completion_gate_mix_alpha(mix_alpha)
-            self.latest_completion_gate_ungated_item_emb = self._apply_fusion(
-                ungated_item_source,
-                deterministic=True,
-            ).detach()
-            self.latest_completion_gate_gated_item_emb = self._apply_fusion(
-                item_source,
-                deterministic=True,
-            )
-        else:
-            item_source = self._fuse_item_sources(
-                item_outputs,
-                modal_features=outputs["modal_inputs"],
-                observed_masks=outputs["observed_masks"],
-            )
-            self.latest_completion_gate_ungated_item_emb = None
-            self.latest_completion_gate_gated_item_emb = None
+        item_source = self._fuse_item_sources(
+            item_outputs,
+            modal_features=outputs["modal_inputs"],
+            observed_masks=outputs["observed_masks"],
+        )
         item_emb = self.fusion_linear(item_source)
 
         user_emb = torch.nan_to_num(user_emb, nan=0.0, posinf=0.0, neginf=0.0)
@@ -4841,116 +4181,10 @@ class MILK_model(torch.nn.Module):
 
         return user_emb, item_emb
 
-    def completion_gate_advantage_loss(self, batch_users, batch_pos_items, batch_neg_items):
-        if not (
-            self.use_rank_residual_completion_gate
-            and not self.use_rum_fusion
-            and self.latest_completion_gate_ungated_item_emb is not None
-            and self.latest_completion_gate_gated_item_emb is not None
-            and self.final_user is not None
-        ):
-            return torch.zeros((), device=self.env.device)
-
-        local_users = torch.arange(batch_users.shape[0], device=batch_users.device)
-        user_emb = self.final_user[batch_users].detach()
-        ungated_loss = self._bpr_loss_from_embeddings(
-            user_emb,
-            self.latest_completion_gate_ungated_item_emb,
-            local_users,
-            batch_pos_items,
-            batch_neg_items,
-        ).detach()
-        gated_loss = self._bpr_loss_from_embeddings(
-            user_emb,
-            self.latest_completion_gate_gated_item_emb,
-            local_users,
-            batch_pos_items,
-            batch_neg_items,
-        )
-        margin = max(
-            float(getattr(self.env.args, "completion_gate_advantage_margin", 0.0)),
-            0.0,
-        )
-        return torch.relu(gated_loss - ungated_loss + margin)
-
-    def _score_residual_embeddings(self, outputs, deterministic=False):
-        user_id_emb = outputs["user_id"]
-        user_outputs = {
-            modality: outputs[modality][0]
-            for modality in self.modalities
-        }
-        user_emb = user_id_emb + sum(user_outputs.values()) / len(user_outputs)
-
-        base_item_outputs = {
-            modality: outputs["ungated_item_outputs"][modality].detach()
-            for modality in self.modalities
-        }
-        gated_item_outputs = {
-            modality: base_item_outputs[modality] * outputs["reliability_gates"][modality]
-            for modality in self.modalities
-        }
-        base_item_source = self._fuse_item_sources(
-            base_item_outputs,
-            modal_features=outputs["modal_inputs"],
-            observed_masks=outputs["observed_masks"],
-        )
-        gated_item_source = self._fuse_item_sources(
-            gated_item_outputs,
-            modal_features=outputs["modal_inputs"],
-            observed_masks=outputs["observed_masks"],
-        )
-        base_item_emb = self._apply_fusion(base_item_source, deterministic=deterministic)
-        gated_item_emb = self._apply_fusion(gated_item_source, deterministic=deterministic)
-        return user_emb, base_item_emb, gated_item_emb
-
-    def _score_residual_alpha(self):
-        return self.completion_gate_score_residual_alpha
-
-    def score_residual_pair_scores(self, batch_users, batch_items, outputs=None):
-        if outputs is None:
-            outputs = self._run_modal_gcn()
-        user_emb, base_item_emb, gated_item_emb = self._score_residual_embeddings(
-            outputs,
-            deterministic=True,
-        )
-        users = user_emb[batch_users]
-        base_scores = torch.sum(users * base_item_emb[batch_items], dim=1)
-        gated_scores = torch.sum(users * gated_item_emb[batch_items], dim=1)
-        alpha = self._score_residual_alpha()
-        self.latest_completion_gate_metrics["completion_gate_score_residual_alpha"] = alpha
-        return base_scores + alpha * (gated_scores - base_scores)
-
-    def score_residual_score_matrix(self, batch_users, batch_items, outputs=None):
-        if outputs is None:
-            outputs = self._run_modal_gcn()
-        user_emb, base_item_emb, gated_item_emb = self._score_residual_embeddings(
-            outputs,
-            deterministic=True,
-        )
-        users = user_emb[batch_users]
-        base_scores = users @ base_item_emb[batch_items].T
-        gated_scores = users @ gated_item_emb[batch_items].T
-        alpha = self._score_residual_alpha()
-        return base_scores + alpha * (gated_scores - base_scores)
-
-    def _score_residual_reg_loss(self, outputs, batch_users, batch_pos_items, batch_neg_items):
-        user_emb, base_item_emb, _ = self._score_residual_embeddings(
-            outputs,
-            deterministic=True,
-        )
-        return self.calculate_reg_loss(
-            batch_users,
-            batch_pos_items,
-            batch_neg_items,
-            all_user_emb=user_emb,
-            all_item_emb=base_item_emb,
-        )
-
     def _rum_tau(self):
         return max(float(getattr(self.env.args, "rum_tau", 1.0)), 1e-6)
 
     def _rum_logit_terms(self, outputs, batch_users, batch_items, matrix=False, detach_items=False):
-        reliability = outputs["reliability_gates"]
         observed = outputs["observed_masks"]
         pref = self.user_modality_pref(batch_users)
         scores = []
@@ -4958,7 +4192,6 @@ class MILK_model(torch.nn.Module):
         rel_values = []
         obs_values = []
         user_id_emb = outputs["user_id"][batch_users]
-        reliability_coeff = float(getattr(self.env.args, "rum_reliability_coeff", 1.0))
         match_coeff = float(getattr(self.env.args, "rum_match_coeff", 1.0))
 
         for modality_idx, modality in enumerate(self.modalities):
@@ -4969,18 +4202,17 @@ class MILK_model(torch.nn.Module):
                 modal_items = modal_items.detach()
             if matrix:
                 modal_score = modal_users @ modal_items.T
-                rel = reliability[modality][batch_items].squeeze(1).unsqueeze(0)
                 obs = observed[modality][batch_items].float().unsqueeze(0)
+                rel = torch.ones_like(obs)
                 pref_term = pref[:, modality_idx].unsqueeze(1)
             else:
                 modal_score = torch.sum(modal_users * modal_items, dim=1)
-                rel = reliability[modality][batch_items].squeeze(1)
                 obs = observed[modality][batch_items].float()
+                rel = torch.ones_like(obs)
                 pref_term = pref[:, modality_idx]
 
             logit = (
                 pref_term
-                + reliability_coeff * torch.log(rel.clamp_min(1e-6))
                 + match_coeff * torch.tanh(modal_score)
                 + self.rum_modality_bias[modality_idx]
                 + self.rum_observed_bias[modality_idx] * obs
@@ -5090,33 +4322,6 @@ class MILK_model(torch.nn.Module):
             reg_loss = self._rum_reg_loss(outputs, batch_users, batch_pos_items, batch_neg_items)
             if return_embeddings:
                 all_user_emb, all_item_emb = self.forward()
-                return bpr_loss, reg_loss, all_user_emb, all_item_emb
-            return bpr_loss, reg_loss
-
-        if self.use_score_residual_completion_gate:
-            outputs = self._run_modal_gcn()
-            pos_scores = self.score_residual_pair_scores(
-                batch_users,
-                batch_pos_items,
-                outputs=outputs,
-            )
-            neg_scores = self.score_residual_pair_scores(
-                batch_users,
-                batch_neg_items,
-                outputs=outputs,
-            )
-            bpr_loss = torch.mean(torch.nn.functional.softplus(neg_scores - pos_scores))
-            reg_loss = self._score_residual_reg_loss(
-                outputs,
-                batch_users,
-                batch_pos_items,
-                batch_neg_items,
-            )
-            if return_embeddings:
-                all_user_emb, all_item_emb, _ = self._score_residual_embeddings(
-                    outputs,
-                    deterministic=True,
-                )
                 return bpr_loss, reg_loss, all_user_emb, all_item_emb
             return bpr_loss, reg_loss
 

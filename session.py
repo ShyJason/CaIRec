@@ -737,16 +737,6 @@ class MILK_session(object):
                         self.env.args.modality_bpr_coeff
                         * self.model.modality_bpr_loss(user, pos_item, neg_item)
                     )
-                if self.env.args.completion_gate_reg_coeff > 0:
-                    penalty_loss = penalty_loss + (
-                        self.env.args.completion_gate_reg_coeff
-                        * self.model.completion_gate_regularization_loss()
-                    )
-                if getattr(self.env.args, "completion_gate_advantage_coeff", 0.0) > 0:
-                    penalty_loss = penalty_loss + (
-                        self.env.args.completion_gate_advantage_coeff
-                        * self.model.completion_gate_advantage_loss(user, pos_item, neg_item)
-                    )
                 item_graph_confidence_reg_coeff = float(
                     getattr(self.env.args, "item_graph_confidence_reg_coeff", 0.0) or 0.0
                 )
@@ -917,10 +907,6 @@ class MILK_session(object):
             print('-' * 30)
             print(
                 f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, rec_neighbor_cl = {rec_neighbor_cl_loss:.5f}, rec_neighbor_cl_weight = {rec_neighbor_cl_weight_eff:.5f}, align_loss = {align_loss:.5f}, distill_loss = {distill_loss:.5f}, train_time = {train_time:.2f}')
-            gate_metrics = getattr(self.model, 'latest_completion_gate_metrics', {})
-            if gate_metrics:
-                gate_summary = ', '.join(f'{key} = {value:.5f}' for key, value in sorted(gate_metrics.items()))
-                print(f'COMPLETION_GATE:{gate_summary}')
             rum_metrics = getattr(self.model, 'latest_rum_fusion_metrics', {})
             if rum_metrics:
                 rum_summary = ', '.join(f'{key} = {value:.5f}' for key, value in sorted(rum_metrics.items()))
@@ -1261,12 +1247,6 @@ class MILK_session(object):
                 raise ValueError('test modality-subset reporting is not implemented for RUM score fusion')
             hr, recall, ndcg = self._test_rum(mode=mode, top_list=top_list)
             return hr, recall, ndcg, time.time() - t
-        if getattr(self.model, 'use_score_residual_completion_gate', False):
-            if mode == 'test' and bool(getattr(self.env.args, 'report_test_modality_subsets', 0)):
-                raise ValueError('test modality-subset reporting is not implemented for residual score fusion')
-            hr, recall, ndcg = self._test_score_residual(mode=mode, top_list=top_list)
-            return hr, recall, ndcg, time.time() - t
-
         user_emb, item_emb = self.model()
 
         user_emb = user_emb.cpu().detach().numpy()
@@ -1346,88 +1326,6 @@ class MILK_session(object):
                 tool.cprint(metric_message)
                 if self.env.args.log:
                     self.env.test_logger.info(metric_message)
-
-    @torch.no_grad()
-    def _test_score_residual(self, mode='val', top_list=[50]):
-        eval_data = self.dataset.val_data if mode == 'val' else self.dataset.test_data
-        eval_users = list(eval_data.keys())
-        max_topk = max(top_list)
-        user_batch_size = int(getattr(self.env.args, 'rum_eval_user_batch_size', 256))
-        item_chunk_size = int(getattr(self.env.args, 'rum_eval_item_chunk_size', 4096))
-        user_batch_size = max(1, user_batch_size)
-        item_chunk_size = max(1, item_chunk_size)
-
-        self.model.clear_gcn_cache()
-        outputs = self.model._run_modal_gcn()
-        candidate_only = getattr(self.dataset, 'cold_start_protocol', 'none') == 'milk'
-        candidate_items = self.dataset.get_eval_candidate_items(mode) if candidate_only else np.arange(self.dataset.m_item)
-        all_items = torch.as_tensor(candidate_items, dtype=torch.long, device=self.env.device)
-        ranked_items = {}
-
-        for start in range(0, len(eval_users), user_batch_size):
-            batch_user_ids = eval_users[start:start + user_batch_size]
-            batch_users = torch.as_tensor(batch_user_ids, dtype=torch.long, device=self.env.device)
-            running_scores = None
-            running_items = None
-
-            for item_start in range(0, all_items.numel(), item_chunk_size):
-                item_ids = all_items[item_start:item_start + item_chunk_size]
-                scores = self.model.score_residual_score_matrix(batch_users, item_ids, outputs=outputs)
-                if not candidate_only:
-                    for row_idx, user_id in enumerate(batch_user_ids):
-                        train_items = self.dataset.train_data.get(user_id, [])
-                        if not train_items:
-                            continue
-                        local_items = [
-                            item - item_start
-                            for item in train_items
-                            if item_start <= item < item_start + item_ids.numel()
-                        ]
-                        if local_items:
-                            scores[row_idx, torch.as_tensor(local_items, dtype=torch.long, device=self.env.device)] = -float('inf')
-
-                chunk_topk = min(max_topk, item_ids.numel())
-                chunk_scores, chunk_indices = torch.topk(scores, k=chunk_topk, dim=1)
-                chunk_items = item_ids[chunk_indices]
-                if running_scores is None:
-                    running_scores = chunk_scores
-                    running_items = chunk_items
-                else:
-                    merged_scores = torch.cat([running_scores, chunk_scores], dim=1)
-                    merged_items = torch.cat([running_items, chunk_items], dim=1)
-                    keep_topk = min(max_topk, merged_scores.size(1))
-                    running_scores, keep_indices = torch.topk(merged_scores, k=keep_topk, dim=1)
-                    running_items = torch.gather(merged_items, 1, keep_indices)
-
-            if running_items is None:
-                continue
-            running_items = running_items.cpu().numpy()
-            for row_idx, user_id in enumerate(batch_user_ids):
-                ranked_items[user_id] = running_items[row_idx].tolist()
-
-        hr_out, recall_out, ndcg_out = {}, {}, {}
-        for topk in top_list:
-            hr_values, recall_values, ndcg_values = [], [], []
-            for user_id in eval_users:
-                test_items = set(eval_data[user_id])
-                if not test_items:
-                    continue
-                pred_items = ranked_items.get(user_id, [])[:topk]
-                hit_value = 0
-                dcg_value = 0.0
-                for idx, item in enumerate(pred_items):
-                    if item in test_items:
-                        hit_value += 1
-                        dcg_value += np.log(2) / np.log(idx + 2)
-                target_length = min(topk, len(test_items))
-                idcg = sum(np.log(2) / np.log(idx + 2) for idx in range(target_length))
-                hr_values.append(hit_value / target_length if target_length > 0 else 0.0)
-                recall_values.append(hit_value / len(test_items))
-                ndcg_values.append(dcg_value / idcg if idcg > 0 else 0.0)
-            hr_out[topk] = float(np.mean(hr_values)) if hr_values else 0.0
-            recall_out[topk] = float(np.mean(recall_values)) if recall_values else 0.0
-            ndcg_out[topk] = float(np.mean(ndcg_values)) if ndcg_values else 0.0
-        return hr_out, recall_out, ndcg_out
 
     @torch.no_grad()
     def _test_rum(self, mode='val', top_list=[50]):

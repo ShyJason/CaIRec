@@ -345,37 +345,6 @@ def _build_parser():
         default=0,
         help='Set to 1 when external override files already contain completed features for missing modalities.',
     )
-    parser.add_argument(
-        '--completion_gate_mode',
-        type=str,
-        default='off',
-        choices=[
-            'off',
-            'reliability',
-            'alignment',
-            'rank_residual',
-            'rank_residual_norm',
-            'rank_residual_allnorm',
-            'rank_residual_allgate',
-            'rank_residual_softmax',
-            'rank_residual_global',
-            'rank_residual_shrink',
-            'rank_residual_centered',
-            'rank_residual_delta',
-            'rank_residual_centered_allgate',
-        ],
-    )
-    parser.add_argument('--completion_gate_hidden_dim', type=int, default=64)
-    parser.add_argument('--completion_gate_dropout', type=float, default=0.1)
-    parser.add_argument('--completion_gate_init_logit', type=float, default=1.5)
-    parser.add_argument('--completion_gate_detach_inputs', type=int, default=1)
-    parser.add_argument('--completion_gate_use_item_context', type=int, default=1)
-    parser.add_argument(
-        '--completion_gate_item_context_source',
-        type=str,
-        default='id_embedding',
-        choices=['id_embedding', 'shared_mean', 'off'],
-    )
     parser.add_argument('--item_graph_topk', type=int, default=20)
     parser.add_argument(
         '--item_graph_fuse_before_topk',
@@ -620,30 +589,6 @@ def _build_parser():
         choices=['all', 'missing'],
         help='Apply post-GCN, pre-fusion modality item-item residual to all items or only items missing that modality.',
     )
-    parser.add_argument('--completion_gate_floor', type=float, default=0.7)
-    parser.add_argument('--completion_gate_target_mean', type=float, default=0.95)
-    parser.add_argument('--completion_gate_reg_coeff', type=float, default=0.0)
-    parser.add_argument('--completion_gate_alignment_center', type=float, default=0.0)
-    parser.add_argument('--completion_gate_alignment_temp', type=float, default=0.2)
-    parser.add_argument('--completion_gate_residual_alpha', type=float, default=0.1)
-    parser.add_argument(
-        '--completion_gate_no_residual_alpha',
-        type=int,
-        default=0,
-        help='If set, rank-residual gates use 1 + tanh(z) and ignore completion_gate_residual_alpha.',
-    )
-    parser.add_argument('--completion_gate_mix_alpha', type=float, default=0.3)
-    parser.add_argument('--completion_gate_identity_coeff', type=float, default=0.05)
-    parser.add_argument('--completion_gate_balance_coeff', type=float, default=0.01)
-    parser.add_argument('--completion_gate_softmax_temp', type=float, default=1.0)
-    parser.add_argument('--completion_gate_advantage_coeff', type=float, default=0.0)
-    parser.add_argument('--completion_gate_advantage_margin', type=float, default=0.0)
-    parser.add_argument('--completion_gate_score_residual_alpha', type=float, default=0.0)
-    parser.add_argument('--completion_gate_learn_mix', type=int, default=0)
-    parser.add_argument('--completion_gate_mix_max', type=float, default=1.0)
-    parser.add_argument('--completion_gate_shrink_init_logit', type=float, default=-4.0)
-    parser.add_argument('--completion_gate_tail_quantile', type=float, default=1.0)
-    parser.add_argument('--completion_gate_only_train', type=int, default=0)
     parser.add_argument(
         '--fusion_mode',
         type=str,
