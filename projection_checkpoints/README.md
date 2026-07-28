@@ -1,4 +1,4 @@
-# Pretrained modality projections
+# Projection checkpoints
 
 Stage 1 loads one of these fixed projection-only checkpoints by dataset:
 

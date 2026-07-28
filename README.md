@@ -13,7 +13,7 @@ BPR optimization.
 ├── dataset_loader.py, evaluation.py    # data protocol and evaluation
 ├── promrl_core/                        # completion runtime
 ├── configs/                            # retained paper configurations
-├── pretrained_projections/             # fixed Stage 1 projection initializers
+├── projection_checkpoints/             # fixed Stage 1 projection initializers
 ├── run_mmrec_mainline.sh                # complete Stage 1.1 → 1.2 → 2 pipeline
 ├── scripts/                            # data preparation and significance test
 └── tests/                              # focused regression tests
@@ -46,7 +46,7 @@ The complete pipeline loads:
 - `unified_missing_items_mr0.5_seed2023.npy` in each dataset directory.
 
 Datasets are not committed to Git. The three small projection-only initializers
-are committed under `pretrained_projections/` and verified by its
+are committed under `projection_checkpoints/` and verified by its
 `SHA256SUMS`. No pre-existing Stage 1.1, Stage 1.2, or Stage 2 checkpoint is
 required.
 
@@ -54,7 +54,7 @@ required.
 
 Stage 0 projection training is not part of this repository. Stage 1 starts by
 loading the matching pretrained modality projection from
-`pretrained_projections/<dataset>.pth`, then the script runs Stage 1.1, Stage
+`projection_checkpoints/<dataset>.pth`, then the script runs Stage 1.1, Stage
 1.2, and Stage 2 in order.
 
 ```bash
