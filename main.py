@@ -231,14 +231,6 @@ def _build_parser():
     )
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
     parser.add_argument('--imputation_val_rate', type=float, default=0.0)
-    parser.add_argument(
-        '--imputation_selection_policy',
-        type=str,
-        default='legacy',
-        choices=['legacy', 'stage1_default', 'decoder_default'],
-    )
-    parser.add_argument('--imputation_selection_split', type=str, default='train', choices=['train', 'val', 'test'])
-    parser.add_argument('--imputation_selection_metric', type=str, default='mse', choices=['mse', 'cosine'])
     # ----------------------- logger
     parser.add_argument('--log', type=int, default=0)
     parser.add_argument('--tensorboard', type=int, default=1)
@@ -262,8 +254,6 @@ def _validate_protocol_args(args):
     if args.evaluation_protocol == 'strict':
         if args.selection_mode == 'test':
             raise ValueError('Strict evaluation cannot use selection_mode=test; use validation selection.')
-        if args.imputation_selection_split == 'test':
-            raise ValueError('Strict evaluation cannot use imputation_selection_split=test; use train or val.')
     return args
 
 
@@ -383,12 +373,6 @@ if my_env.args.train_stage in (
             summary += (
                 f", imputation_val_mse = {final_metrics['imputation_val_mse']:.6f}, "
                 f"imputation_val_cosine = {final_metrics['imputation_val_cosine']:.6f}"
-            )
-        if 'val_shared_cosine_gap' in final_metrics:
-            summary += (
-                f", val_shared_cosine_gap = {final_metrics['val_shared_cosine_gap']:.6f}, "
-                f"val_missing_decode_cosine = {final_metrics.get('val_missing_decode_cosine', 0.0):.6f}, "
-                f"val_shared_mse = {final_metrics.get('val_shared_mse', 0.0):.6f}"
             )
         tool.cprint(summary)
         if my_env.args.log:
