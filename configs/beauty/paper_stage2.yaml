@@ -53,5 +53,4 @@ ema_eta: 0.01
 strict_probe_test_interval: 0
 tensorboard: 0
 save: 1
-save_all_epochs: 0
 suffix: paper_stage2_beauty

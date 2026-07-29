@@ -34,7 +34,6 @@ class MILK_session(object):
 
         self.early_stop = 0
         self.best_epoch = 0
-        self.best_loss = float('inf')
         self.total_epoch = 0
         self.best_ndcg = defaultdict(float)
         self.best_hr = defaultdict(float)
@@ -45,7 +44,6 @@ class MILK_session(object):
         self.best_recommendation_metric = float('-inf')
         self.stage_name = self.env.args.train_stage
         self.last_train_metrics = {}
-        self.best_stage1_selection = None
         self.best_model_state = None
         self.last_test_modality_subsets = {}
 
@@ -181,138 +179,6 @@ class MILK_session(object):
             self._restore_model_state(current_state)
             if was_training:
                 self.model.train()
-
-    def _finalize_strict_imputation_metrics(self):
-        if self.best_model_state is None:
-            return
-
-        current_state = {
-            key: value.detach().cpu().clone()
-            for key, value in self.model.state_dict().items()
-        }
-        was_training = self.model.training
-        try:
-            self._restore_model_state(self.best_model_state)
-            metric_splits = ['test', 'val']
-            metrics = self._compute_imputation_metrics(splits=tuple(metric_splits))
-            overall = metrics.get('test', {}).get('_overall', {})
-            if overall:
-                self.last_train_metrics['imputation_test_mse'] = float(overall.get('mse', 0.0))
-                self.last_train_metrics['imputation_test_cosine'] = float(overall.get('cosine', 0.0))
-                self.last_train_metrics['imputation_test_random_mse'] = float(overall.get('random_mse', 0.0))
-                self.last_train_metrics['imputation_test_random_cosine'] = float(overall.get('random_cosine', 0.0))
-                print(
-                    f"IMPUTE:test mse = {overall.get('mse', 0.0):.6f}, "
-                    f"cosine = {overall.get('cosine', 0.0):.6f}, "
-                    f"random_mse = {overall.get('random_mse', 0.0):.6f}, "
-                    f"random_cosine = {overall.get('random_cosine', 0.0):.6f}"
-                )
-            if 'val' in metrics:
-                heldout_metrics = self._compute_stage1_heldout_metrics(split='imputation_val')
-                self.last_train_metrics['imputation_val_mse'] = float(metrics['val']['_overall'].get('mse', 0.0))
-                self.last_train_metrics['imputation_val_cosine'] = float(metrics['val']['_overall'].get('cosine', 0.0))
-                self.last_train_metrics['val_pseudo_shared_mse'] = float(heldout_metrics.get('pseudo_shared_mse', 0.0))
-                self.last_train_metrics['val_pseudo_shared_cosine'] = float(heldout_metrics.get('pseudo_shared_cosine', 0.0))
-                self.last_train_metrics['val_pseudo_shared_cosine_gap'] = float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0))
-        finally:
-            self._restore_model_state(current_state)
-            if was_training:
-                self.model.train()
-
-    def _compute_imputation_metrics(self, splits=('train', 'test')):
-        if self.env.args.disable_imputation:
-            return {}
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            metrics = {
-                split: self.model.compute_imputation_representation_metrics(
-                    split=split,
-                    include_random_baseline=True,
-                )
-                for split in splits
-            }
-        finally:
-            if was_training:
-                self.model.train()
-        return metrics
-
-    def _compute_stage1_heldout_metrics(self, split='val'):
-        if self.env.args.disable_imputation:
-            return {}
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            metrics = self.model.compute_stage1_heldout_metrics(
-                split=split,
-                include_random_baseline=True,
-            )
-        finally:
-            if was_training:
-                self.model.train()
-        return metrics
-
-    def _log_imputation_metrics(self, metrics):
-        if not metrics:
-            return
-
-        for split, split_metrics in metrics.items():
-            overall = split_metrics.get('_overall', {})
-            if not overall:
-                continue
-            if self.env.args.tensorboard:
-                self.env.w.add_scalar(f'Imputation/{split}_mse', overall.get('mse', 0.0), self.total_epoch)
-                self.env.w.add_scalar(f'Imputation/{split}_cosine', overall.get('cosine', 0.0), self.total_epoch)
-                if 'random_mse' in overall:
-                    self.env.w.add_scalar(f'Imputation/{split}_random_mse', overall.get('random_mse', 0.0), self.total_epoch)
-                    self.env.w.add_scalar(f'Imputation/{split}_random_cosine', overall.get('random_cosine', 0.0), self.total_epoch)
-
-    def _log_stage1_heldout_metrics(self, metrics):
-        if not metrics or not self.env.args.tensorboard:
-            return
-
-        split = metrics.get('split', 'val')
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_mse',
-            metrics.get('pseudo_shared_mse', 0.0),
-            self.total_epoch,
-        )
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_cosine',
-            metrics.get('pseudo_shared_cosine', 0.0),
-            self.total_epoch,
-        )
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_cosine_gap',
-            metrics.get('pseudo_shared_cosine_gap', 0.0),
-            self.total_epoch,
-        )
-
-    def _stage1_default_selection_tuple(self, heldout_metrics):
-        return (
-            float(heldout_metrics.get('pseudo_shared_cosine_gap', float('-inf'))),
-            float(heldout_metrics.get('pseudo_shared_cosine', float('-inf'))),
-            -float(heldout_metrics.get('pseudo_shared_mse', float('inf'))),
-        )
-
-    def _is_better_stage1_selection(self, selection_data):
-        current_tuple = self._stage1_default_selection_tuple(selection_data)
-        if self.best_stage1_selection is None:
-            return True
-        return current_tuple > self._stage1_default_selection_tuple(self.best_stage1_selection)
-
-    def _update_best_stage1_selection(self, selection_data):
-        self.best_stage1_selection = dict(selection_data)
-
-    def _format_stage1_selection_message(self, selection_data):
-        return (
-            'best pseudo-shared held-out metrics: '
-            f"val_pseudo_shared_cosine = {selection_data.get('pseudo_shared_cosine', 0.0):.6f}, "
-            f"val_pseudo_shared_cosine_gap = {selection_data.get('pseudo_shared_cosine_gap', 0.0):.6f}, "
-            f"val_pseudo_shared_mse = {selection_data.get('pseudo_shared_mse', 0.0):.6f}"
-        )
 
     def _compute_stage_promrl_loss(self, promrl_losses):
         stage = self.env.args.train_stage
@@ -607,87 +473,10 @@ class MILK_session(object):
                     self.env.w.add_scalar(f'Train/lr_group_{group_idx}', group['lr'], self.total_epoch)
 
             if self.env.args.train_stage in STAGE1_IMPUTER_STAGES:
-                if self.env.args.train_stage != 'imputer_param':
-                    metric_splits = ['train', 'val']
-                    if self.env.args.evaluation_protocol == 'legacy' or record_strict_test_probe:
-                        metric_splits.append('test')
-                    metric_splits = tuple(dict.fromkeys(metric_splits))
-                    imputation_metrics = self._compute_imputation_metrics(splits=metric_splits)
-                    self._log_imputation_metrics(imputation_metrics)
-                    for split_name, split_metrics in imputation_metrics.items():
-                        overall = split_metrics.get('_overall', {})
-                        if overall:
-                            print(
-                                f"IMPUTE:{split_name} mse = {overall.get('mse', 0.0):.6f}, "
-                                f"cosine = {overall.get('cosine', 0.0):.6f}, "
-                                f"random_mse = {overall.get('random_mse', 0.0):.6f}, "
-                                f"random_cosine = {overall.get('random_cosine', 0.0):.6f}"
-                            )
-                    heldout_metrics = {}
-                    if 'val' in imputation_metrics:
-                        heldout_metrics = self._compute_stage1_heldout_metrics(split='imputation_val')
-                        self._log_stage1_heldout_metrics(heldout_metrics)
-                        print(
-                            'STAGE1_HELDOUT:val '
-                            f"pseudo_shared_mse = {heldout_metrics.get('pseudo_shared_mse', 0.0):.6f}, "
-                            f"pseudo_shared_cosine = {heldout_metrics.get('pseudo_shared_cosine', 0.0):.6f}, "
-                            f"pseudo_shared_cosine_gap = {heldout_metrics.get('pseudo_shared_cosine_gap', 0.0):.6f}"
-                        )
-
-                    selection_data = {
-                        'pseudo_shared_cosine': float(heldout_metrics.get('pseudo_shared_cosine', 0.0)),
-                        'pseudo_shared_cosine_gap': float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0)),
-                        'pseudo_shared_mse': float(heldout_metrics.get('pseudo_shared_mse', 0.0)),
-                    }
-                    self.last_train_metrics['val_pseudo_shared_mse'] = selection_data['pseudo_shared_mse']
-                    self.last_train_metrics['val_pseudo_shared_cosine'] = selection_data['pseudo_shared_cosine']
-                    self.last_train_metrics['val_pseudo_shared_cosine_gap'] = selection_data['pseudo_shared_cosine_gap']
-
-                    self.last_train_metrics['imputation_train_mse'] = float(imputation_metrics['train']['_overall']['mse'])
-                    self.last_train_metrics['imputation_train_cosine'] = float(imputation_metrics['train']['_overall']['cosine'])
-                    if 'val' in imputation_metrics:
-                        self.last_train_metrics['imputation_val_mse'] = float(imputation_metrics['val']['_overall']['mse'])
-                        self.last_train_metrics['imputation_val_cosine'] = float(imputation_metrics['val']['_overall']['cosine'])
-                    if 'test' in imputation_metrics:
-                        self.last_train_metrics['imputation_test_mse'] = float(imputation_metrics['test']['_overall']['mse'])
-                        self.last_train_metrics['imputation_test_cosine'] = float(imputation_metrics['test']['_overall']['cosine'])
-
-                    save_all_epochs = bool(getattr(self.env.args, 'save_all_epochs', 0))
-                    if save_all_epochs and self.env.args.save:
-                        self.save_model(epoch, keep_previous=True)
-
-                    if selection_data is None:
-                        continue
-
-                    if self._is_better_stage1_selection(selection_data):
-                        self._update_best_stage1_selection(selection_data)
-                        self.best_epoch = epoch
-                        if self.env.args.evaluation_protocol == 'strict':
-                            self._snapshot_best_model_state()
-                        if self.env.args.save and not save_all_epochs:
-                            self.save_model(epoch)
-                            print(f"save ckpt ({self._format_stage1_selection_message(selection_data)})")
-                        elif self.env.args.save:
-                            print(f"save ckpt ({self._format_stage1_selection_message(selection_data)})")
-                    else:
-                        print("skip ckpt (not better under stage1_default)")
-                else:
-                    current_loss = float(loss)
-                    save_all_epochs = bool(getattr(self.env.args, 'save_all_epochs', 0))
-                    if save_all_epochs and self.env.args.save:
-                        self.save_model(epoch, keep_previous=True)
-                    if current_loss < self.best_loss:
-                        self.best_loss = current_loss
-                        self.best_epoch = epoch
-                        if self.env.args.evaluation_protocol == 'strict':
-                            self._snapshot_best_model_state()
-                        if self.env.args.save and not save_all_epochs:
-                            self.save_model(epoch)
-                            print('save ckpt')
-                        elif self.env.args.save:
-                            print('save ckpt')
-                    else:
-                        print('skip ckpt (not best)')
+                if epoch == epochs - 1 and self.env.args.save:
+                    self.best_epoch = epoch
+                    self.save_model(epoch)
+                    print('save final Stage 1 checkpoint')
                 continue
 
             if epoch % self.env.args.eva_interval == 0:
@@ -784,11 +573,12 @@ class MILK_session(object):
             if self.early_stop > self.env.args.early_stop // 1:
                 break
 
-        if finalize and self.env.args.evaluation_protocol == 'strict':
-            if self.env.args.train_stage in STAGE1_IMPUTER_STAGES:
-                self._finalize_strict_imputation_metrics()
-            else:
-                self._finalize_strict_test_metrics()
+        if (
+            finalize
+            and self.env.args.evaluation_protocol == 'strict'
+            and self.env.args.train_stage not in STAGE1_IMPUTER_STAGES
+        ):
+            self._finalize_strict_test_metrics()
 
     def test(self, mode='val', top_list=[50]):
         self.model.eval()
@@ -874,12 +664,10 @@ class MILK_session(object):
     def save_ckpt(self, path):
         torch.save(self.model.state_dict(), path)
 
-    def save_model(self, current_epoch, keep_previous=False):
+    def save_model(self, current_epoch):
         prefix = f'{self.env.args.suffix}_{self.env.args.train_stage}_{self.env.args.penalty_coeff}_epoch'
         model_state_file = os.path.join(self.env.CKPT_PATH, f'{prefix}{current_epoch}.pth')
         self.save_ckpt(model_state_file)
-        if keep_previous:
-            return
         for file_name in os.listdir(self.env.CKPT_PATH):
             if not file_name.startswith(prefix):
                 continue

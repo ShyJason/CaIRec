@@ -230,14 +230,12 @@ def _build_parser():
         help='Fraction of eligible observed modalities to pseudo-mask for decoupled adapter alignment.',
     )
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
-    parser.add_argument('--imputation_val_rate', type=float, default=0.0)
     # ----------------------- logger
     parser.add_argument('--log', type=int, default=0)
     parser.add_argument('--tensorboard', type=int, default=1)
     parser.add_argument('--hf_tensorboard_repo', type=str, default='')
     parser.add_argument('--hf_commit_every', type=int, default=5)
     parser.add_argument('--save', type=int, default=1)
-    parser.add_argument('--save_all_epochs', type=int, default=0)
     return parser
 
 
@@ -362,18 +360,6 @@ if my_env.args.train_stage in (
             f"promrl_inter = {final_metrics['promrl_inter']:.5f}, "
             f"promrl_itm = {final_metrics['promrl_itm']:.5f}"
         )
-        if 'imputation_train_mse' in final_metrics:
-            summary += (
-                f", imputation_train_mse = {final_metrics['imputation_train_mse']:.6f}, "
-                f"imputation_train_cosine = {final_metrics['imputation_train_cosine']:.6f}, "
-                f"imputation_test_mse = {final_metrics.get('imputation_test_mse', 0.0):.6f}, "
-                f"imputation_test_cosine = {final_metrics.get('imputation_test_cosine', 0.0):.6f}"
-            )
-        if 'imputation_val_mse' in final_metrics:
-            summary += (
-                f", imputation_val_mse = {final_metrics['imputation_val_mse']:.6f}, "
-                f"imputation_val_cosine = {final_metrics['imputation_val_cosine']:.6f}"
-            )
         tool.cprint(summary)
         if my_env.args.log:
             my_env.test_logger.info(summary)

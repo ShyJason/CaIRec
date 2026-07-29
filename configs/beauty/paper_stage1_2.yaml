@@ -25,8 +25,6 @@ itm_temp: 0.07
 itm_num_heads: 4
 ema_eta: 0.01
 
-imputation_val_rate: 0.1
-save_all_epochs: 1
 
 alpha_intra: 1.0
 alpha_inter: 1.0
