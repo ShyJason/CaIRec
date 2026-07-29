@@ -26,7 +26,6 @@ class PaperConfigTest(unittest.TestCase):
                 self.assertEqual(stage2["train_stage"], "recommender")
                 for config in (stage1_1, stage1_2, stage2):
                     self.assertEqual(config["missing_rate"], 0.5)
-                    self.assertEqual(config["feature_bridge_mode"], "decoupled_latent")
 
     def test_bundled_missing_payloads_match_the_paper_protocol(self):
         expected = {

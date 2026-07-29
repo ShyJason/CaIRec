@@ -36,7 +36,6 @@ EXP_MODE="${EXP_MODE:-mm}"
 DEVICE_ID="${DEVICE_ID:-4}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 SEED="${SEED:-2023}"
-FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE:-decoupled_latent}"
 
 DEFAULT_MISSING_RATE="0.5"
 DEFAULT_STAGE12_EPOCHS="50"
@@ -72,9 +71,9 @@ STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
 TENSORBOARD="${TENSORBOARD:-0}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
 PROJECTION_CKPT="${PROJECTION_CKPT:-${ROOT_DIR}/ckpt/${DATASET}.pth}"
-STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_1_param}"
-STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_2_completion}"
-STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage2_recommender}"
+STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage1_1_param}"
+STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage1_2_completion}"
+STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage2_recommender}"
 
 DEFAULT_STAGE11_CONFIG="configs/${DATASET}/paper_stage1_1.yaml"
 DEFAULT_STAGE12_CONFIG="configs/${DATASET}/paper_stage1_2.yaml"
@@ -83,7 +82,7 @@ STAGE12_CONFIG="${STAGE12_CONFIG:-${DEFAULT_STAGE12_CONFIG}}"
 DEFAULT_STAGE2_CONFIG="configs/${DATASET}/paper_stage2.yaml"
 STAGE2_CONFIG="${STAGE2_CONFIG:-${DEFAULT_STAGE2_CONFIG}}"
 
-echo "[mainline] dataset=${DATASET} exp_mode=${EXP_MODE} bridge=${FEATURE_BRIDGE_MODE} missing_rate=${MISSING_RATE}"
+echo "[mainline] dataset=${DATASET} exp_mode=${EXP_MODE} missing_rate=${MISSING_RATE}"
 
 for config in "${STAGE11_CONFIG}" "${STAGE12_CONFIG}" "${STAGE2_CONFIG}"; do
   if [[ ! -f "${config}" ]]; then
@@ -140,7 +139,6 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=imputer_param \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
@@ -150,14 +148,12 @@ env \
   PROJECTION_CKPT="${PROJECTION_CKPT}" \
   IMPUTER_CKPT= \
   ALPHA_REC="${STAGE11_ALPHA_REC:-1.0}" \
-  ALPHA_DECODE=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
   SUFFIX="${STAGE11_SUFFIX}" \
   ./run_demo_itm.sh \
     --freeze_recommender 1 \
     --freeze_imputer -1 \
-    --freeze_decoder 1 \
     "$@"
 
 STAGE11_FINAL_EPOCH=$((STAGE11_EPOCHS - 1))
@@ -175,7 +171,6 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=imputer_backprop \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
@@ -189,7 +184,6 @@ env \
   ALPHA_INTRA="${STAGE12_ALPHA_INTRA:-1.0}" \
   ALPHA_INTER="${STAGE12_ALPHA_INTER:-1.0}" \
   ALPHA_ITM="${STAGE12_ALPHA_ITM:-1.0}" \
-  ALPHA_DECODE=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
   SUFFIX="${STAGE12_SUFFIX}" \
@@ -197,7 +191,6 @@ env \
     --imputer_ckpt "${STAGE11_CKPT}" \
     --freeze_recommender 1 \
     --freeze_imputer -1 \
-    --freeze_decoder 1 \
     "$@"
 
 STAGE12_FINAL_EPOCH=$((STAGE12_EPOCHS - 1))
@@ -219,7 +212,6 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=recommender \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
@@ -232,14 +224,11 @@ env \
   GAMMA_ALIGN="${STAGE2_GAMMA_ALIGN}" \
   ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO}" \
   IMPUTER_CKPT="${STAGE12_CKPT}" \
-  ALPHA_DECODE=0.0 \
-  ALPHA_DECODE_KL=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE="${SAVE:-1}" \
   SUFFIX="${STAGE2_SUFFIX}" \
   ./run_demo_itm.sh \
     --imputer_ckpt "${STAGE12_CKPT}" \
     --freeze_imputer 1 \
-    --freeze_decoder 1 \
     --freeze_recommender -1 \
     "$@"

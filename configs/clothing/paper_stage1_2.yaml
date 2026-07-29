@@ -2,7 +2,6 @@ dataset: clothing
 exp_mode: mm
 train_stage: imputer_backprop
 generative_update_mode: fixed
-feature_bridge_mode: decoupled_latent
 selection_mode: val
 
 device_id: 0
@@ -14,10 +13,7 @@ eva_interval: 1
 batch_size: 256
 lr: 0.0005
 lr_imp: 0.0005
-lr_decoder: 0.0002
-freeze_decoder: 1
 
-contra_dim: 64
 d_beta: 32
 tau1: 0.1
 tau2: 0.1
@@ -31,7 +27,6 @@ alpha_intra: 1.0
 alpha_inter: 1.0
 alpha_itm: 1.0
 alpha_rec: 1.0
-alpha_decode: 0.0
 missing_rate: 0.5
 tensorboard: 0
 hf_tensorboard_repo: ""

@@ -96,7 +96,6 @@ def _build_parser():
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--lr_rec', type=float, default=None)
     parser.add_argument('--lr_imp', type=float, default=None)
-    parser.add_argument('--lr_decoder', type=float, default=None)
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--eva_interval', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=2048)
@@ -142,14 +141,12 @@ def _build_parser():
     )
     parser.add_argument('--freeze_imputer', type=int, default=-1)
     parser.add_argument('--freeze_recommender', type=int, default=-1)
-    parser.add_argument('--freeze_decoder', type=int, default=0)
 
     # ----------------------- Regularizer coefficient
     parser.add_argument('--reg_coeff', type=float, default=1e-4)
     parser.add_argument('--penalty_coeff', type=float, default=50) # b 1000  c 50
     parser.add_argument('--missing_rate', type=float, default=0.3)
 
-    parser.add_argument('--contra_dim', type=int, default=256)
     parser.add_argument('--d_beta', type=int, default=128)
     parser.add_argument('--tau1', type=float, default=0.1)
     parser.add_argument('--tau2', type=float, default=0.1)
@@ -158,12 +155,6 @@ def _build_parser():
     parser.add_argument('--itm_num_heads', type=int, default=4)
     parser.add_argument('--ema_eta', type=float, default=0.01)
     parser.add_argument('--disable_imputation', type=int, default=0)
-    parser.add_argument(
-        '--feature_bridge_mode',
-        type=str,
-        default='raw_decoder',
-        choices=['raw_decoder', 'latent_direct', 'decoupled_latent'],
-    )
     parser.add_argument('--item_graph_topk', type=int, default=20)
     parser.add_argument(
         '--item_graph_missing_scope',
@@ -209,7 +200,6 @@ def _build_parser():
     parser.add_argument('--alpha_inter', type=float, default=1.0)
     parser.add_argument('--alpha_itm', type=float, default=1.0)
     parser.add_argument('--alpha_rec', type=float, default=0.1)
-    parser.add_argument('--alpha_decode', type=float, default=0.0)
     parser.add_argument(
         '--generative_update_mode',
         type=str,
@@ -354,8 +344,6 @@ if my_env.args.train_stage in (
             f"final stage1 metrics: epoch = {final_metrics['epoch']}, "
             f"loss_s1 = {final_metrics['loss_s1']:.5f}, "
             f"promrl_rec = {final_metrics['promrl_rec']:.5f}, "
-            f"promrl_decode = {final_metrics['promrl_decode']:.5f}, "
-            f"promrl_decode_kl = {final_metrics.get('promrl_decode_kl', 0.0):.5f}, "
             f"promrl_intra = {final_metrics['promrl_intra']:.5f}, "
             f"promrl_inter = {final_metrics['promrl_inter']:.5f}, "
             f"promrl_itm = {final_metrics['promrl_itm']:.5f}"

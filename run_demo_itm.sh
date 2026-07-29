@@ -40,8 +40,6 @@ PROJECTION_CKPT="${PROJECTION_CKPT:-}"
 IMPUTER_CKPT="${IMPUTER_CKPT:-}"
 FREEZE_IMPUTER="${FREEZE_IMPUTER:--1}"
 FREEZE_RECOMMENDER="${FREEZE_RECOMMENDER:--1}"
-FREEZE_DECODER="${FREEZE_DECODER:-0}"
-CONTRA_DIM="${CONTRA_DIM:-64}"
 D_BETA="${D_BETA:-32}"
 TAU1="${TAU1:-0.1}"
 TAU2="${TAU2:-0.1}"
@@ -50,7 +48,6 @@ ITM_TEMP="${ITM_TEMP:-0.07}"
 ITM_NUM_HEADS="${ITM_NUM_HEADS:-4}"
 EMA_ETA="${EMA_ETA:-0.01}"
 DISABLE_IMPUTATION="${DISABLE_IMPUTATION:-0}"
-FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE:-decoupled_latent}"
 GENERATIVE_UPDATE_MODE="${GENERATIVE_UPDATE_MODE:-em}"
 ALPHA_INTRA="${ALPHA_INTRA:-1.0}"
 ALPHA_INTER="${ALPHA_INTER:-1.0}"
@@ -60,7 +57,6 @@ if [[ "${DATASET}" == "clothing" && "${TRAIN_STAGE}" == "imputer_backprop" ]]; t
 else
   ALPHA_REC="${ALPHA_REC:-0.1}"
 fi
-ALPHA_DECODE="${ALPHA_DECODE:-0.0}"
 GAMMA_ALIGN="${GAMMA_ALIGN:-0.0}"
 ADAPTER_ALIGN_PSEUDO_RATIO="${ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
 RECOMMENDER_ALLOW_MODAL_GRAD="${RECOMMENDER_ALLOW_MODAL_GRAD:-0}"
@@ -70,7 +66,7 @@ ALPHA_MISSING_SHARED="${ALPHA_MISSING_SHARED:-}"
 ALPHA_MISSING_DECODE="${ALPHA_MISSING_DECODE:-}"
 BETA_MISSING_SHARED="${BETA_MISSING_SHARED:-0.0}"
 BETA_MISSING_DECODE="${BETA_MISSING_DECODE:-0.0}"
-MISSING_RATE="${MISSING_RATE:-0.3}"
+MISSING_RATE="${MISSING_RATE:-0.5}"
 ORACLE_MISSING_SUPERVISION="${ORACLE_MISSING_SUPERVISION:-0}"
 SAVE="${SAVE:-0}"
 SUFFIX="${SUFFIX:-demo_${DATASET}_${EXP_MODE}_${TRAIN_STAGE}}"
@@ -93,7 +89,7 @@ fi
 echo "[demo] root=${ROOT_DIR}"
 echo "[demo] dataset=${DATASET} exp_mode=${EXP_MODE} device_id=${DEVICE_ID}"
 echo "[demo] seed=${SEED}"
-echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} disable_imputation=${DISABLE_IMPUTATION} bridge=${FEATURE_BRIDGE_MODE} missing_rate=${MISSING_RATE} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
+echo "[demo] stage=${TRAIN_STAGE} epochs=${EPOCHS} batch_size=${BATCH_SIZE} lambda_itm=${LAMBDA_ITM} disable_imputation=${DISABLE_IMPUTATION} missing_rate=${MISSING_RATE} selection=${SELECTION_MODE} eval_protocol=${EVALUATION_PROTOCOL} strict_probe_test_interval=${STRICT_PROBE_TEST_INTERVAL}"
 echo "[demo] log_file=${LOG_FILE}"
 echo "[demo] tensorboard=${TENSORBOARD} hf_tensorboard_repo=${HF_TENSORBOARD_REPO:-<none>}"
 echo "[demo] config=${CONFIG:-<none>}"
@@ -112,8 +108,6 @@ cmd=(
   --train_stage "${TRAIN_STAGE}"
   --freeze_imputer "${FREEZE_IMPUTER}"
   --freeze_recommender "${FREEZE_RECOMMENDER}"
-  --freeze_decoder "${FREEZE_DECODER}"
-  --contra_dim "${CONTRA_DIM}"
   --d_beta "${D_BETA}"
   --tau1 "${TAU1}"
   --tau2 "${TAU2}"
@@ -122,13 +116,11 @@ cmd=(
   --itm_num_heads "${ITM_NUM_HEADS}"
   --ema_eta "${EMA_ETA}"
   --disable_imputation "${DISABLE_IMPUTATION}"
-  --feature_bridge_mode "${FEATURE_BRIDGE_MODE}"
   --generative_update_mode "${GENERATIVE_UPDATE_MODE}"
   --alpha_intra "${ALPHA_INTRA}"
   --alpha_inter "${ALPHA_INTER}"
   --alpha_itm "${ALPHA_ITM}"
   --alpha_rec "${ALPHA_REC}"
-  --alpha_decode "${ALPHA_DECODE}"
   --gamma_align "${GAMMA_ALIGN}"
   --adapter_align_pseudo_ratio "${ADAPTER_ALIGN_PSEUDO_RATIO}"
   --recommender_allow_modal_grad "${RECOMMENDER_ALLOW_MODAL_GRAD}"
@@ -151,10 +143,6 @@ fi
 
 if [[ -n "${LR_IMP}" ]]; then
   cmd+=(--lr_imp "${LR_IMP}")
-fi
-
-if [[ -n "${LR_DECODER}" ]]; then
-  cmd+=(--lr_decoder "${LR_DECODER}")
 fi
 
 if [[ -n "${CKPT}" ]]; then

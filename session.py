@@ -28,7 +28,6 @@ class MILK_session(object):
             self.env.args.train_stage,
             freeze_imputer=self.env.args.freeze_imputer,
             freeze_recommender=self.env.args.freeze_recommender,
-            freeze_decoder=self.env.args.freeze_decoder,
         )
         self.representation_optimizer = self._build_representation_optimizer()
 
@@ -68,25 +67,15 @@ class MILK_session(object):
         else:
             lr_imp = lr_rec
 
-        if self.env.args.lr_decoder is not None:
-            lr_decoder = self.env.args.lr_decoder
-        elif self.env.args.train_stage == 'recommender':
-            lr_decoder = 0.1 * lr_rec
-        else:
-            lr_decoder = lr_imp
-        return lr_rec, lr_imp, lr_decoder
+        return lr_rec, lr_imp
 
     def _build_representation_optimizer(self):
-        lr_rec, lr_imp, lr_decoder = self._resolve_stage_learning_rates()
+        lr_rec, lr_imp = self._resolve_stage_learning_rates()
         param_groups = []
 
         imputer_params = self.model.get_imputer_parameters()
         if imputer_params:
             param_groups.append({'params': imputer_params, 'lr': lr_imp})
-
-        decoder_params = self.model.get_decoder_parameters()
-        if decoder_params:
-            param_groups.append({'params': decoder_params, 'lr': lr_decoder})
 
         recommender_params = self.model.get_recommender_parameters()
         if recommender_params:
@@ -97,17 +86,14 @@ class MILK_session(object):
 
         return torch.optim.Adam(param_groups, lr=lr_rec)
 
-    def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=None):
+    def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1):
         self.env.args.train_stage = train_stage
         self.env.args.freeze_imputer = freeze_imputer
         self.env.args.freeze_recommender = freeze_recommender
-        if freeze_decoder is not None:
-            self.env.args.freeze_decoder = freeze_decoder
         self.model.configure_training_stage(
             self.env.args.train_stage,
             freeze_imputer=self.env.args.freeze_imputer,
             freeze_recommender=self.env.args.freeze_recommender,
-            freeze_decoder=self.env.args.freeze_decoder,
         )
         self.representation_optimizer = self._build_representation_optimizer()
         self.stage_name = self.env.args.train_stage
@@ -184,29 +170,24 @@ class MILK_session(object):
         stage = self.env.args.train_stage
         zero = self._zero_scalar()
         if promrl_losses is None:
-            return zero, zero, zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero
 
         promrl_intra_loss = promrl_losses['loss_intra']
         promrl_inter_loss = promrl_losses['loss_inter']
         promrl_itm_loss = promrl_losses['loss_itm']
         promrl_rec_loss = promrl_losses['rec_loss']
-        promrl_decode_loss = promrl_losses.get('loss_decode', zero)
-        promrl_decode_kl_loss = promrl_losses.get('loss_decode_kl', zero)
 
         if stage == 'imputer_param':
             stage_promrl_loss = self.env.args.alpha_rec * promrl_rec_loss
             promrl_intra_loss = zero
             promrl_inter_loss = zero
             promrl_itm_loss = zero
-            promrl_decode_loss = zero
-            promrl_decode_kl_loss = zero
         elif stage == 'imputer_backprop':
             stage_promrl_loss = (
                 self.env.args.alpha_intra * promrl_intra_loss
                 + self.env.args.alpha_inter * promrl_inter_loss
                 + self.env.args.alpha_itm * promrl_itm_loss
                 + self.env.args.alpha_rec * promrl_rec_loss
-                + self.env.args.alpha_decode * promrl_decode_loss
             )
         else:
             stage_promrl_loss = zero
@@ -214,8 +195,6 @@ class MILK_session(object):
             promrl_inter_loss = zero
             promrl_itm_loss = zero
             promrl_rec_loss = zero
-            promrl_decode_loss = zero
-            promrl_decode_kl_loss = zero
 
         return (
             stage_promrl_loss,
@@ -223,8 +202,6 @@ class MILK_session(object):
             promrl_inter_loss,
             promrl_itm_loss,
             promrl_rec_loss,
-            promrl_decode_loss,
-            promrl_decode_kl_loss,
         )
 
     def _should_compute_promrl_losses(self, effective_stage):
@@ -239,7 +216,6 @@ class MILK_session(object):
             self.env.args.alpha_inter,
             self.env.args.alpha_itm,
             self.env.args.alpha_rec,
-            self.env.args.alpha_decode,
         )
 
         return any(float(weight) != 0.0 for weight in weights)
@@ -275,8 +251,6 @@ class MILK_session(object):
         all_modality_bpr_loss, all_grad_loss, all_penalty_loss = 0., 0., 0.
         all_promrl_intra_loss, all_promrl_inter_loss = 0., 0.
         all_promrl_itm_loss, all_promrl_rec_loss = 0., 0.
-        all_promrl_decode_loss = 0.
-        all_promrl_decode_kl_loss = 0.
         all_align_loss = 0.
         self.model.set_missing_modality_via_env()
         if imputer_only_stage:
@@ -312,8 +286,6 @@ class MILK_session(object):
                 promrl_inter_loss,
                 promrl_itm_loss,
                 promrl_rec_loss,
-                promrl_decode_loss,
-                promrl_decode_kl_loss,
             ) = \
                 self._compute_stage_promrl_loss(promrl_losses)
 
@@ -386,8 +358,6 @@ class MILK_session(object):
             all_promrl_inter_loss += promrl_inter_loss
             all_promrl_itm_loss += promrl_itm_loss
             all_promrl_rec_loss += promrl_rec_loss
-            all_promrl_decode_loss += promrl_decode_loss
-            all_promrl_decode_kl_loss += promrl_decode_kl_loss
             all_align_loss += align_loss
         return (
             all_loss / total_batch,
@@ -400,8 +370,6 @@ class MILK_session(object):
             all_promrl_inter_loss / total_batch,
             all_promrl_itm_loss / total_batch,
             all_promrl_rec_loss / total_batch,
-            all_promrl_decode_loss / total_batch,
-            all_promrl_decode_kl_loss / total_batch,
             all_align_loss / total_batch,
             time.time() - t,
         )
@@ -430,15 +398,13 @@ class MILK_session(object):
                 promrl_inter_loss,
                 promrl_itm_loss,
                 promrl_rec_loss,
-                promrl_decode_loss,
-                promrl_decode_kl_loss,
                 align_loss,
                 train_time,
             ) = self.train_epoch()
             # self.model.show_scores()
             print('-' * 30)
             print(
-                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
+                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
             self.last_train_metrics = {
                 'epoch': epoch,
                 'loss_s1': float(loss),
@@ -451,8 +417,6 @@ class MILK_session(object):
                 'promrl_inter': float(promrl_inter_loss),
                 'promrl_itm': float(promrl_itm_loss),
                 'promrl_rec': float(promrl_rec_loss),
-                'promrl_decode': float(promrl_decode_loss),
-                'promrl_decode_kl': float(promrl_decode_kl_loss),
                 'align_loss': float(align_loss),
                 'train_time': float(train_time),
             }
@@ -466,8 +430,6 @@ class MILK_session(object):
                 self.env.w.add_scalar('Train/promrl_inter', float(promrl_inter_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_itm', float(promrl_itm_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_rec', float(promrl_rec_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/promrl_decode', float(promrl_decode_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/promrl_decode_kl', float(promrl_decode_kl_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/align_loss', float(align_loss), self.total_epoch)
                 for group_idx, group in enumerate(self.representation_optimizer.param_groups if self.representation_optimizer is not None else []):
                     self.env.w.add_scalar(f'Train/lr_group_{group_idx}', group['lr'], self.total_epoch)

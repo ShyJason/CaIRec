@@ -1,7 +1,6 @@
 dataset: beauty
 exp_mode: mm
 train_stage: recommender
-feature_bridge_mode: decoupled_latent
 selection_mode: val
 recommendation_selection_metric: recall
 recommendation_selection_topk: 20
@@ -41,7 +40,6 @@ item_graph_modal_layers: 1
 reg_coeff: 0.01
 penalty_coeff: 1.0
 modality_bpr_coeff: 1.0
-contra_dim: 64
 d_beta: 32
 tau1: 0.1
 tau2: 0.1

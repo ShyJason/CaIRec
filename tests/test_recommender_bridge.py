@@ -13,8 +13,6 @@ class RecommenderBridgeTest(unittest.TestCase):
         model.modalities = ["v", "t"]
         model.m_item = 2
         model.env = types.SimpleNamespace(device="cpu")
-        model.use_latent_direct_bridge = False
-        model.use_decoupled_latent_bridge = True
         model.disable_imputation = False
 
         raw = {
