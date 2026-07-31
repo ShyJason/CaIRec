@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -24,31 +25,38 @@ class PaperConfigTest(unittest.TestCase):
                 self.assertEqual(stage1_2["train_stage"], "imputer_backprop")
                 self.assertEqual(stage2["train_stage"], "recommender")
                 for config in (stage1_1, stage1_2, stage2):
-                    self.assertEqual(config["missing_mask_protocol"], "unified_static")
                     self.assertEqual(config["missing_rate"], 0.5)
-                    self.assertEqual(config["eval_missing_rate"], 0.5)
-                    self.assertEqual(config["unified_payload_seed"], 2023)
-                    self.assertEqual(config["feature_bridge_mode"], "decoupled_latent")
+
+    def test_bundled_missing_payloads_match_the_paper_protocol(self):
+        expected = {
+            "clothing": "34e09412a337e19906b16bb7bdb9e097d824e1e85a1b1908e501e5a29bc1873c",
+            "beauty": "408e3c8bfffd8322412e63b77cc87b07ae4ce1f02329f0500d61c2aee95e0cf4",
+            "sports": "421816fbeaa65cb6323f9f42e209a52f5688401525ba75bb6c902789580aaabe",
+        }
+        for dataset, expected_hash in expected.items():
+            with self.subTest(dataset=dataset):
+                path = (
+                    ROOT
+                    / "configs"
+                    / dataset
+                    / "unified_missing_items_mr0.5_seed2023.npy"
+                )
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected_hash)
 
     def test_stage2_matches_canonical_dataset_specific_settings(self):
         expected = {
-            "clothing": (0, 50),
-            "beauty": (2023, 20),
-            "sports": (0, 30),
+            "clothing": 50,
+            "beauty": 20,
+            "sports": 30,
         }
-        for dataset, values in expected.items():
+        for dataset, patience in expected.items():
             with self.subTest(dataset=dataset):
                 config = self._load(dataset, "stage2")
-                dataset_seed, patience = values
-                self.assertEqual(config["dataset_seed"], dataset_seed)
                 self.assertEqual(config["early_stop"], patience)
                 self.assertNotIn("rec_neighbor_cl_weight", config)
                 self.assertNotIn("rec_neighbor_cl_temp", config)
                 self.assertNotIn("rec_neighbor_cl_bank_size", config)
-                self.assertEqual(config["fusion_mode"], "mean")
-                self.assertNotIn("posterior_reliability_scope", config)
-                self.assertNotIn("posterior_reliability_scale", config)
-                self.assertNotIn("posterior_reliability_floor", config)
                 self.assertEqual(config["item_graph_kind"], "modality_completed")
                 self.assertEqual(config["item_graph_topk"], 10)
                 self.assertEqual(config["item_graph_cf_weight"], 0.4)

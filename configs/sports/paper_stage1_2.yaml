@@ -2,25 +2,18 @@ dataset: sports
 exp_mode: mm
 train_stage: imputer_backprop
 generative_update_mode: fixed
-feature_bridge_mode: decoupled_latent
 selection_mode: val
 
 device_id: 0
 use_gpu: 1
 seed: 2023
-dataset_seed: 0
-missing_mask_protocol: unified_static
-unified_payload_seed: 2023
 missing_rate: 0.5
-eval_missing_rate: 0.5
 
 epoch: 50
 eva_interval: 1
 batch_size: 256
 lr: 0.0005
 lr_imp: 0.0005
-freeze_decoder: 1
-contra_dim: 64
 d_beta: 32
 tau1: 0.1
 tau2: 0.1
@@ -29,14 +22,10 @@ itm_temp: 0.07
 itm_num_heads: 4
 ema_eta: 0.01
 
-imputation_val_rate: 0.1
-imputation_selection_policy: stage1_default
-save_all_epochs: 1
 alpha_intra: 1.0
 alpha_inter: 1.0
 alpha_itm: 1.0
 alpha_rec: 1.0
-alpha_decode: 0.0
 
 tensorboard: 0
 hf_tensorboard_repo: ""

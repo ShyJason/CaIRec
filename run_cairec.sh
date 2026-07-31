@@ -36,13 +36,6 @@ EXP_MODE="${EXP_MODE:-mm}"
 DEVICE_ID="${DEVICE_ID:-4}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 SEED="${SEED:-2023}"
-if [[ "${DATASET}" == "beauty" ]]; then
-  DEFAULT_DATASET_SEED="2023"
-else
-  DEFAULT_DATASET_SEED="0"
-fi
-DATASET_SEED="${DATASET_SEED:-${DEFAULT_DATASET_SEED}}"
-FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE:-decoupled_latent}"
 
 DEFAULT_MISSING_RATE="0.5"
 DEFAULT_STAGE12_EPOCHS="50"
@@ -52,9 +45,6 @@ DEFAULT_STAGE2_LR="0.005"
 DEFAULT_STAGE2_LR_REC="0.005"
 DEFAULT_STAGE2_GAMMA_ALIGN="0.00125"
 MISSING_RATE="${MISSING_RATE:-${DEFAULT_MISSING_RATE}}"
-TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY:-random}"
-EVAL_MISSING_RATE="${EVAL_MISSING_RATE:-${DEFAULT_MISSING_RATE}}"
-MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL:-unified_static}"
 
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 STAGE11_EPOCHS="${STAGE11_EPOCHS:-5}"
@@ -73,8 +63,6 @@ fi
 STAGE12_LR="${STAGE12_LR:-${DEFAULT_STAGE12_LR}}"
 STAGE12_LR_IMP="${STAGE12_LR_IMP:-${DEFAULT_STAGE12_LR}}"
 STAGE12_GENERATIVE_UPDATE_MODE="${STAGE12_GENERATIVE_UPDATE_MODE:-fixed}"
-STAGE11_IMPUTATION_VAL_RATE="${STAGE11_IMPUTATION_VAL_RATE:-0.0}"
-STAGE12_IMPUTATION_VAL_RATE="${STAGE12_IMPUTATION_VAL_RATE:-0.1}"
 STAGE2_LR="${STAGE2_LR:-${DEFAULT_STAGE2_LR}}"
 STAGE2_LR_REC="${STAGE2_LR_REC:-${DEFAULT_STAGE2_LR_REC}}"
 STAGE2_LR_IMP="${STAGE2_LR_IMP:-0.0002}"
@@ -83,9 +71,9 @@ STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO:-1.0}"
 TENSORBOARD="${TENSORBOARD:-0}"
 RUN_STAGE2="${RUN_STAGE2:-1}"
 PROJECTION_CKPT="${PROJECTION_CKPT:-${ROOT_DIR}/ckpt/${DATASET}.pth}"
-STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_1_param}"
-STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage1_2_completion}"
-STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${FEATURE_BRIDGE_MODE}_${RUN_TAG}_stage2_recommender}"
+STAGE11_SUFFIX="${STAGE11_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage1_1_param}"
+STAGE12_SUFFIX="${STAGE12_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage1_2_completion}"
+STAGE2_SUFFIX="${STAGE2_SUFFIX:-three_stage_${DATASET}_${EXP_MODE}_${RUN_TAG}_stage2_recommender}"
 
 DEFAULT_STAGE11_CONFIG="configs/${DATASET}/paper_stage1_1.yaml"
 DEFAULT_STAGE12_CONFIG="configs/${DATASET}/paper_stage1_2.yaml"
@@ -94,7 +82,7 @@ STAGE12_CONFIG="${STAGE12_CONFIG:-${DEFAULT_STAGE12_CONFIG}}"
 DEFAULT_STAGE2_CONFIG="configs/${DATASET}/paper_stage2.yaml"
 STAGE2_CONFIG="${STAGE2_CONFIG:-${DEFAULT_STAGE2_CONFIG}}"
 
-echo "[mainline] dataset=${DATASET} exp_mode=${EXP_MODE} bridge=${FEATURE_BRIDGE_MODE} train_missing_modality=${TRAIN_MISSING_MODALITY} missing_rate=${MISSING_RATE} eval_missing_rate=${EVAL_MISSING_RATE}"
+echo "[mainline] dataset=${DATASET} exp_mode=${EXP_MODE} missing_rate=${MISSING_RATE}"
 
 for config in "${STAGE11_CONFIG}" "${STAGE12_CONFIG}" "${STAGE2_CONFIG}"; do
   if [[ ! -f "${config}" ]]; then
@@ -121,15 +109,23 @@ fi
 for asset in \
   "Data/${DATASET}/${DATASET}.inter" \
   "Data/${DATASET}/image_feat.npy" \
-  "Data/${DATASET}/text_feat.npy" \
-  "Data/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"; do
+  "Data/${DATASET}/text_feat.npy"; do
   if [[ ! -f "${asset}" ]]; then
     echo "[mainline] missing required asset: ${asset}" >&2
     exit 1
   fi
 done
+PAYLOAD="Data/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"
+if [[ ! -f "${PAYLOAD}" ]]; then
+  PAYLOAD="configs/${DATASET}/unified_missing_items_mr0.5_seed2023.npy"
+fi
+if [[ ! -f "${PAYLOAD}" ]]; then
+  echo "[mainline] missing fixed missing-item payload for ${DATASET}" >&2
+  exit 1
+fi
 
 echo "[mainline] pretrained projection=${PROJECTION_CKPT}"
+echo "[mainline] missing payload=${PAYLOAD}"
 echo "[mainline] configs=${STAGE11_CONFIG},${STAGE12_CONFIG},${STAGE2_CONFIG}"
 if [[ "${CHECK_ONLY}" == "1" ]]; then
   echo "[mainline] preflight passed; no training started"
@@ -143,30 +139,21 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=imputer_param \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
-  TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY}" \
-  EVAL_MISSING_RATE="${EVAL_MISSING_RATE}" \
-  MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
-  DATASET_SEED="${DATASET_SEED}" \
   EPOCHS="${STAGE11_EPOCHS}" \
   BATCH_SIZE="${STAGE11_BATCH_SIZE}" \
   LR="${STAGE11_LR}" \
-  IMPUTATION_VAL_RATE="${STAGE11_IMPUTATION_VAL_RATE}" \
   PROJECTION_CKPT="${PROJECTION_CKPT}" \
   IMPUTER_CKPT= \
   ALPHA_REC="${STAGE11_ALPHA_REC:-1.0}" \
-  ALPHA_DECODE=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
-  SAVE_ALL_EPOCHS=1 \
   SUFFIX="${STAGE11_SUFFIX}" \
   ./run_demo_itm.sh \
     --freeze_recommender 1 \
     --freeze_imputer -1 \
-    --freeze_decoder 1 \
     "$@"
 
 STAGE11_FINAL_EPOCH=$((STAGE11_EPOCHS - 1))
@@ -184,35 +171,26 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=imputer_backprop \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
-  TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY}" \
-  EVAL_MISSING_RATE="${EVAL_MISSING_RATE}" \
-  MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
-  DATASET_SEED="${DATASET_SEED}" \
   EPOCHS="${STAGE12_EPOCHS}" \
   BATCH_SIZE="${STAGE12_BATCH_SIZE}" \
   LR="${STAGE12_LR}" \
   LR_IMP="${STAGE12_LR_IMP}" \
   GENERATIVE_UPDATE_MODE="${STAGE12_GENERATIVE_UPDATE_MODE}" \
-  IMPUTATION_VAL_RATE="${STAGE12_IMPUTATION_VAL_RATE}" \
   IMPUTER_CKPT="${STAGE11_CKPT}" \
   ALPHA_REC="${STAGE12_ALPHA_REC:-1.0}" \
   ALPHA_INTRA="${STAGE12_ALPHA_INTRA:-1.0}" \
   ALPHA_INTER="${STAGE12_ALPHA_INTER:-1.0}" \
   ALPHA_ITM="${STAGE12_ALPHA_ITM:-1.0}" \
-  ALPHA_DECODE=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE=1 \
-  SAVE_ALL_EPOCHS=1 \
   SUFFIX="${STAGE12_SUFFIX}" \
   ./run_demo_itm.sh \
     --imputer_ckpt "${STAGE11_CKPT}" \
     --freeze_recommender 1 \
     --freeze_imputer -1 \
-    --freeze_decoder 1 \
     "$@"
 
 STAGE12_FINAL_EPOCH=$((STAGE12_EPOCHS - 1))
@@ -234,32 +212,23 @@ env \
   DATASET="${DATASET}" \
   EXP_MODE="${EXP_MODE}" \
   TRAIN_STAGE=recommender \
-  FEATURE_BRIDGE_MODE="${FEATURE_BRIDGE_MODE}" \
   MISSING_RATE="${MISSING_RATE}" \
-  TRAIN_MISSING_MODALITY="${TRAIN_MISSING_MODALITY}" \
-  EVAL_MISSING_RATE="${EVAL_MISSING_RATE}" \
-  MISSING_MASK_PROTOCOL="${MISSING_MASK_PROTOCOL}" \
   DEVICE_ID="${DEVICE_ID}" \
   SEED="${SEED}" \
-  DATASET_SEED="${DATASET_SEED}" \
   EPOCHS="${STAGE2_EPOCHS}" \
   EARLY_STOP="${STAGE2_EARLY_STOP}" \
   BATCH_SIZE="${STAGE2_BATCH_SIZE}" \
   LR="${STAGE2_LR}" \
   LR_REC="${STAGE2_LR_REC}" \
   LR_IMP="${STAGE2_LR_IMP}" \
-  IMPUTATION_VAL_RATE=0.0 \
   GAMMA_ALIGN="${STAGE2_GAMMA_ALIGN}" \
   ADAPTER_ALIGN_PSEUDO_RATIO="${STAGE2_ADAPTER_ALIGN_PSEUDO_RATIO}" \
   IMPUTER_CKPT="${STAGE12_CKPT}" \
-  ALPHA_DECODE=0.0 \
-  ALPHA_DECODE_KL=0.0 \
   TENSORBOARD="${TENSORBOARD}" \
   SAVE="${SAVE:-1}" \
   SUFFIX="${STAGE2_SUFFIX}" \
   ./run_demo_itm.sh \
     --imputer_ckpt "${STAGE12_CKPT}" \
     --freeze_imputer 1 \
-    --freeze_decoder 1 \
     --freeze_recommender -1 \
     "$@"

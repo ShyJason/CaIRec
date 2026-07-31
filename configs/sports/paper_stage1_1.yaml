@@ -1,24 +1,18 @@
 dataset: sports
 exp_mode: mm
 train_stage: imputer_param
-feature_bridge_mode: decoupled_latent
 selection_mode: val
 
 device_id: 0
 use_gpu: 1
 seed: 2023
-dataset_seed: 0
-missing_mask_protocol: unified_static
-unified_payload_seed: 2023
 missing_rate: 0.5
-eval_missing_rate: 0.5
 
 epoch: 5
 eva_interval: 1
 batch_size: 256
 lr: 0.001
 alpha_rec: 1.0
-contra_dim: 64
 d_beta: 32
 tau1: 0.1
 tau2: 0.1

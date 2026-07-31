@@ -28,13 +28,11 @@ class MILK_session(object):
             self.env.args.train_stage,
             freeze_imputer=self.env.args.freeze_imputer,
             freeze_recommender=self.env.args.freeze_recommender,
-            freeze_decoder=self.env.args.freeze_decoder,
         )
         self.representation_optimizer = self._build_representation_optimizer()
 
         self.early_stop = 0
         self.best_epoch = 0
-        self.best_loss = float('inf')
         self.total_epoch = 0
         self.best_ndcg = defaultdict(float)
         self.best_hr = defaultdict(float)
@@ -45,9 +43,6 @@ class MILK_session(object):
         self.best_recommendation_metric = float('-inf')
         self.stage_name = self.env.args.train_stage
         self.last_train_metrics = {}
-        self.best_imputation_mse = float('inf')
-        self.best_imputation_cosine = float('-inf')
-        self.best_stage1_selection = None
         self.best_model_state = None
         self.last_test_modality_subsets = {}
 
@@ -72,25 +67,15 @@ class MILK_session(object):
         else:
             lr_imp = lr_rec
 
-        if self.env.args.lr_decoder is not None:
-            lr_decoder = self.env.args.lr_decoder
-        elif self.env.args.train_stage == 'recommender':
-            lr_decoder = 0.1 * lr_rec
-        else:
-            lr_decoder = lr_imp
-        return lr_rec, lr_imp, lr_decoder
+        return lr_rec, lr_imp
 
     def _build_representation_optimizer(self):
-        lr_rec, lr_imp, lr_decoder = self._resolve_stage_learning_rates()
+        lr_rec, lr_imp = self._resolve_stage_learning_rates()
         param_groups = []
 
         imputer_params = self.model.get_imputer_parameters()
         if imputer_params:
             param_groups.append({'params': imputer_params, 'lr': lr_imp})
-
-        decoder_params = self.model.get_decoder_parameters()
-        if decoder_params:
-            param_groups.append({'params': decoder_params, 'lr': lr_decoder})
 
         recommender_params = self.model.get_recommender_parameters()
         if recommender_params:
@@ -101,17 +86,14 @@ class MILK_session(object):
 
         return torch.optim.Adam(param_groups, lr=lr_rec)
 
-    def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1, freeze_decoder=None):
+    def switch_training_stage(self, train_stage, freeze_imputer=-1, freeze_recommender=-1):
         self.env.args.train_stage = train_stage
         self.env.args.freeze_imputer = freeze_imputer
         self.env.args.freeze_recommender = freeze_recommender
-        if freeze_decoder is not None:
-            self.env.args.freeze_decoder = freeze_decoder
         self.model.configure_training_stage(
             self.env.args.train_stage,
             freeze_imputer=self.env.args.freeze_imputer,
             freeze_recommender=self.env.args.freeze_recommender,
-            freeze_decoder=self.env.args.freeze_decoder,
         )
         self.representation_optimizer = self._build_representation_optimizer()
         self.stage_name = self.env.args.train_stage
@@ -184,279 +166,28 @@ class MILK_session(object):
             if was_training:
                 self.model.train()
 
-    def _finalize_strict_imputation_metrics(self):
-        if self.best_model_state is None:
-            return
-
-        current_state = {
-            key: value.detach().cpu().clone()
-            for key, value in self.model.state_dict().items()
-        }
-        was_training = self.model.training
-        try:
-            self._restore_model_state(self.best_model_state)
-            metric_splits = ['test']
-            if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default', 'decoder_default'):
-                metric_splits.append('val')
-            metrics = self._compute_imputation_metrics(splits=tuple(metric_splits))
-            overall = metrics.get('test', {}).get('_overall', {})
-            if overall:
-                self.last_train_metrics['imputation_test_mse'] = float(overall.get('mse', 0.0))
-                self.last_train_metrics['imputation_test_cosine'] = float(overall.get('cosine', 0.0))
-                self.last_train_metrics['imputation_test_random_mse'] = float(overall.get('random_mse', 0.0))
-                self.last_train_metrics['imputation_test_random_cosine'] = float(overall.get('random_cosine', 0.0))
-                print(
-                    f"IMPUTE:test mse = {overall.get('mse', 0.0):.6f}, "
-                    f"cosine = {overall.get('cosine', 0.0):.6f}, "
-                    f"random_mse = {overall.get('random_mse', 0.0):.6f}, "
-                    f"random_cosine = {overall.get('random_cosine', 0.0):.6f}"
-                )
-            if 'val' in metrics:
-                heldout_split = (
-                    'val'
-                    if self._resolve_stage1_selection_policy() == 'decoder_default'
-                    else 'imputation_val'
-                )
-                heldout_metrics = self._compute_stage1_heldout_metrics(split=heldout_split)
-                self.last_train_metrics['imputation_val_mse'] = float(metrics['val']['_overall'].get('mse', 0.0))
-                self.last_train_metrics['imputation_val_cosine'] = float(metrics['val']['_overall'].get('cosine', 0.0))
-                self.last_train_metrics['val_pseudo_shared_mse'] = float(heldout_metrics.get('pseudo_shared_mse', 0.0))
-                self.last_train_metrics['val_pseudo_shared_cosine'] = float(heldout_metrics.get('pseudo_shared_cosine', 0.0))
-                self.last_train_metrics['val_pseudo_shared_cosine_gap'] = float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0))
-                self.last_train_metrics['val_missing_decode_mse'] = float(heldout_metrics.get('missing_decode_mse', 0.0))
-                self.last_train_metrics['val_missing_decode_cosine'] = float(heldout_metrics.get('missing_decode_cosine', 0.0))
-        finally:
-            self._restore_model_state(current_state)
-            if was_training:
-                self.model.train()
-
-    def _compute_imputation_metrics(self, splits=('train', 'test')):
-        if self.env.args.disable_imputation:
-            return {}
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            metrics = {
-                split: self.model.compute_imputation_representation_metrics(
-                    split=split,
-                    include_random_baseline=True,
-                )
-                for split in splits
-            }
-        finally:
-            if was_training:
-                self.model.train()
-        return metrics
-
-    def _compute_stage1_heldout_metrics(self, split='val'):
-        if self.env.args.disable_imputation:
-            return {}
-
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            metrics = self.model.compute_stage1_heldout_metrics(
-                split=split,
-                include_random_baseline=True,
-            )
-        finally:
-            if was_training:
-                self.model.train()
-        return metrics
-
-    def _log_imputation_metrics(self, metrics):
-        if not metrics:
-            return
-
-        for split, split_metrics in metrics.items():
-            overall = split_metrics.get('_overall', {})
-            if not overall:
-                continue
-            if self.env.args.tensorboard:
-                self.env.w.add_scalar(f'Imputation/{split}_mse', overall.get('mse', 0.0), self.total_epoch)
-                self.env.w.add_scalar(f'Imputation/{split}_cosine', overall.get('cosine', 0.0), self.total_epoch)
-                if 'random_mse' in overall:
-                    self.env.w.add_scalar(f'Imputation/{split}_random_mse', overall.get('random_mse', 0.0), self.total_epoch)
-                    self.env.w.add_scalar(f'Imputation/{split}_random_cosine', overall.get('random_cosine', 0.0), self.total_epoch)
-
-    def _log_stage1_heldout_metrics(self, metrics):
-        if not metrics or not self.env.args.tensorboard:
-            return
-
-        split = metrics.get('split', 'val')
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_mse',
-            metrics.get('pseudo_shared_mse', 0.0),
-            self.total_epoch,
-        )
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_cosine',
-            metrics.get('pseudo_shared_cosine', 0.0),
-            self.total_epoch,
-        )
-        self.env.w.add_scalar(
-            f'Stage1Heldout/{split}_pseudo_shared_cosine_gap',
-            metrics.get('pseudo_shared_cosine_gap', 0.0),
-            self.total_epoch,
-        )
-
-    def _is_better_imputation_metric(self, value):
-        metric = self.env.args.imputation_selection_metric
-        if metric == 'mse':
-            return value < self.best_imputation_mse
-        return value > self.best_imputation_cosine
-
-    def _update_best_imputation_metric(self, value):
-        metric = self.env.args.imputation_selection_metric
-        if metric == 'mse':
-            self.best_imputation_mse = value
-        else:
-            self.best_imputation_cosine = value
-
-    def _resolve_stage1_selection_policy(self):
-        return getattr(self.env.args, 'imputation_selection_policy', 'legacy')
-
-    def _stage1_default_selection_tuple(self, heldout_metrics):
-        return (
-            float(heldout_metrics.get('pseudo_shared_cosine_gap', float('-inf'))),
-            float(heldout_metrics.get('pseudo_shared_cosine', float('-inf'))),
-            -float(heldout_metrics.get('pseudo_shared_mse', float('inf'))),
-        )
-
-    def _promrl_shared_selection_tuple(self, heldout_metrics):
-        return (
-            float(heldout_metrics.get('pseudo_shared_cosine_gap', float('-inf'))),
-            float(heldout_metrics.get('pseudo_shared_cosine', float('-inf'))),
-            -float(heldout_metrics.get('pseudo_shared_mse', float('inf'))),
-        )
-
-    def _adapter_selection_tuple(self, heldout_metrics):
-        return (
-            float(heldout_metrics.get('missing_decode_cosine', float('-inf'))),
-            -float(heldout_metrics.get('missing_decode_mse', float('inf'))),
-            float(heldout_metrics.get('shared_cosine_gap', float('-inf'))),
-        )
-
-    def _decoder_selection_tuple(self, heldout_metrics):
-        return (
-            float(heldout_metrics.get('pseudo_decode_cosine', float('-inf'))),
-            -float(heldout_metrics.get('pseudo_decode_mse', float('inf'))),
-        )
-
-    def _recommender_probe_selection_tuple(self, selection_data):
-        return (
-            float(selection_data.get('recall', float('-inf'))),
-            float(selection_data.get('ndcg', float('-inf'))),
-            -float(selection_data.get('epoch', float('inf'))),
-        )
-
-    def _is_better_stage1_selection(self, selection_data):
-        policy = self._resolve_stage1_selection_policy()
-        if policy == 'stage1_default':
-            current_tuple = self._stage1_default_selection_tuple(selection_data)
-            if self.best_stage1_selection is None:
-                return True
-            return current_tuple > self._stage1_default_selection_tuple(self.best_stage1_selection)
-        if policy == 'promrl_shared':
-            current_tuple = self._promrl_shared_selection_tuple(selection_data)
-            if self.best_stage1_selection is None:
-                return True
-            return current_tuple > self._promrl_shared_selection_tuple(self.best_stage1_selection)
-        if policy == 'adapter_default':
-            current_tuple = self._adapter_selection_tuple(selection_data)
-            if self.best_stage1_selection is None:
-                return True
-            return current_tuple > self._adapter_selection_tuple(self.best_stage1_selection)
-        if policy == 'decoder_default':
-            current_tuple = self._decoder_selection_tuple(selection_data)
-            if self.best_stage1_selection is None:
-                return True
-            return current_tuple > self._decoder_selection_tuple(self.best_stage1_selection)
-        if policy == 'recommender_probe':
-            current_tuple = self._recommender_probe_selection_tuple(selection_data)
-            if self.best_stage1_selection is None:
-                return True
-            return current_tuple > self._recommender_probe_selection_tuple(self.best_stage1_selection)
-        return self._is_better_imputation_metric(float(selection_data['value']))
-
-    def _update_best_stage1_selection(self, selection_data):
-        policy = self._resolve_stage1_selection_policy()
-        if policy in ('stage1_default', 'promrl_shared', 'adapter_default', 'recommender_probe'):
-            self.best_stage1_selection = dict(selection_data)
-        elif policy == 'decoder_default':
-            self.best_stage1_selection = dict(selection_data)
-        else:
-            self._update_best_imputation_metric(float(selection_data['value']))
-
-    def _format_stage1_selection_message(self, selection_data):
-        policy = self._resolve_stage1_selection_policy()
-        if policy == 'stage1_default':
-            return (
-                'best pseudo-shared held-out metrics: '
-                f"val_pseudo_shared_cosine = {selection_data.get('pseudo_shared_cosine', 0.0):.6f}, "
-                f"val_pseudo_shared_cosine_gap = {selection_data.get('pseudo_shared_cosine_gap', 0.0):.6f}, "
-                f"val_pseudo_shared_mse = {selection_data.get('pseudo_shared_mse', 0.0):.6f}"
-            )
-        if policy == 'promrl_shared':
-            return (
-                'best pseudo-shared held-out metrics: '
-                f"val_pseudo_shared_cosine = {selection_data.get('pseudo_shared_cosine', 0.0):.6f}, "
-                f"val_pseudo_shared_cosine_gap = {selection_data.get('pseudo_shared_cosine_gap', 0.0):.6f}, "
-                f"val_pseudo_shared_mse = {selection_data.get('pseudo_shared_mse', 0.0):.6f}"
-            )
-        if policy == 'adapter_default':
-            return (
-                'best adapter held-out metrics: '
-                f"val_missing_decode_cosine = {selection_data.get('missing_decode_cosine', 0.0):.6f}, "
-                f"val_missing_decode_mse = {selection_data.get('missing_decode_mse', 0.0):.6f}, "
-                f"val_shared_cosine_gap = {selection_data.get('shared_cosine_gap', 0.0):.6f}"
-            )
-        if policy == 'decoder_default':
-            return (
-                'best raw decoder pseudo-missing metrics: '
-                f"val_pseudo_decode_cosine = {selection_data.get('pseudo_decode_cosine', 0.0):.6f}, "
-                f"val_pseudo_decode_mse = {selection_data.get('pseudo_decode_mse', 0.0):.6f}"
-            )
-        if policy == 'recommender_probe':
-            return (
-                'best recommender probe metrics: '
-                f"val_recall@20 = {selection_data.get('recall', 0.0):.6f}, "
-                f"val_ndcg@20 = {selection_data.get('ndcg', 0.0):.6f}, "
-                f"epoch = {int(selection_data.get('epoch', -1))}"
-            )
-        return (
-            f"best {selection_data['split']} "
-            f"{selection_data['metric']} = {selection_data['value']:.6f}"
-        )
-
     def _compute_stage_promrl_loss(self, promrl_losses):
         stage = self.env.args.train_stage
         zero = self._zero_scalar()
         if promrl_losses is None:
-            return zero, zero, zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero
 
         promrl_intra_loss = promrl_losses['loss_intra']
         promrl_inter_loss = promrl_losses['loss_inter']
         promrl_itm_loss = promrl_losses['loss_itm']
         promrl_rec_loss = promrl_losses['rec_loss']
-        promrl_decode_loss = promrl_losses.get('loss_decode', zero)
-        promrl_decode_kl_loss = promrl_losses.get('loss_decode_kl', zero)
 
         if stage == 'imputer_param':
             stage_promrl_loss = self.env.args.alpha_rec * promrl_rec_loss
             promrl_intra_loss = zero
             promrl_inter_loss = zero
             promrl_itm_loss = zero
-            promrl_decode_loss = zero
-            promrl_decode_kl_loss = zero
         elif stage == 'imputer_backprop':
             stage_promrl_loss = (
                 self.env.args.alpha_intra * promrl_intra_loss
                 + self.env.args.alpha_inter * promrl_inter_loss
                 + self.env.args.alpha_itm * promrl_itm_loss
                 + self.env.args.alpha_rec * promrl_rec_loss
-                + self.env.args.alpha_decode * promrl_decode_loss
             )
         else:
             stage_promrl_loss = zero
@@ -464,8 +195,6 @@ class MILK_session(object):
             promrl_inter_loss = zero
             promrl_itm_loss = zero
             promrl_rec_loss = zero
-            promrl_decode_loss = zero
-            promrl_decode_kl_loss = zero
 
         return (
             stage_promrl_loss,
@@ -473,8 +202,6 @@ class MILK_session(object):
             promrl_inter_loss,
             promrl_itm_loss,
             promrl_rec_loss,
-            promrl_decode_loss,
-            promrl_decode_kl_loss,
         )
 
     def _should_compute_promrl_losses(self, effective_stage):
@@ -489,7 +216,6 @@ class MILK_session(object):
             self.env.args.alpha_inter,
             self.env.args.alpha_itm,
             self.env.args.alpha_rec,
-            self.env.args.alpha_decode,
         )
 
         return any(float(weight) != 0.0 for weight in weights)
@@ -525,8 +251,6 @@ class MILK_session(object):
         all_modality_bpr_loss, all_grad_loss, all_penalty_loss = 0., 0., 0.
         all_promrl_intra_loss, all_promrl_inter_loss = 0., 0.
         all_promrl_itm_loss, all_promrl_rec_loss = 0., 0.
-        all_promrl_decode_loss = 0.
-        all_promrl_decode_kl_loss = 0.
         all_align_loss = 0.
         self.model.set_missing_modality_via_env()
         if imputer_only_stage:
@@ -562,8 +286,6 @@ class MILK_session(object):
                 promrl_inter_loss,
                 promrl_itm_loss,
                 promrl_rec_loss,
-                promrl_decode_loss,
-                promrl_decode_kl_loss,
             ) = \
                 self._compute_stage_promrl_loss(promrl_losses)
 
@@ -636,8 +358,6 @@ class MILK_session(object):
             all_promrl_inter_loss += promrl_inter_loss
             all_promrl_itm_loss += promrl_itm_loss
             all_promrl_rec_loss += promrl_rec_loss
-            all_promrl_decode_loss += promrl_decode_loss
-            all_promrl_decode_kl_loss += promrl_decode_kl_loss
             all_align_loss += align_loss
         return (
             all_loss / total_batch,
@@ -650,8 +370,6 @@ class MILK_session(object):
             all_promrl_inter_loss / total_batch,
             all_promrl_itm_loss / total_batch,
             all_promrl_rec_loss / total_batch,
-            all_promrl_decode_loss / total_batch,
-            all_promrl_decode_kl_loss / total_batch,
             all_align_loss / total_batch,
             time.time() - t,
         )
@@ -680,15 +398,13 @@ class MILK_session(object):
                 promrl_inter_loss,
                 promrl_itm_loss,
                 promrl_rec_loss,
-                promrl_decode_loss,
-                promrl_decode_kl_loss,
                 align_loss,
                 train_time,
             ) = self.train_epoch()
             # self.model.show_scores()
             print('-' * 30)
             print(
-                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, promrl_decode = {promrl_decode_loss:.5f}, promrl_decode_kl = {promrl_decode_kl_loss:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
+                f'TRAIN:stage = {self.stage_name}, epoch = {epoch}/{epochs} loss_s1 = {loss:.5f}, main_bpr_loss = {main_bpr_loss:.5f}, modality_bpr_loss = {modality_bpr_loss:.5f}, maximize_loss={maximize_loss:.5f}, penalty_loss = {penalty_loss:.5f}, reg_loss = {reg_loss:.5f}, promrl_intra = {promrl_intra_loss:.5f}, promrl_inter = {promrl_inter_loss:.5f}, promrl_itm = {promrl_itm_loss:.5f}, promrl_rec = {promrl_rec_loss:.5f}, align_loss = {align_loss:.5f}, train_time = {train_time:.2f}')
             self.last_train_metrics = {
                 'epoch': epoch,
                 'loss_s1': float(loss),
@@ -701,8 +417,6 @@ class MILK_session(object):
                 'promrl_inter': float(promrl_inter_loss),
                 'promrl_itm': float(promrl_itm_loss),
                 'promrl_rec': float(promrl_rec_loss),
-                'promrl_decode': float(promrl_decode_loss),
-                'promrl_decode_kl': float(promrl_decode_kl_loss),
                 'align_loss': float(align_loss),
                 'train_time': float(train_time),
             }
@@ -716,178 +430,15 @@ class MILK_session(object):
                 self.env.w.add_scalar('Train/promrl_inter', float(promrl_inter_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_itm', float(promrl_itm_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/promrl_rec', float(promrl_rec_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/promrl_decode', float(promrl_decode_loss), self.total_epoch)
-                self.env.w.add_scalar('Train/promrl_decode_kl', float(promrl_decode_kl_loss), self.total_epoch)
                 self.env.w.add_scalar('Train/align_loss', float(align_loss), self.total_epoch)
                 for group_idx, group in enumerate(self.representation_optimizer.param_groups if self.representation_optimizer is not None else []):
                     self.env.w.add_scalar(f'Train/lr_group_{group_idx}', group['lr'], self.total_epoch)
 
             if self.env.args.train_stage in STAGE1_IMPUTER_STAGES:
-                if self.env.args.train_stage != 'imputer_param':
-                    metric_splits = ['train']
-                    if self._resolve_stage1_selection_policy() in ('stage1_default', 'promrl_shared', 'adapter_default', 'decoder_default'):
-                        metric_splits.append('val')
-                    if self.env.args.evaluation_protocol == 'legacy' or record_strict_test_probe:
-                        metric_splits.append('test')
-                    metric_splits = tuple(dict.fromkeys(metric_splits))
-                    imputation_metrics = self._compute_imputation_metrics(splits=metric_splits)
-                    self._log_imputation_metrics(imputation_metrics)
-                    for split_name, split_metrics in imputation_metrics.items():
-                        overall = split_metrics.get('_overall', {})
-                        if overall:
-                            print(
-                                f"IMPUTE:{split_name} mse = {overall.get('mse', 0.0):.6f}, "
-                                f"cosine = {overall.get('cosine', 0.0):.6f}, "
-                                f"random_mse = {overall.get('random_mse', 0.0):.6f}, "
-                                f"random_cosine = {overall.get('random_cosine', 0.0):.6f}"
-                            )
-                    heldout_metrics = {}
-                    if 'val' in imputation_metrics:
-                        heldout_split = (
-                            'val'
-                            if self._resolve_stage1_selection_policy() == 'decoder_default'
-                            else 'imputation_val'
-                        )
-                        heldout_metrics = self._compute_stage1_heldout_metrics(split=heldout_split)
-                        self._log_stage1_heldout_metrics(heldout_metrics)
-                        print(
-                            'STAGE1_HELDOUT:val '
-                            f"pseudo_shared_mse = {heldout_metrics.get('pseudo_shared_mse', 0.0):.6f}, "
-                            f"pseudo_shared_cosine = {heldout_metrics.get('pseudo_shared_cosine', 0.0):.6f}, "
-                            f"pseudo_shared_cosine_gap = {heldout_metrics.get('pseudo_shared_cosine_gap', 0.0):.6f}, "
-                            f"pseudo_decode_mse = {heldout_metrics.get('pseudo_decode_mse', 0.0):.6f}, "
-                            f"pseudo_decode_cosine = {heldout_metrics.get('pseudo_decode_cosine', 0.0):.6f}, "
-                            f"missing_decode_mse = {heldout_metrics.get('missing_decode_mse', 0.0):.6f}, "
-                            f"missing_decode_cosine = {heldout_metrics.get('missing_decode_cosine', 0.0):.6f}"
-                        )
-
-                    policy = self._resolve_stage1_selection_policy()
-                    selection_data = None
-                    if policy == 'stage1_default':
-                        selection_data = {
-                            'pseudo_shared_cosine': float(heldout_metrics.get('pseudo_shared_cosine', 0.0)),
-                            'pseudo_shared_cosine_gap': float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0)),
-                            'pseudo_shared_mse': float(heldout_metrics.get('pseudo_shared_mse', 0.0)),
-                        }
-                        self.last_train_metrics['val_pseudo_shared_mse'] = selection_data['pseudo_shared_mse']
-                        self.last_train_metrics['val_pseudo_shared_cosine'] = selection_data['pseudo_shared_cosine']
-                        self.last_train_metrics['val_pseudo_shared_cosine_gap'] = selection_data['pseudo_shared_cosine_gap']
-                    elif policy == 'promrl_shared':
-                        selection_data = {
-                            'pseudo_shared_cosine': float(heldout_metrics.get('pseudo_shared_cosine', 0.0)),
-                            'pseudo_shared_cosine_gap': float(heldout_metrics.get('pseudo_shared_cosine_gap', 0.0)),
-                            'pseudo_shared_mse': float(heldout_metrics.get('pseudo_shared_mse', 0.0)),
-                        }
-                        self.last_train_metrics['val_pseudo_shared_mse'] = selection_data['pseudo_shared_mse']
-                        self.last_train_metrics['val_pseudo_shared_cosine'] = selection_data['pseudo_shared_cosine']
-                        self.last_train_metrics['val_pseudo_shared_cosine_gap'] = selection_data['pseudo_shared_cosine_gap']
-                    elif policy == 'adapter_default':
-                        selection_data = {
-                            'missing_decode_cosine': float(heldout_metrics.get('missing_decode_cosine', 0.0)),
-                            'missing_decode_mse': float(heldout_metrics.get('missing_decode_mse', 0.0)),
-                            'shared_cosine_gap': float(heldout_metrics.get('shared_cosine_gap', 0.0)),
-                        }
-                        self.last_train_metrics['val_shared_cosine'] = float(heldout_metrics.get('shared_cosine', 0.0))
-                        self.last_train_metrics['val_shared_cosine_gap'] = selection_data['shared_cosine_gap']
-                        self.last_train_metrics['val_missing_decode_mse'] = selection_data['missing_decode_mse']
-                        self.last_train_metrics['val_missing_decode_cosine'] = selection_data['missing_decode_cosine']
-                    elif policy == 'decoder_default':
-                        selection_data = {
-                            'pseudo_decode_cosine': float(heldout_metrics.get('pseudo_decode_cosine', 0.0)),
-                            'pseudo_decode_mse': float(heldout_metrics.get('pseudo_decode_mse', 0.0)),
-                        }
-                        self.last_train_metrics['val_pseudo_decode_mse'] = selection_data['pseudo_decode_mse']
-                        self.last_train_metrics['val_pseudo_decode_cosine'] = selection_data['pseudo_decode_cosine']
-                        self.last_train_metrics['val_missing_decode_mse'] = float(heldout_metrics.get('missing_decode_mse', 0.0))
-                        self.last_train_metrics['val_missing_decode_cosine'] = float(heldout_metrics.get('missing_decode_cosine', 0.0))
-                    elif policy == 'recommender_probe':
-                        should_probe_recommender = (epoch % self.env.args.eva_interval == 0)
-                        if should_probe_recommender:
-                            hr, recall, ndcg, val_time = self.test(
-                                mode=self.env.args.selection_mode,
-                                top_list=self.env.args.topk,
-                            )
-                            metric_name, metric_topk, metric_value = self._resolve_recommendation_selection(hr, recall, ndcg)
-                            probe_topk = 20 if 20 in recall else metric_topk
-                            print(
-                                f'STAGE1_RECOMMENDER_PROBE: epoch = {epoch} '
-                                f'recall@{probe_topk} = {recall[probe_topk]:.6f}, '
-                                f'ndcg@{probe_topk} = {ndcg[probe_topk]:.6f}, '
-                                f'{self.env.args.selection_mode}_time = {val_time:.2f}'
-                            )
-                            selection_data = {
-                                'epoch': epoch,
-                                'metric': metric_name,
-                                'topk': metric_topk,
-                                'value': float(metric_value),
-                                'recall': float(recall[probe_topk]),
-                                'ndcg': float(ndcg[probe_topk]),
-                            }
-                            self.last_train_metrics['val_probe_recall20'] = selection_data['recall']
-                            self.last_train_metrics['val_probe_ndcg20'] = selection_data['ndcg']
-                            if self.env.args.tensorboard:
-                                self.env.w.add_scalar('Stage1Probe/val_recall_20', selection_data['recall'], self.total_epoch)
-                                self.env.w.add_scalar('Stage1Probe/val_ndcg_20', selection_data['ndcg'], self.total_epoch)
-                        else:
-                            print(f'skip recommender probe at epoch {epoch} (eva_interval = {self.env.args.eva_interval})')
-                    else:
-                        selection_split = self.env.args.imputation_selection_split
-                        if selection_split not in imputation_metrics:
-                            selection_split = 'train'
-                        selection_metric = self.env.args.imputation_selection_metric
-                        selection_value = float(imputation_metrics[selection_split]['_overall'][selection_metric])
-                        selection_data = {
-                            'split': selection_split,
-                            'metric': selection_metric,
-                            'value': selection_value,
-                        }
-                        self.last_train_metrics[f'imputation_{selection_split}_{selection_metric}'] = selection_value
-
-                    self.last_train_metrics['imputation_train_mse'] = float(imputation_metrics['train']['_overall']['mse'])
-                    self.last_train_metrics['imputation_train_cosine'] = float(imputation_metrics['train']['_overall']['cosine'])
-                    if 'val' in imputation_metrics:
-                        self.last_train_metrics['imputation_val_mse'] = float(imputation_metrics['val']['_overall']['mse'])
-                        self.last_train_metrics['imputation_val_cosine'] = float(imputation_metrics['val']['_overall']['cosine'])
-                    if 'test' in imputation_metrics:
-                        self.last_train_metrics['imputation_test_mse'] = float(imputation_metrics['test']['_overall']['mse'])
-                        self.last_train_metrics['imputation_test_cosine'] = float(imputation_metrics['test']['_overall']['cosine'])
-
-                    save_all_epochs = bool(getattr(self.env.args, 'save_all_epochs', 0))
-                    if save_all_epochs and self.env.args.save:
-                        self.save_model(epoch, keep_previous=True)
-
-                    if selection_data is None:
-                        continue
-
-                    if self._is_better_stage1_selection(selection_data):
-                        self._update_best_stage1_selection(selection_data)
-                        self.best_epoch = epoch
-                        if self.env.args.evaluation_protocol == 'strict':
-                            self._snapshot_best_model_state()
-                        if self.env.args.save and not save_all_epochs:
-                            self.save_model(epoch)
-                            print(f"save ckpt ({self._format_stage1_selection_message(selection_data)})")
-                        elif self.env.args.save:
-                            print(f"save ckpt ({self._format_stage1_selection_message(selection_data)})")
-                    else:
-                        print(f"skip ckpt (not better under {policy})")
-                else:
-                    current_loss = float(loss)
-                    save_all_epochs = bool(getattr(self.env.args, 'save_all_epochs', 0))
-                    if save_all_epochs and self.env.args.save:
-                        self.save_model(epoch, keep_previous=True)
-                    if current_loss < self.best_loss:
-                        self.best_loss = current_loss
-                        self.best_epoch = epoch
-                        if self.env.args.evaluation_protocol == 'strict':
-                            self._snapshot_best_model_state()
-                        if self.env.args.save and not save_all_epochs:
-                            self.save_model(epoch)
-                            print('save ckpt')
-                        elif self.env.args.save:
-                            print('save ckpt')
-                    else:
-                        print('skip ckpt (not best)')
+                if epoch == epochs - 1 and self.env.args.save:
+                    self.best_epoch = epoch
+                    self.save_model(epoch)
+                    print('save final Stage 1 checkpoint')
                 continue
 
             if epoch % self.env.args.eva_interval == 0:
@@ -984,11 +535,12 @@ class MILK_session(object):
             if self.early_stop > self.env.args.early_stop // 1:
                 break
 
-        if finalize and self.env.args.evaluation_protocol == 'strict':
-            if self.env.args.train_stage in STAGE1_IMPUTER_STAGES:
-                self._finalize_strict_imputation_metrics()
-            else:
-                self._finalize_strict_test_metrics()
+        if (
+            finalize
+            and self.env.args.evaluation_protocol == 'strict'
+            and self.env.args.train_stage not in STAGE1_IMPUTER_STAGES
+        ):
+            self._finalize_strict_test_metrics()
 
     def test(self, mode='val', top_list=[50]):
         self.model.eval()
@@ -1074,12 +626,10 @@ class MILK_session(object):
     def save_ckpt(self, path):
         torch.save(self.model.state_dict(), path)
 
-    def save_model(self, current_epoch, keep_previous=False):
+    def save_model(self, current_epoch):
         prefix = f'{self.env.args.suffix}_{self.env.args.train_stage}_{self.env.args.penalty_coeff}_epoch'
         model_state_file = os.path.join(self.env.CKPT_PATH, f'{prefix}{current_epoch}.pth')
         self.save_ckpt(model_state_file)
-        if keep_previous:
-            return
         for file_name in os.listdir(self.env.CKPT_PATH):
             if not file_name.startswith(prefix):
                 continue

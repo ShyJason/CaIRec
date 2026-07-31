@@ -80,39 +80,6 @@ def _build_parser():
     parser.add_argument('--use_gpu', type=int, default=1)
     parser.add_argument('--device_id', type=int, default=0)
     parser.add_argument('--seed', type=int, default=2023)
-    parser.add_argument('--dataset_seed', type=int, default=0)
-    parser.add_argument(
-        '--unified_payload_seed',
-        type=int,
-        default=-1,
-        help='Seed of the pre-generated unified_static missing payload; defaults to --seed.',
-    )
-    parser.add_argument(
-        '--unified_payload_file',
-        type=str,
-        default='',
-        help=(
-            'Optional unified_static payload filename. Relative paths are resolved '
-            'inside Data/<dataset>; when omitted, the seed-based default is used.'
-        ),
-    )
-    parser.add_argument(
-        '--missing_mask_protocol',
-        type=str,
-        default='i3',
-        choices=['i3', 'default_rng', 'unified_static'],
-        help='unified_static loads the pre-generated, phase-invariant missing-item payload',
-    )
-    parser.add_argument(
-        '--train_missing_modality',
-        type=str,
-        default='random',
-        choices=['random', 'image', 'text'],
-        help=(
-            'Training-only missing-modality policy. Validation/test keep the '
-            'random-modality protocol controlled by eval_missing_rate.'
-        ),
-    )
     parser.add_argument('--ckpt', type=str, default=None)
     parser.add_argument('--eval_only', type=int, default=0)
     parser.add_argument(
@@ -129,7 +96,6 @@ def _build_parser():
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--lr_rec', type=float, default=None)
     parser.add_argument('--lr_imp', type=float, default=None)
-    parser.add_argument('--lr_decoder', type=float, default=None)
     parser.add_argument('--epoch', type=int, default=200)
     parser.add_argument('--eva_interval', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=2048)
@@ -175,20 +141,12 @@ def _build_parser():
     )
     parser.add_argument('--freeze_imputer', type=int, default=-1)
     parser.add_argument('--freeze_recommender', type=int, default=-1)
-    parser.add_argument('--freeze_decoder', type=int, default=0)
 
     # ----------------------- Regularizer coefficient
     parser.add_argument('--reg_coeff', type=float, default=1e-4)
     parser.add_argument('--penalty_coeff', type=float, default=50) # b 1000  c 50
     parser.add_argument('--missing_rate', type=float, default=0.3)
-    parser.add_argument(
-        '--eval_missing_rate',
-        type=float,
-        default=0.5,
-        help='Validation/test missing-modality rate. Defaults to the historical fixed 0.5 protocol.',
-    )
 
-    parser.add_argument('--contra_dim', type=int, default=256)
     parser.add_argument('--d_beta', type=int, default=128)
     parser.add_argument('--tau1', type=float, default=0.1)
     parser.add_argument('--tau2', type=float, default=0.1)
@@ -197,25 +155,7 @@ def _build_parser():
     parser.add_argument('--itm_num_heads', type=int, default=4)
     parser.add_argument('--ema_eta', type=float, default=0.01)
     parser.add_argument('--disable_imputation', type=int, default=0)
-    parser.add_argument(
-        '--feature_bridge_mode',
-        type=str,
-        default='raw_decoder',
-        choices=['raw_decoder', 'latent_direct', 'decoupled_latent'],
-    )
     parser.add_argument('--item_graph_topk', type=int, default=20)
-    parser.add_argument(
-        '--item_graph_fuse_before_topk',
-        type=int,
-        default=0,
-        choices=[0, 1],
-        help=(
-            'Experimental completed-item graph construction order. When enabled for '
-            'modality_completed, compute weighted CF+semantic scores over all items first '
-            'and apply top-k only once; the default keeps the legacy per-source top-k '
-            'followed by fusion and a final top-k.'
-        ),
-    )
     parser.add_argument(
         '--item_graph_missing_scope',
         type=str,
@@ -231,17 +171,8 @@ def _build_parser():
         '--item_graph_kind',
         type=str,
         default='none',
-        choices=[
-            'none',
-            'modality_masked',
-            'modality_completed',
-        ],
-        help=(
-            'Item-item graph adapter kind. modality_masked builds per-modality CF plus semantic '
-            'graphs directly from masked raw features for strict Stage2-only no-completion ablations; '
-            'modality_completed propagates each modality '
-            'embedding with its own CF plus completed-feature modality graph.'
-        ),
+        choices=['none', 'modality_completed'],
+        help='Enable the paper completed-feature item graph during Stage 2.',
     )
     parser.add_argument(
         '--item_graph_norm',
@@ -250,54 +181,8 @@ def _build_parser():
         choices=['rw', 'sym', 'none'],
     )
     parser.add_argument('--item_graph_cf_weight', type=float, default=0.5)
-    parser.add_argument(
-        '--item_graph_cf_scale',
-        type=str,
-        default='raw',
-        choices=['raw', 'sqrt', 'power', 'clip', 'cosine', 'log1p', 'rowmax', 'log1p_rowmax'],
-        help=(
-            'Scale for the CF item-item graph before fusing with semantic graphs. '
-            'raw keeps co-occurrence counts; sqrt/power/log1p compress count tails; '
-            'clip caps counts; cosine normalizes by item popularity; rowmax scales each row to at most 1.'
-        ),
-    )
-    parser.add_argument(
-        '--item_graph_cf_power',
-        type=float,
-        default=0.5,
-        help='Power exponent used when item_graph_cf_scale=power.',
-    )
-    parser.add_argument(
-        '--item_graph_cf_clip',
-        type=float,
-        default=3.0,
-        help='Maximum co-occurrence count used when item_graph_cf_scale=clip.',
-    )
     parser.add_argument('--item_graph_image_weight', type=float, default=0.25)
     parser.add_argument('--item_graph_text_weight', type=float, default=0.25)
-    parser.add_argument(
-        '--item_graph_feature_space',
-        type=str,
-        default='shared',
-        choices=['shared', 'raw_decoder'],
-        help=(
-            'Feature space used to build completed modality item graphs. '
-            'shared uses observed projected completion latents plus imputed completion latents; '
-            'raw_decoder uses observed raw features plus decoded imputed raw features.'
-        ),
-    )
-    parser.add_argument(
-        '--item_graph_audio_weight',
-        type=float,
-        default=0.0,
-        help='Audio graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
-    )
-    parser.add_argument(
-        '--item_graph_video_weight',
-        type=float,
-        default=0.0,
-        help='Video graph weight. Single-source graph runs are ablations: set exactly one item_graph_*_weight positive.',
-    )
     parser.add_argument('--item_graph_feature_chunk_size', type=int, default=1024)
     parser.add_argument(
         '--item_graph_modal_alpha',
@@ -311,48 +196,10 @@ def _build_parser():
         default=1,
         help='Number of post-GCN, pre-fusion modality item-item residual propagation layers.',
     )
-    parser.add_argument(
-        '--item_graph_modal_target',
-        type=str,
-        default='all',
-        choices=['all', 'missing'],
-        help='Apply post-GCN, pre-fusion modality item-item residual to all items or only items missing that modality.',
-    )
-    parser.add_argument(
-        '--fusion_mode',
-        type=str,
-        default='mean',
-        choices=['mean', 'posterior_reliability'],
-        help=(
-            'Item modality fusion. posterior_reliability uses the linear-Gaussian '
-            'completion posterior predictive variance in the components selected '
-            'by posterior_reliability_scope.'
-        ),
-    )
-    parser.add_argument(
-        '--posterior_reliability_scope',
-        type=str,
-        default='both',
-        choices=['both', 'graph', 'fusion'],
-        help='Apply posterior reliability to semantic graph top-k, modality fusion, or both.',
-    )
-    parser.add_argument(
-        '--posterior_reliability_scale',
-        type=float,
-        default=1.0,
-        help='Lambda in c=exp(-lambda * mean posterior predictive variance).',
-    )
-    parser.add_argument(
-        '--posterior_reliability_floor',
-        type=float,
-        default=0.0,
-        help='Optional lower bound for missing-modality posterior reliability.',
-    )
     parser.add_argument('--alpha_intra', type=float, default=1.0)
     parser.add_argument('--alpha_inter', type=float, default=1.0)
     parser.add_argument('--alpha_itm', type=float, default=1.0)
     parser.add_argument('--alpha_rec', type=float, default=0.1)
-    parser.add_argument('--alpha_decode', type=float, default=0.0)
     parser.add_argument(
         '--generative_update_mode',
         type=str,
@@ -373,22 +220,12 @@ def _build_parser():
         help='Fraction of eligible observed modalities to pseudo-mask for decoupled adapter alignment.',
     )
     parser.add_argument('--recommender_allow_modal_grad', type=int, default=0)
-    parser.add_argument('--imputation_val_rate', type=float, default=0.0)
-    parser.add_argument(
-        '--imputation_selection_policy',
-        type=str,
-        default='legacy',
-        choices=['legacy', 'stage1_default', 'decoder_default'],
-    )
-    parser.add_argument('--imputation_selection_split', type=str, default='train', choices=['train', 'val', 'test'])
-    parser.add_argument('--imputation_selection_metric', type=str, default='mse', choices=['mse', 'cosine'])
     # ----------------------- logger
     parser.add_argument('--log', type=int, default=0)
     parser.add_argument('--tensorboard', type=int, default=1)
     parser.add_argument('--hf_tensorboard_repo', type=str, default='')
     parser.add_argument('--hf_commit_every', type=int, default=5)
     parser.add_argument('--save', type=int, default=1)
-    parser.add_argument('--save_all_epochs', type=int, default=0)
     return parser
 
 
@@ -405,8 +242,6 @@ def _validate_protocol_args(args):
     if args.evaluation_protocol == 'strict':
         if args.selection_mode == 'test':
             raise ValueError('Strict evaluation cannot use selection_mode=test; use validation selection.')
-        if args.imputation_selection_split == 'test':
-            raise ValueError('Strict evaluation cannot use imputation_selection_split=test; use train or val.')
     return args
 
 
@@ -460,10 +295,7 @@ if args.projection_ckpt is not None:
 if args.imputer_ckpt is not None:
     matched_keys = my_model.load_imputer_checkpoint(args.imputer_ckpt)
     tool.cprint(f'Loaded imputer checkpoint from {args.imputer_ckpt} ({len(matched_keys)} tensors)')
-if getattr(args, 'item_graph_kind', None) in (
-    'modality_masked',
-    'modality_completed',
-):
+if getattr(args, 'item_graph_kind', None) == 'modality_completed':
     my_model.build_completed_item_graph()
 tool.cprint('Init Model')
 
@@ -512,30 +344,10 @@ if my_env.args.train_stage in (
             f"final stage1 metrics: epoch = {final_metrics['epoch']}, "
             f"loss_s1 = {final_metrics['loss_s1']:.5f}, "
             f"promrl_rec = {final_metrics['promrl_rec']:.5f}, "
-            f"promrl_decode = {final_metrics['promrl_decode']:.5f}, "
-            f"promrl_decode_kl = {final_metrics.get('promrl_decode_kl', 0.0):.5f}, "
             f"promrl_intra = {final_metrics['promrl_intra']:.5f}, "
             f"promrl_inter = {final_metrics['promrl_inter']:.5f}, "
             f"promrl_itm = {final_metrics['promrl_itm']:.5f}"
         )
-        if 'imputation_train_mse' in final_metrics:
-            summary += (
-                f", imputation_train_mse = {final_metrics['imputation_train_mse']:.6f}, "
-                f"imputation_train_cosine = {final_metrics['imputation_train_cosine']:.6f}, "
-                f"imputation_test_mse = {final_metrics.get('imputation_test_mse', 0.0):.6f}, "
-                f"imputation_test_cosine = {final_metrics.get('imputation_test_cosine', 0.0):.6f}"
-            )
-        if 'imputation_val_mse' in final_metrics:
-            summary += (
-                f", imputation_val_mse = {final_metrics['imputation_val_mse']:.6f}, "
-                f"imputation_val_cosine = {final_metrics['imputation_val_cosine']:.6f}"
-            )
-        if 'val_shared_cosine_gap' in final_metrics:
-            summary += (
-                f", val_shared_cosine_gap = {final_metrics['val_shared_cosine_gap']:.6f}, "
-                f"val_missing_decode_cosine = {final_metrics.get('val_missing_decode_cosine', 0.0):.6f}, "
-                f"val_shared_mse = {final_metrics.get('val_shared_mse', 0.0):.6f}"
-            )
         tool.cprint(summary)
         if my_env.args.log:
             my_env.test_logger.info(summary)

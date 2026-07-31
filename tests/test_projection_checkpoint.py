@@ -15,8 +15,6 @@ class ProjectionCheckpointTest(unittest.TestCase):
         model = MILK_model.__new__(MILK_model)
         torch.nn.Module.__init__(model)
         model.modalities = ["v", "t"]
-        model.use_decoupled_latent_bridge = True
-        model.use_latent_direct_bridge = False
         model.comp_proj_v = torch.nn.Linear(3, 2)
         model.comp_proj_t = torch.nn.Linear(4, 2)
         model.W = torch.nn.ParameterDict(
